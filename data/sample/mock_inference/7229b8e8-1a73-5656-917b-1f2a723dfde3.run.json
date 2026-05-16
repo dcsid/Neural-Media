@@ -1,0 +1,23 @@
+{
+  "id": "e2811359-9d6c-5728-b933-5badbbaeb826",
+  "video_id": "7229b8e8-1a73-5656-917b-1f2a723dfde3",
+  "model_id": "tribe-v2-mock",
+  "model_version": "0.0.0-mock",
+  "seed": 7,
+  "params_json": {
+    "duration_s": 30.0,
+    "sample_rate_hz": 1.5,
+    "num_timepoints": 45,
+    "preprocessing": {
+      "video_resolution": "224x224",
+      "video_fps": 8,
+      "audio_sample_rate_hz": 16000,
+      "source_url": "https://www.tiktok.com/@late.nite/video/7300000000000000004"
+    },
+    "created_at_utc": "2026-05-16T00:00:00+00:00",
+    "config_hash": "297bf43daefc1c441c88f88ffc52ee6bcaa74adc4adfd6e16bef5de3b593119c"
+  },
+  "created_at": "2026-05-16T00:00:00Z",
+  "activation_path": "/Users/siddus/Documents/UVAWork/Spring 2026/Neural-Media-ml-inference/data/sample/activations/e2811359-9d6c-5728-b933-5badbbaeb826.npz",
+  "status": "complete"
+}

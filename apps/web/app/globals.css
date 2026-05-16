@@ -1,0 +1,47 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  height: 100%;
+  background: theme("colors.canvas");
+  color: theme("colors.ink.100");
+  font-family: theme("fontFamily.sans");
+  font-feature-settings: "ss01", "cv11", "tnum";
+  letter-spacing: -0.005em;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Tabular numerals are the project default — readings, durations, peaks. */
+.num,
+.font-mono,
+[data-num] {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Subtle horizontal rule used in place of card borders. */
+.hairline {
+  border-color: theme("colors.line");
+}
+
+/* Section labels — small, sparse, all-caps, ink-300. */
+.eyebrow {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: theme("colors.ink.300");
+}
+
+/* Reduce flash of unstyled content during font load. */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}

@@ -1,0 +1,52 @@
+# --- OS / editor ------------------------------------------------------------
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+# .idea/ is checked in via the JetBrains-managed staged files; gitignore the
+# user-specific bits only:
+.idea/workspace.xml
+.idea/usage.statistics.xml
+.idea/shelf/
+.idea/dictionaries/
+.idea/dataSources/
+.idea/sonarlint/
+
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+build/
+dist/
+
+# --- Node / Next ------------------------------------------------------------
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+.npm/
+.pnpm-store/
+
+# --- Neural Media user data --------------------------------------------------
+# These directories hold a real user's TikTok data + inference outputs.
+# NEVER commit them. data/sample/ is the only data path that ships.
+data/videos/*
+!data/videos/.gitkeep
+data/activations/*
+!data/activations/.gitkeep
+data/sqlite/*
+!data/sqlite/.gitkeep
+
+# --- Misc -------------------------------------------------------------------
+*.log
+coverage/
+.env
+.env.local
+.env.*.local

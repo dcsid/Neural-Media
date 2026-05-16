@@ -1,0 +1,23 @@
+{
+  "id": "75cd5f81-8cac-52ed-956b-c78acff0e413",
+  "video_id": "a5271f15-d632-59df-9c43-3929f3852a84",
+  "model_id": "tribe-v2-mock",
+  "model_version": "0.0.0-mock",
+  "seed": 7,
+  "params_json": {
+    "duration_s": 35.0,
+    "sample_rate_hz": 1.5,
+    "num_timepoints": 52,
+    "preprocessing": {
+      "video_resolution": "224x224",
+      "video_fps": 8,
+      "audio_sample_rate_hz": 16000,
+      "source_url": "https://www.tiktok.com/@comedybit/video/7300000000000000007"
+    },
+    "created_at_utc": "2026-05-16T00:00:00+00:00",
+    "config_hash": "3c86e966baff10d929ba0abff0886202587e31d852c1d59ab4771f4d3a25431c"
+  },
+  "created_at": "2026-05-16T00:00:00Z",
+  "activation_path": "/Users/siddus/Documents/UVAWork/Spring 2026/Neural-Media-ml-inference/data/sample/activations/75cd5f81-8cac-52ed-956b-c78acff0e413.npz",
+  "status": "complete"
+}

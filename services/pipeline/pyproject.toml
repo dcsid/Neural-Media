@@ -1,0 +1,31 @@
+[project]
+name = "neural-media-pipeline"
+version = "0.0.1"
+description = "TikTok export → normalized videos + watch events for Neural Media. Local-first; nothing leaves the machine."
+requires-python = ">=3.11"
+license = { text = "CC-BY-NC-4.0" }
+dependencies = [
+  "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+# yt-dlp + ffmpeg deps land with the downloader / preprocess modules.
+dev = [
+  "pytest>=8",
+  "ruff>=0.5",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["neural_media_pipeline*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

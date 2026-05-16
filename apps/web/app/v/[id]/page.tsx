@@ -3,7 +3,7 @@ import { notFound } from "next/navigation";
 import { api, ApiError, serverBaseUrl } from "@/lib/api";
 import { formatDurationSeconds, videoTitle } from "@/lib/format";
 import { ApiOfflineState } from "@/components/ApiOfflineState";
-import { BrainMeshPlaceholder } from "@/components/BrainMeshPlaceholder";
+import { BrainDetailViewer } from "@/components/BrainDetailViewer";
 import { RegionReadingsTable } from "@/components/RegionReadingsTable";
 import { StatRow } from "@/components/StatRow";
 
@@ -17,9 +17,10 @@ export default async function VideoDetailPage({ params }: PageProps) {
   const { id } = await params;
   const baseUrl = serverBaseUrl();
   try {
-    const [video, metrics] = await Promise.all([
+    const [video, metrics, activation] = await Promise.all([
       api.video(id, { baseUrl }),
       api.videoMetrics(id, { baseUrl }),
+      api.videoActivation(id, { baseUrl }),
     ]);
 
     const meanAvg = average(metrics.map((m) => m.mean));
@@ -85,10 +86,14 @@ export default async function VideoDetailPage({ params }: PageProps) {
             </div>
           </div>
           <div>
-            <BrainMeshPlaceholder label="placeholder — cortical mesh (timeline-driven)" />
+            <BrainDetailViewer
+              activation={activation}
+              meanActivation={meanAvg}
+              durationS={video.duration_s}
+            />
             <p className="mt-3 text-[11px] text-ink-400">
-              Scrubber slot. Once brain-viz lands, the timeline below this
-              area drives the predicted-activation heatmap on the mesh.
+              Drag or arrow-key the scrubber to drive the predicted
+              activation across the cortical surface.
             </p>
           </div>
         </section>

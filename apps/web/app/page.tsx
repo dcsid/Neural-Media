@@ -4,7 +4,7 @@ import {
   formatWatchTimeHuman,
 } from "@/lib/format";
 import { ApiOfflineState } from "@/components/ApiOfflineState";
-import { BrainMeshPlaceholder } from "@/components/BrainMeshPlaceholder";
+import { BrainMesh } from "@/components/brain";
 import { RegionBalanceBars } from "@/components/RegionBalanceBars";
 import { HourHistogram } from "@/components/HourHistogram";
 import { DayStrip } from "@/components/DayStrip";
@@ -72,10 +72,14 @@ export default async function DashboardPage() {
             </div>
           </div>
           <div>
-            <BrainMeshPlaceholder />
+            <div className="relative aspect-[5/4] w-full border border-line bg-canvas">
+              <BrainMesh activation={meanActivation} />
+            </div>
             <p className="mt-3 text-[11px] text-ink-400">
-              Hero mesh slot. The brain-viz worker plugs the live cortical
-              surface here.
+              Predicted average BOLD response across cortical regions.
+              Falls back to a low-poly placeholder until{" "}
+              <code className="font-mono">/brain/fsaverage5.glb</code>{" "}
+              is committed.
             </p>
           </div>
         </section>

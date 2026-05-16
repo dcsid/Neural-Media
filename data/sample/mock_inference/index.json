@@ -1,0 +1,64 @@
+{
+  "model_id": "tribe-v2-mock",
+  "model_version": "0.0.0-mock",
+  "seed": 7,
+  "sample_rate_hz": 1.5,
+  "videos": [
+    {
+      "video_id": "fc0937dc-a165-53bf-844a-a7a1ff46d37f",
+      "source_url": "https://www.tiktok.com/@sampleuser/video/7300000000000000001",
+      "inference_run_id": "89621d7d-0be9-500b-998d-a3f1a00d82a5",
+      "duration_s": 55.0,
+      "num_timepoints": 82
+    },
+    {
+      "video_id": "afe47531-55e4-5d69-a78a-345726166148",
+      "source_url": "https://www.tiktok.com/@chefcorpus/video/7300000000000000002",
+      "inference_run_id": "1d458bee-3a31-5846-ae26-0e69c3a9a8da",
+      "duration_s": 26.0,
+      "num_timepoints": 39
+    },
+    {
+      "video_id": "c00c9099-d041-5a65-998e-9c40817d191c",
+      "source_url": "https://www.tiktok.com/@traveltoks/video/7300000000000000003",
+      "inference_run_id": "f8d5b48d-f464-5d39-b3f2-1007c4804983",
+      "duration_s": 24.0,
+      "num_timepoints": 36
+    },
+    {
+      "video_id": "7229b8e8-1a73-5656-917b-1f2a723dfde3",
+      "source_url": "https://www.tiktok.com/@late.nite/video/7300000000000000004",
+      "inference_run_id": "e2811359-9d6c-5728-b933-5badbbaeb826",
+      "duration_s": 30.0,
+      "num_timepoints": 45
+    },
+    {
+      "video_id": "41a01030-ec5b-5b62-959e-4486ae0165c7",
+      "source_url": "https://www.tiktok.com/@asmrsoft/video/7300000000000000005",
+      "inference_run_id": "59168aee-b588-5e0b-9eb6-07287a34cc23",
+      "duration_s": 22.0,
+      "num_timepoints": 33
+    },
+    {
+      "video_id": "2cfb137a-2162-5de2-832e-7b7566fc1eb4",
+      "source_url": "https://www.tiktok.com/@newsdaily/video/7300000000000000006",
+      "inference_run_id": "c9d969f0-5718-51e4-aff0-e80c49f7cc8e",
+      "duration_s": 37.0,
+      "num_timepoints": 56
+    },
+    {
+      "video_id": "a5271f15-d632-59df-9c43-3929f3852a84",
+      "source_url": "https://www.tiktok.com/@comedybit/video/7300000000000000007",
+      "inference_run_id": "75cd5f81-8cac-52ed-956b-c78acff0e413",
+      "duration_s": 35.0,
+      "num_timepoints": 52
+    },
+    {
+      "video_id": "e4ad0955-31db-5080-96ec-8eea5c0c4957",
+      "source_url": "https://www.tiktok.com/@morningbrew/video/7300000000000000008",
+      "inference_run_id": "a339ebc5-9849-5acb-b180-e3b74b15600a",
+      "duration_s": 29.0,
+      "num_timepoints": 44
+    }
+  ]
+}

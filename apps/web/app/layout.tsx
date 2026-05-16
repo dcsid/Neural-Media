@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { Header } from "@/components/Header";
+import { Footer } from "@/components/Footer";
 
 export const metadata: Metadata = {
   title: "Neural Media",
@@ -7,9 +9,6 @@ export const metadata: Metadata = {
     "Predicted average cortical fMRI response to your TikTok watch history. Local-first. Non-commercial. Built on Meta FAIR TRIBE v2.",
 };
 
-// SCAFFOLD STUB.
-// Owner: frontend-dashboard worker. See docs/worker-briefs/frontend-dashboard.md.
-// Replace with header + nav + footer per the design direction.
 export default function RootLayout({
   children,
 }: {
@@ -17,7 +16,13 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" className="dark">
-      <body className="min-h-screen antialiased">{children}</body>
+      <body className="min-h-screen antialiased">
+        <div className="flex min-h-screen flex-col">
+          <Header />
+          <div className="flex-1">{children}</div>
+          <Footer />
+        </div>
+      </body>
     </html>
   );
 }

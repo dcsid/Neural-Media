@@ -1,0 +1,184 @@
+"""CLI smoke tests. Drives main() with stubbed orchestrator side effects."""
+
+from __future__ import annotations
+
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+from neural_media_inference import RunArtifacts
+
+from neural_media_pipeline import cli
+from neural_media_pipeline.orchestrate import _seed_for
+from shared.schemas import (
+    NUM_VERTICES,
+    REGION_IDS,
+    ActivationOutput,
+    InferenceRun,
+    RegionMetrics,
+)
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+FIXTURE = REPO_ROOT / "data" / "sample" / "tiktok_export" / "user_data.json"
+
+
+def _patched_orchestrator(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace ``cli.Orchestrator`` with one whose side effects are stubbed."""
+
+    def _fake_fetch(url, dest, ua):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"x")
+
+    def _fake_ffmpeg(args):
+        out = Path(args[-1])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"y")
+
+    def _fake_probe(_):
+        return 12.0
+
+    def _fake_inference(*, video_id, duration_s, seed, sample_rate_hz,
+                        activations_dir, extra_params=None, **kw):
+        run_id = f"run-{video_id}"
+        Path(activations_dir).mkdir(parents=True, exist_ok=True)
+        npz = Path(activations_dir) / f"{run_id}.npz"
+        npz.write_bytes(b"")
+        meta = Path(activations_dir) / f"{run_id}.meta.json"
+        meta.write_text("{}")
+        n_t = max(8, int(duration_s * sample_rate_hz))
+        return RunArtifacts(
+            inference_run=InferenceRun(
+                id=run_id, video_id=video_id, model_id="tribe-v2-mock",
+                model_version="0.0.0-mock", seed=seed, params_json={},
+                created_at=datetime.now(timezone.utc),
+                activation_path=str(npz), status="complete",
+            ),
+            region_metrics=[
+                RegionMetrics(
+                    region_id=r, video_id=video_id, inference_run_id=run_id,
+                    mean=0.0, peak=0.0, sustained=0.0, timeseries=[0.0] * n_t,
+                ) for r in REGION_IDS
+            ],
+            activation_payload=ActivationOutput(
+                inference_run_id=run_id, video_id=video_id,
+                num_vertices=NUM_VERTICES, num_timepoints=n_t,
+                sample_rate_hz=sample_rate_hz,
+                timestamps=[i / sample_rate_hz for i in range(n_t)],
+                keyframe_vertices={"0.0": [0.0]},
+                region_means={r: [0.0] * n_t for r in REGION_IDS},
+            ),
+            activation_path=npz, sidecar_path=meta,
+        )
+
+    real = cli.Orchestrator
+
+    def _factory(cfg):
+        return real(
+            cfg,
+            fetch=_fake_fetch, ffmpeg=_fake_ffmpeg,
+            sleep=lambda _s: None, probe_duration=_fake_probe,
+            inference_fn=_fake_inference,
+        )
+
+    monkeypatch.setattr(cli, "Orchestrator", _factory)
+
+
+def test_cli_ingests_fixture(monkeypatch: pytest.MonkeyPatch,
+                             tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    _patched_orchestrator(monkeypatch)
+
+    rc = cli.main([
+        str(FIXTURE),
+        "--data-root", str(tmp_path),
+    ])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "parsed: 8 videos, 8 events" in out
+    assert "completed: 8" in out
+    assert "failed: 0" in out
+
+    db = tmp_path / "sqlite" / "neural_media.db"
+    conn = sqlite3.connect(db)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0] == 8
+    finally:
+        conn.close()
+
+
+def test_cli_dry_run_does_not_create_db(tmp_path: Path,
+                                        capsys: pytest.CaptureFixture) -> None:
+    rc = cli.main([str(FIXTURE), "--data-root", str(tmp_path), "--dry-run"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "parsed: 8 videos, 8 events" in out
+    assert not (tmp_path / "sqlite" / "neural_media.db").exists()
+
+
+def test_cli_missing_export(tmp_path: Path,
+                            capsys: pytest.CaptureFixture) -> None:
+    rc = cli.main([str(tmp_path / "does-not-exist.json"), "--data-root", str(tmp_path)])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "not found" in err
+
+
+def test_cli_neither_export_nor_run_pending(tmp_path: Path,
+                                            capsys: pytest.CaptureFixture) -> None:
+    rc = cli.main(["--data-root", str(tmp_path)])
+    assert rc == 2
+    assert "--run-pending" in capsys.readouterr().err
+
+
+def test_cli_run_pending_uses_existing_db(monkeypatch: pytest.MonkeyPatch,
+                                          tmp_path: Path,
+                                          capsys: pytest.CaptureFixture) -> None:
+    _patched_orchestrator(monkeypatch)
+    # First, populate the db.
+    assert cli.main([str(FIXTURE), "--data-root", str(tmp_path)]) == 0
+    capsys.readouterr()
+
+    # Now drive run-pending — every job already complete, should be a no-op.
+    rc = cli.main(["--run-pending", "--data-root", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "completed: 0" in out
+    assert "failed: 0" in out
+
+
+def test_cli_output_never_leaks_full_url(monkeypatch: pytest.MonkeyPatch,
+                                         tmp_path: Path,
+                                         capsys: pytest.CaptureFixture) -> None:
+    """Even when jobs fail, only video ids appear in the output."""
+
+    def boom_fetch(url, dest, ua):
+        raise RuntimeError("ratelimited")
+
+    real = cli.Orchestrator
+
+    def factory(cfg):
+        return real(
+            cfg,
+            fetch=boom_fetch,
+            ffmpeg=lambda args: None,
+            sleep=lambda _s: None,
+            probe_duration=lambda p: 12.0,
+        )
+
+    monkeypatch.setattr(cli, "Orchestrator", factory)
+    cli.main([str(FIXTURE), "--data-root", str(tmp_path)])
+    captured = capsys.readouterr()
+    assert "https://www.tiktok.com" not in captured.out
+    assert "https://www.tiktok.com" not in captured.err
+    # video ids are uuid5 hashes of the URL — those ARE in the output and
+    # that's by design (they're the safe handle for failure follow-up).
+    seed_for_sample = _seed_for  # noqa: F841 — touch import for clarity
+
+
+def test_dunder_main_module_runs() -> None:
+    """``python -m neural_media_pipeline`` should resolve to the CLI."""
+    import importlib.util
+
+    spec = importlib.util.find_spec("neural_media_pipeline.__main__")
+    assert spec is not None and spec.origin is not None

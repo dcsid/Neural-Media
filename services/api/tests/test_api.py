@@ -1,12 +1,19 @@
-"""Contract endpoints — round-trip every GET through shared.schemas."""
+"""Contract endpoints — round-trip every GET through shared.schemas.
+
+Both store implementations (SampleStore + SqliteStore) are exercised
+behind the same endpoints via the parametrized `client` fixture, so the
+same contract assertions cover both paths.
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
 from neural_media_api.main import create_app
+from neural_media_api.sqlite_store import SqliteStore
 from neural_media_api.store import SampleStore
 from shared.schemas import (
     REGION_IDS,
@@ -20,12 +27,22 @@ from shared.schemas import (
 )
 
 
-@pytest.fixture
-def client(sample_root: Path) -> TestClient:
-    app = create_app(store=SampleStore(sample_root))
-    # `base_url` controls the synthetic Host header — must be loopback to
+@pytest.fixture(params=["sample", "sqlite"])
+def client(
+    request: pytest.FixtureRequest,
+    sample_root: Path,
+    tiktok_export_path: Path,
+    populated_sqlite_db: Path,
+) -> Iterator[TestClient]:
+    if request.param == "sample":
+        store = SampleStore(sample_root, tiktok_export_path=tiktok_export_path)
+    else:
+        store = SqliteStore(populated_sqlite_db)
+    app = create_app(store=store)
+    # base_url controls the synthetic Host header — must be loopback to
     # satisfy LoopbackOnlyMiddleware.
-    return TestClient(app, base_url="http://localhost")
+    with TestClient(app, base_url="http://localhost") as tc:
+        yield tc
 
 
 @pytest.fixture
@@ -40,15 +57,19 @@ def test_health(client: TestClient) -> None:
     assert r.json() == {"status": "ok"}
 
 
-def test_videos_round_trip(client: TestClient) -> None:
+def test_videos_round_trip(
+    client: TestClient, populated_video_ids: list[str]
+) -> None:
     r = client.get("/api/v1/videos")
     assert r.status_code == 200
     videos = [VideoMetadata.model_validate(v) for v in r.json()]
-    assert {v.id for v in videos} == {"vid-aaaa", "vid-bbbb"}
+    assert {v.id for v in videos} == set(populated_video_ids)
 
 
-def test_video_detail_round_trip(client: TestClient) -> None:
-    r = client.get("/api/v1/videos/vid-aaaa")
+def test_video_detail_round_trip(
+    client: TestClient, populated_video_ids: list[str]
+) -> None:
+    r = client.get(f"/api/v1/videos/{populated_video_ids[0]}")
     assert r.status_code == 200
     VideoMetadata.model_validate(r.json())
 
@@ -59,17 +80,23 @@ def test_unknown_video_is_404(client: TestClient) -> None:
     assert client.get("/api/v1/videos/nope/activation").status_code == 404
 
 
-def test_video_metrics_round_trip(client: TestClient) -> None:
-    r = client.get("/api/v1/videos/vid-aaaa/metrics")
+def test_video_metrics_round_trip(
+    client: TestClient, populated_video_ids: list[str]
+) -> None:
+    r = client.get(f"/api/v1/videos/{populated_video_ids[0]}/metrics")
     assert r.status_code == 200
     rows = [RegionMetrics.model_validate(m) for m in r.json()]
     assert {row.region_id for row in rows} == set(REGION_IDS)
 
 
-def test_video_activation_round_trip(client: TestClient) -> None:
-    r = client.get("/api/v1/videos/vid-aaaa/activation")
+def test_video_activation_round_trip(
+    client: TestClient, populated_video_ids: list[str]
+) -> None:
+    r = client.get(f"/api/v1/videos/{populated_video_ids[0]}/activation")
     assert r.status_code == 200
-    ActivationOutput.model_validate(r.json())
+    payload = ActivationOutput.model_validate(r.json())
+    # Wire format must include every canonical region.
+    assert set(payload.region_means) == set(REGION_IDS)
 
 
 def test_regions_round_trip(client: TestClient) -> None:
@@ -87,7 +114,6 @@ def test_aggregate_round_trip(client: TestClient) -> None:
     assert len(report.by_hour_of_day) == 24
     assert len(report.by_day_of_week) == 7
     assert set(report.by_region) == set(REGION_IDS)
-    # First/last watched timestamps come from the populated fixture.
     assert report.first_watched_at is not None
     assert report.last_watched_at is not None
 
@@ -99,11 +125,13 @@ def test_watch_events_round_trip(client: TestClient) -> None:
     assert len(events) == 3
 
 
-def test_inference_runs_round_trip(client: TestClient) -> None:
+def test_inference_runs_round_trip(
+    client: TestClient, populated_video_ids: list[str]
+) -> None:
     r = client.get("/api/v1/inference-runs")
     assert r.status_code == 200
     runs = [InferenceRun.model_validate(x) for x in r.json()]
-    assert {run.video_id for run in runs} == {"vid-aaaa", "vid-bbbb"}
+    assert {run.video_id for run in runs} == set(populated_video_ids)
 
 
 # --- Empty-fixture path: every list endpoint serves 200 + [] (not 500) ----

@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { AnimatePresence, motion } from "motion/react";
 import clsx from "clsx";
 import { api, ApiError } from "@/lib/api";
-import type { ImportJob } from "@shared/types";
+import type { Capabilities, ImportJob } from "@shared/types";
 import { ApiOfflineState } from "@/components/ApiOfflineState";
 
 // /import — drag-and-drop only. There is no file picker, no
@@ -118,6 +118,24 @@ function progressLabel(job: ImportJob): string {
   return `Importing ${current} / ${total}${phaseSuffix}`;
 }
 
+// Short human-readable phrase for the capability blocker tokens emitted
+// by GET /capabilities. Kept terse — this surfaces inline next to a
+// disabled radio, not as a paragraph.
+function describeBlocker(token: string): string {
+  switch (token) {
+    case "missing-extra":
+      return "install services/inference[real]";
+    case "missing-gpu":
+      return "no CUDA GPU detected";
+    case "missing-ffmpeg":
+      return "ffmpeg not on PATH";
+    case "missing-yt-dlp":
+      return "yt-dlp not on PATH";
+    default:
+      return token;
+  }
+}
+
 function statusVerb(status: ImportJob["status"]): string {
   switch (status) {
     case "queued":
@@ -140,9 +158,38 @@ export default function ImportPage() {
   const [windowAmount, setWindowAmount] = useState<number>(DEFAULT_WINDOW_AMOUNT);
   const [windowUnit, setWindowUnit] = useState<WindowUnit>(DEFAULT_WINDOW_UNIT);
   const [mode, setMode] = useState<RunMode>("mock");
+  // null until the GET /capabilities probe returns. When `real:false`, we
+  // gray out the Real radio and tooltip the first blocker so the user
+  // doesn't try a mode the host can't run.
+  const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
   // Track the active polling token so an in-flight loop from a
   // previous upload can't write into a fresh one.
   const pollTokenRef = useRef(0);
+
+  // Probe capabilities once on mount. Best-effort: if the call fails we
+  // leave both modes enabled — the existing 400-with-detail path on
+  // /import still surfaces a useful message if Real then doesn't work.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .capabilities()
+      .then((caps) => {
+        if (!cancelled) setCapabilities(caps);
+      })
+      .catch(() => {
+        // swallow — the upload-time error path handles the rest.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const realDisabled =
+    capabilities !== null && capabilities.real === false;
+  const realBlocker =
+    realDisabled && capabilities && capabilities.real_blockers.length > 0
+      ? capabilities.real_blockers[0]
+      : null;
 
   const stopPolling = useCallback(() => {
     pollTokenRef.current += 1;
@@ -194,6 +241,12 @@ export default function ImportPage() {
 
   // Cancel any pending poll on unmount.
   useEffect(() => stopPolling, [stopPolling]);
+
+  // If capabilities reports real:false while the user is on Real, snap
+  // back to Mock so the next drop doesn't immediately 400.
+  useEffect(() => {
+    if (realDisabled && mode === "real") setMode("mock");
+  }, [realDisabled, mode]);
 
   const uploadFile = useCallback(
     async (file: File) => {
@@ -392,20 +445,35 @@ export default function ImportPage() {
             <span className="text-ink-100">Mock</span>
             <span className="text-ink-400">fast, synthetic outputs (no download, no GPU)</span>
           </label>
-          <label className="flex items-center gap-2">
+          <label
+            className={clsx(
+              "flex items-center gap-2",
+              realDisabled && "cursor-not-allowed opacity-50",
+            )}
+            title={
+              realBlocker
+                ? `Real mode unavailable: ${describeBlocker(realBlocker)}`
+                : undefined
+            }
+          >
             <input
               type="radio"
               name="mode"
               value="real"
               checked={mode === "real"}
               onChange={onModeChange}
-              disabled={!acceptingDrop}
+              disabled={!acceptingDrop || realDisabled}
               className="accent-accent disabled:opacity-50"
             />
             <span className="text-ink-100">Real</span>
             <span className="text-ink-400">
               yt-dlp + ffmpeg + TRIBE v2 (needs GPU + <code className="font-mono">[real]</code> install + accepted licenses)
             </span>
+            {realDisabled && realBlocker && (
+              <span className="ml-1 font-mono text-[10px] uppercase tracking-wider text-accent">
+                · {describeBlocker(realBlocker)}
+              </span>
+            )}
           </label>
         </div>
       </div>

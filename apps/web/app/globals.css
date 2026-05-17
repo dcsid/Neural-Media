@@ -72,3 +72,20 @@ body {
     transition-duration: 0.001ms !important;
   }
 }
+
+/* Pure-CSS fade-in used for the dashboard cards. Short, single-fire,
+   honours prefers-reduced-motion (the media query above zeroes it out). */
+@keyframes motion-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.motion-fade-in {
+  animation: motion-fade-in 320ms ease-out both;
+}
+

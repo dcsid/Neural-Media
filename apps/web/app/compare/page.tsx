@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { REGION_IDS, type RegionId, type RegionMetrics } from "@shared/types";
 import { api, ApiError, serverBaseUrl } from "@/lib/api";
 import { ApiOfflineState } from "@/components/ApiOfflineState";
@@ -71,6 +72,15 @@ export default async function ComparePage({ searchParams }: PageProps) {
           share a y-axis so peaks and shapes are directly comparable. The
           difference column (<span className="text-ink-50">A − B</span>) is on
           predicted-activation means.
+        </p>
+        <p className="mt-3 text-[11px] text-ink-400">
+          Comparing time windows instead?{" "}
+          <Link
+            href="/compare/windows"
+            className="text-ink-200 underline underline-offset-2 hover:text-accent"
+          >
+            Compare two windows →
+          </Link>
         </p>
 
         <ComparePicker

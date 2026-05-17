@@ -43,6 +43,10 @@ data/activations/*
 !data/activations/.gitkeep
 data/sqlite/*
 !data/sqlite/.gitkeep
+data/imports/*
+!data/imports/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
 
 # --- Misc -------------------------------------------------------------------
 *.log

@@ -30,6 +30,7 @@ from .schemas_re_export import (
     VideoMetadata,
     WatchEvent,
 )
+from .sqlite_store import SqliteStore
 from .store import SampleStore, Store
 
 # Loopback-only hosts permitted on the `Host` header. `Host` may include a
@@ -57,17 +58,41 @@ class LoopbackOnlyMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-def _default_sample_root() -> Path:
-    """Resolve the sample mock_inference directory.
-
-    Overridable via the `NEURAL_MEDIA_SAMPLE_ROOT` env var so tests can point
-    at a fixture directory without touching the repo's committed sample data.
-    """
-    env = os.environ.get("NEURAL_MEDIA_SAMPLE_ROOT")
-    if env:
-        return Path(env)
+def _repo_root() -> Path:
     # services/api/neural_media_api/main.py -> repo root is 3 levels up.
-    return Path(__file__).resolve().parents[3] / "data" / "sample" / "mock_inference"
+    return Path(__file__).resolve().parents[3]
+
+
+def _default_sample_root() -> Path:
+    """Sample mock_inference directory. `NEURAL_MEDIA_SAMPLE_ROOT` overrides."""
+    env = os.environ.get("NEURAL_MEDIA_SAMPLE_ROOT")
+    return Path(env) if env else _repo_root() / "data" / "sample" / "mock_inference"
+
+
+def _default_export_path() -> Path:
+    """Committed TikTok export. `NEURAL_MEDIA_TIKTOK_EXPORT` overrides."""
+    env = os.environ.get("NEURAL_MEDIA_TIKTOK_EXPORT")
+    return (
+        Path(env)
+        if env
+        else _repo_root() / "data" / "sample" / "tiktok_export" / "user_data.json"
+    )
+
+
+def _select_store() -> Store:
+    """Pick the backing store based on environment.
+
+    `NEURAL_MEDIA_DB_PATH` → SqliteStore. Otherwise → SampleStore reading
+    the committed fixtures. Either way, missing files degrade to empty
+    lists rather than crashing the API.
+    """
+    db_path = os.environ.get("NEURAL_MEDIA_DB_PATH")
+    if db_path:
+        return SqliteStore(db_path)
+    return SampleStore(
+        mock_inference_root=_default_sample_root(),
+        tiktok_export_path=_default_export_path(),
+    )
 
 
 def create_app(store: Store | None = None) -> FastAPI:
@@ -90,8 +115,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         allow_headers=["*"],
     )
 
-    backing: Store = store if store is not None else SampleStore(_default_sample_root())
-    app.state.store = backing
+    app.state.store = store if store is not None else _select_store()
 
     @app.get("/api/v1/health")
     def health() -> dict[str, str]:

@@ -17,8 +17,10 @@ const config: Config = {
           50: "#f4f5f7",
           100: "#dadce2",
           200: "#a9adb8",
-          300: "#7c818d",
-          400: "#5b606b",
+          // ink-300 / ink-400 lifted from #7c818d / #5b606b to pass
+          // WCAG 2 AA contrast against the #0a0b0d canvas.
+          300: "#9aa1ad",
+          400: "#7c818d",
           500: "#3f444e",
           600: "#2a2e36",
         },

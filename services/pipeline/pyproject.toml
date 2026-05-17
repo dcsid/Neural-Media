@@ -16,6 +16,9 @@ dependencies = [
 [tool.uv.sources]
 neural-media-inference = { path = "../inference", editable = true }
 
+[project.scripts]
+neural-media-pipeline = "neural_media_pipeline.cli:main"
+
 [project.optional-dependencies]
 # Real network/media tooling. Tests monkeypatch the network seam, so
 # yt-dlp is not required to run the test suite — install it only when

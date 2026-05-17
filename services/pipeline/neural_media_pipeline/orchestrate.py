@@ -53,9 +53,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from neural_media_inference import RunArtifacts, run_inference
+from neural_media_inference import InferenceBackend, RunArtifacts, run_inference
 
 from shared.schemas import InferenceRun, VideoMetadata, WatchEvent
 
@@ -95,6 +95,38 @@ _FALLBACK_TIMEPOINTS_MIN = 8  # ensures inference produces a usable run even
 # Injectable inference signature. Real callers default to run_inference.
 InferenceFn = Callable[..., RunArtifacts]
 ProbeFn = Callable[[Path], float]
+
+# Progress callback surface — consumed by the api-orchestrator's
+# /api/v1/import endpoint to drive the dashboard's progress UI.
+Phase = Literal["parsing", "downloading", "preprocessing", "inferring"]
+ProgressCallback = Callable[["ProgressEvent"], None]
+
+
+@dataclass(frozen=True)
+class ProgressEvent:
+    """One step in the ingest lifecycle.
+
+    Emitted at phase boundaries (one per video, per step) and once after
+    each video's inference completes with an incremented
+    ``videos_processed`` counter. ``message`` is the video id when the
+    event is bound to a specific video — never the source URL.
+    """
+
+    phase: Phase
+    videos_total: int = 0
+    videos_processed: int = 0
+    message: str | None = None
+
+
+def _synth_duration_s(video_id: str) -> float:
+    """Deterministic synthetic duration for mock mode.
+
+    Mirrors ``services/inference/scripts/build_sample_outputs.py``'s
+    ``_duration_for`` so the demo flow produces the same timeseries
+    lengths as the committed sample fixtures.
+    """
+    h = int.from_bytes(hashlib.sha256(video_id.encode()).digest()[:4], "big")
+    return 15.0 + (h % 46)
 
 
 # ---------------------------------------------------------------------------
@@ -224,12 +256,50 @@ def _ffprobe_duration_s(path: Path) -> float:
 
 @dataclass
 class OrchestratorConfig:
-    db_path: Path
-    videos_dir: Path
-    processed_dir: Path
-    activations_dir: Path
+    """Runtime config for the orchestrator.
+
+    Provide either ``data_root`` (and the four path fields default to
+    ``<root>/sqlite/neural_media.db``, ``<root>/videos`` etc.) or all
+    four paths explicitly. Mixed usage is also fine: any explicitly-set
+    path wins over the ``data_root``-derived default.
+
+    ``skip_download`` and ``skip_preprocess`` are the demo-mode toggles
+    — see the module docstring. With both true the orchestrator never
+    touches yt-dlp or ffmpeg and the synthesized per-video duration
+    matches the committed sample fixtures.
+
+    ``backend`` is forwarded to ``run_inference`` so callers can plug in
+    MockBackend (default-by-omission) or a real TRIBE backend without
+    re-wiring the test seam.
+    """
+
+    db_path: Path | None = None
+    videos_dir: Path | None = None
+    processed_dir: Path | None = None
+    activations_dir: Path | None = None
+    data_root: Path | None = None
+    skip_download: bool = False
+    skip_preprocess: bool = False
+    backend: InferenceBackend | None = None
     fmri_sample_rate_hz: float = _DEFAULT_FMRI_SAMPLE_RATE_HZ
     default_duration_s: float = _DEFAULT_DURATION_S
+
+    def __post_init__(self) -> None:
+        if self.data_root is not None:
+            root = Path(self.data_root)
+            self.db_path = self.db_path or root / "sqlite" / "neural_media.db"
+            self.videos_dir = self.videos_dir or root / "videos"
+            self.processed_dir = self.processed_dir or root / "videos_processed"
+            self.activations_dir = self.activations_dir or root / "activations"
+        missing = [
+            name for name in ("db_path", "videos_dir", "processed_dir", "activations_dir")
+            if getattr(self, name) is None
+        ]
+        if missing:
+            raise ValueError(
+                f"OrchestratorConfig: must set {', '.join(missing)} "
+                "(or pass data_root)"
+            )
 
 
 class Orchestrator:
@@ -276,32 +346,83 @@ class Orchestrator:
 
     # -- public API -------------------------------------------------------
 
-    def ingest_export(self, export_path: Path) -> IngestSummary:
-        """Parse a TikTok export, upsert rows, then drive every pending job."""
+    def run(
+        self,
+        export_path: Path | str,
+        *,
+        progress: ProgressCallback | None = None,
+    ) -> IngestSummary:
+        """Parse export → upsert → drive every pending job. Emits progress.
+
+        This is the canonical programmatic entry point — the in-process
+        equivalent of ``python -m neural_media_pipeline ...``. The api
+        worker calls it from a background thread off ``/api/v1/import``.
+
+        ``progress`` is invoked at every phase boundary and once more
+        after each video completes inference (with an incremented
+        ``videos_processed``). The callback is synchronous — the api
+        worker is responsible for queueing/serialising if it cares.
+        """
+        cb: ProgressCallback = progress or (lambda _e: None)
+
+        cb(ProgressEvent(phase="parsing", message="parsing export"))
         videos, events = parse_export(export_path)
         self._upsert_videos(videos)
         self._upsert_watch_events(events)
         queued = self._enqueue_pending(videos)
 
-        summary = self.run_pending()
+        summary = self._drive_all(cb)
         summary.parsed_videos = len(videos)
         summary.parsed_events = len(events)
         summary.queued = queued
         return summary
 
-    def run_pending(self) -> IngestSummary:
-        """Drive all non-complete jobs to completion (or failure)."""
+    # Back-compat name: thin wrapper around `run`.
+    def ingest_export(self, export_path: Path) -> IngestSummary:
+        return self.run(export_path)
+
+    def run_pending(
+        self, *, progress: ProgressCallback | None = None,
+    ) -> IngestSummary:
+        """Drive every non-complete job without re-parsing an export."""
+        cb: ProgressCallback = progress or (lambda _e: None)
+        return self._drive_all(cb)
+
+    # --- inner loop ------------------------------------------------------
+
+    def _drive_all(self, cb: ProgressCallback) -> IngestSummary:
         summary = IngestSummary()
-        for video_id in self._pending_job_ids():
+        pending = self._pending_job_ids()
+        total = len(pending)
+        # Emit the "switching out of parsing" event with totals known.
+        if total > 0:
+            first_phase: Phase = (
+                "inferring" if self.cfg.skip_download and self.cfg.skip_preprocess
+                else "preprocessing" if self.cfg.skip_download
+                else "downloading"
+            )
+            cb(ProgressEvent(phase=first_phase, videos_total=total, videos_processed=0))
+
+        processed = 0
+        for video_id in pending:
             video = self._load_video(video_id)
             if video is None:
                 continue
-            outcome = self._drive_one(video)
+            outcome = self._drive_one(video, cb=cb, total=total, processed=processed)
             if outcome.status == STATUS_COMPLETE:
                 summary.completed += 1
             elif outcome.status == STATUS_FAILED:
                 summary.failed += 1
                 summary.errors.append((video_id, outcome.error or "unknown"))
+            processed += 1
+            # End-of-video event: advances `videos_processed`. The api
+            # worker uses this to update its job-status row.
+            cb(ProgressEvent(
+                phase="inferring",
+                videos_total=total,
+                videos_processed=processed,
+                message=video_id,
+            ))
         return summary
 
     # -- DB I/O -----------------------------------------------------------
@@ -415,19 +536,44 @@ class Orchestrator:
 
     # -- pipeline steps ---------------------------------------------------
 
-    def _drive_one(self, video: VideoMetadata) -> _JobOutcome:
+    def _drive_one(
+        self,
+        video: VideoMetadata,
+        *,
+        cb: ProgressCallback,
+        total: int,
+        processed: int,
+    ) -> _JobOutcome:
         """Walk one video from current status → complete (or failed)."""
         self._bump_attempts(video.id)
         status = self._job_status(video.id)
 
         try:
             if status in (STATUS_QUEUED, STATUS_FAILED, None):
-                self._do_download(video)
+                if self.cfg.skip_download:
+                    self._mark_download_skipped(video)
+                else:
+                    cb(ProgressEvent(
+                        phase="downloading", videos_total=total,
+                        videos_processed=processed, message=video.id,
+                    ))
+                    self._do_download(video)
                 status = STATUS_DOWNLOADED
             if status == STATUS_DOWNLOADED:
-                self._do_preprocess(video)
+                if self.cfg.skip_preprocess:
+                    self._mark_preprocess_skipped(video)
+                else:
+                    cb(ProgressEvent(
+                        phase="preprocessing", videos_total=total,
+                        videos_processed=processed, message=video.id,
+                    ))
+                    self._do_preprocess(video)
                 status = STATUS_PREPROCESSED
             if status == STATUS_PREPROCESSED:
+                cb(ProgressEvent(
+                    phase="inferring", videos_total=total,
+                    videos_processed=processed, message=video.id,
+                ))
                 artifacts = self._do_inference(video)
                 return _JobOutcome(video_id=video.id, status=STATUS_COMPLETE,
                                    artifacts=artifacts)
@@ -438,6 +584,20 @@ class Orchestrator:
 
         # status was already STATUS_COMPLETE
         return _JobOutcome(video_id=video.id, status=STATUS_COMPLETE)
+
+    def _mark_download_skipped(self, video: VideoMetadata) -> None:
+        """Mock-mode shortcut: advance status without touching the network.
+
+        Leaves ``videos.downloaded=0`` and ``videos.local_path=NULL`` —
+        the demo path explicitly does NOT pretend a file is on disk.
+        """
+        self._update_job(video.id, status=STATUS_DOWNLOADED)
+
+    def _mark_preprocess_skipped(self, video: VideoMetadata) -> None:
+        """Mock-mode shortcut: advance status without invoking ffmpeg."""
+        self._update_job(
+            video.id, status=STATUS_PREPROCESSED, preprocessed_path=None,
+        )
 
     def _do_download(self, video: VideoMetadata) -> DownloadResult:
         res = download_video(
@@ -466,22 +626,7 @@ class Orchestrator:
         return res
 
     def _do_inference(self, video: VideoMetadata) -> RunArtifacts:
-        processed_path = Path(self._job_field(video.id, "preprocessed_path"))
-
-        duration_s = video.duration_s
-        if duration_s <= 0.0:
-            try:
-                duration_s = self._probe(processed_path)
-            except Exception as exc:  # noqa: BLE001
-                _log.debug("ffprobe failed for %s: %s", video.id, exc)
-                duration_s = 0.0
-        if duration_s <= 0.0:
-            duration_s = self.cfg.default_duration_s
-        # Make sure even a tiny duration produces enough timepoints for the
-        # mock backend's downsampler to be happy.
-        min_duration = _FALLBACK_TIMEPOINTS_MIN / self.cfg.fmri_sample_rate_hz
-        if duration_s < min_duration:
-            duration_s = min_duration
+        duration_s = self._resolve_duration_s(video)
 
         artifacts = self._infer(
             video_id=video.id,
@@ -490,6 +635,7 @@ class Orchestrator:
             sample_rate_hz=self.cfg.fmri_sample_rate_hz,
             activations_dir=self.cfg.activations_dir,
             extra_params=self.preprocess_cfg.extra_params(),
+            **({"backend": self.cfg.backend} if self.cfg.backend is not None else {}),
         )
 
         self._persist_run(artifacts)
@@ -511,6 +657,37 @@ class Orchestrator:
                 (duration_s, video.id),
             )
         return artifacts
+
+    def _resolve_duration_s(self, video: VideoMetadata) -> float:
+        """Pick the most reliable duration for an inference call.
+
+        Priority order:
+          1. ``videos.duration_s`` if non-zero (we cache probed values).
+          2. ffprobe over the preprocessed file, when we have one.
+          3. The mock-mode synthetic duration (deterministic in
+             video_id, matches the sample-fixture builder).
+          4. ``default_duration_s`` as the final fallback.
+
+        A floor of ``_FALLBACK_TIMEPOINTS_MIN / sample_rate_hz`` ensures
+        even a tiny duration produces enough timepoints for the mock
+        backend's downsampler.
+        """
+        duration_s = video.duration_s
+        if duration_s <= 0.0 and not self.cfg.skip_preprocess:
+            processed_path = self._job_field(video.id, "preprocessed_path")
+            if processed_path:
+                try:
+                    duration_s = self._probe(Path(processed_path))
+                except Exception as exc:  # noqa: BLE001
+                    _log.debug("ffprobe failed for %s: %s", video.id, exc)
+                    duration_s = 0.0
+        if duration_s <= 0.0 and self.cfg.skip_preprocess:
+            duration_s = _synth_duration_s(video.id)
+        if duration_s <= 0.0:
+            duration_s = self.cfg.default_duration_s
+
+        min_duration = _FALLBACK_TIMEPOINTS_MIN / self.cfg.fmri_sample_rate_hz
+        return max(duration_s, min_duration)
 
     def _persist_run(self, artifacts: RunArtifacts) -> None:
         run: InferenceRun = artifacts.inference_run
@@ -543,6 +720,9 @@ __all__ = [
     "IngestSummary",
     "Orchestrator",
     "OrchestratorConfig",
+    "Phase",
+    "ProgressCallback",
+    "ProgressEvent",
     "STATUS_COMPLETE",
     "STATUS_DOWNLOADED",
     "STATUS_FAILED",

@@ -13,7 +13,9 @@ private to the orchestrator and tracks job state for resume.
 
   videos              - VideoMetadata rows, one per unique source URL.
                         ``tags`` is stored as JSON in ``tags_json``;
-                        ``inserted_at`` preserves first-seen order.
+                        ``first_seen_idx`` preserves first-seen order
+                        and is read by api-orchestrator's SqliteStore
+                        for the canonical `/api/v1/videos` ordering.
   watch_events        - WatchEvent rows. FK → videos(id).
   inference_runs      - InferenceRun rows. FK → videos(id).
   region_metrics      - RegionMetrics rows. ``timeseries`` is JSON.
@@ -44,6 +46,7 @@ the orchestrator itself.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import shutil
@@ -134,53 +137,59 @@ def _synth_duration_s(video_id: str) -> float:
 # ---------------------------------------------------------------------------
 
 _SCHEMA_SQL = """
+-- The four tables below MUST match
+-- services/api/neural_media_api/sqlite_store.py::SCHEMA_STATEMENTS byte-
+-- for-byte on column names / types / defaults. api is the consumer; any
+-- drift here breaks /api/v1/* reads. ``import_jobs`` is owned by the api
+-- worker and intentionally NOT created here.
 CREATE TABLE IF NOT EXISTS videos (
-    id           TEXT PRIMARY KEY,
-    source_url   TEXT NOT NULL,
-    title        TEXT,
-    author       TEXT,
-    duration_s   REAL NOT NULL DEFAULT 0.0,
-    downloaded   INTEGER NOT NULL DEFAULT 0,
-    local_path   TEXT,
-    tags_json    TEXT NOT NULL DEFAULT '[]',
-    inserted_at  TEXT NOT NULL
+    id              TEXT PRIMARY KEY,
+    source_url      TEXT NOT NULL,
+    title           TEXT,
+    author          TEXT,
+    duration_s      REAL NOT NULL DEFAULT 0.0,
+    downloaded      INTEGER NOT NULL DEFAULT 0,
+    local_path      TEXT,
+    tags_json       TEXT NOT NULL DEFAULT '[]',
+    first_seen_idx  INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS watch_events (
-    id                   TEXT PRIMARY KEY,
-    video_id             TEXT NOT NULL REFERENCES videos(id),
-    watched_at           TEXT NOT NULL,
-    duration_watched_s   REAL,
-    completion_pct       REAL,
-    source               TEXT NOT NULL DEFAULT 'tiktok_export'
+    id                  TEXT PRIMARY KEY,
+    video_id            TEXT NOT NULL,
+    watched_at          TEXT NOT NULL,
+    duration_watched_s  REAL,
+    completion_pct      REAL,
+    source              TEXT NOT NULL DEFAULT 'tiktok_export'
 );
-CREATE INDEX IF NOT EXISTS ix_watch_events_video_id ON watch_events(video_id);
-CREATE INDEX IF NOT EXISTS ix_watch_events_watched_at ON watch_events(watched_at);
+CREATE INDEX IF NOT EXISTS idx_watch_events_watched_at ON watch_events(watched_at);
+CREATE INDEX IF NOT EXISTS idx_watch_events_video_id ON watch_events(video_id);
 
 CREATE TABLE IF NOT EXISTS inference_runs (
-    id                TEXT PRIMARY KEY,
-    video_id          TEXT NOT NULL REFERENCES videos(id),
-    model_id          TEXT NOT NULL,
-    model_version     TEXT NOT NULL,
-    seed              INTEGER NOT NULL,
-    params_json       TEXT NOT NULL DEFAULT '{}',
-    created_at        TEXT NOT NULL,
-    activation_path   TEXT NOT NULL,
-    status            TEXT NOT NULL DEFAULT 'pending'
+    id               TEXT PRIMARY KEY,
+    video_id         TEXT NOT NULL,
+    model_id         TEXT NOT NULL,
+    model_version    TEXT NOT NULL,
+    seed             INTEGER NOT NULL,
+    params_json      TEXT NOT NULL DEFAULT '{}',
+    created_at       TEXT NOT NULL,
+    activation_path  TEXT NOT NULL,
+    status           TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS ix_inference_runs_video_id ON inference_runs(video_id);
+CREATE INDEX IF NOT EXISTS idx_inference_runs_video_id ON inference_runs(video_id);
+CREATE INDEX IF NOT EXISTS idx_inference_runs_created_at ON inference_runs(created_at);
 
 CREATE TABLE IF NOT EXISTS region_metrics (
-    inference_run_id  TEXT NOT NULL REFERENCES inference_runs(id),
+    inference_run_id  TEXT NOT NULL,
     region_id         TEXT NOT NULL,
     video_id          TEXT NOT NULL,
     mean              REAL NOT NULL,
     peak              REAL NOT NULL,
     sustained         REAL NOT NULL,
-    timeseries_json   TEXT NOT NULL,
+    timeseries_json   TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (inference_run_id, region_id)
 );
-CREATE INDEX IF NOT EXISTS ix_region_metrics_video_id ON region_metrics(video_id);
+CREATE INDEX IF NOT EXISTS idx_region_metrics_video_id ON region_metrics(video_id);
 
 CREATE TABLE IF NOT EXISTS pipeline_jobs (
     video_id            TEXT PRIMARY KEY REFERENCES videos(id),
@@ -281,6 +290,13 @@ class OrchestratorConfig:
     skip_download: bool = False
     skip_preprocess: bool = False
     backend: InferenceBackend | None = None
+    # When True, ask the inference runner to skip zlib compression on
+    # activation persistence. ``None`` (default) means "don't pass the
+    # arg" — the runner currently does not expose it, so we sniff for
+    # support and forward iff the parameter exists. Mock mode (both
+    # skip flags) opts in automatically because that's the demo path
+    # where the 23-seconds-of-zlib was profiled away.
+    compress_activations: bool | None = None
     fmri_sample_rate_hz: float = _DEFAULT_FMRI_SAMPLE_RATE_HZ
     default_duration_s: float = _DEFAULT_DURATION_S
 
@@ -325,6 +341,15 @@ class Orchestrator:
         self._sleep = sleep  # None → downloader uses time.sleep
         self._probe = probe_duration
         self._infer = inference_fn
+        # Sniff once whether the configured inference fn supports the
+        # `compress` kwarg. Avoids try/except on every call and keeps
+        # the test seam (fakes use **kw and would silently swallow it).
+        try:
+            self._infer_accepts_compress = (
+                "compress" in inspect.signature(inference_fn).parameters
+            )
+        except (TypeError, ValueError):
+            self._infer_accepts_compress = False
 
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
         cfg.activations_dir.mkdir(parents=True, exist_ok=True)
@@ -428,19 +453,28 @@ class Orchestrator:
     # -- DB I/O -----------------------------------------------------------
 
     def _upsert_videos(self, videos: list[VideoMetadata]) -> None:
-        now = _utcnow_iso()
+        if not videos:
+            return
+        # Continue numbering from where the table left off so subsequent
+        # imports keep stable first-seen order for /api/v1/videos. Gaps
+        # (from INSERT OR IGNORE skips) are fine — the column only needs
+        # to be monotonic, not dense.
+        cur = self._conn.execute(
+            "SELECT COALESCE(MAX(first_seen_idx), -1) FROM videos"
+        )
+        next_idx = int(cur.fetchone()[0]) + 1
         with self._conn:
-            for v in videos:
+            for i, v in enumerate(videos):
                 self._conn.execute(
                     """
                     INSERT OR IGNORE INTO videos
                         (id, source_url, title, author, duration_s,
-                         downloaded, local_path, tags_json, inserted_at)
+                         downloaded, local_path, tags_json, first_seen_idx)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (v.id, v.source_url, v.title, v.author, v.duration_s,
                      1 if v.downloaded else 0, v.local_path,
-                     json.dumps(v.tags), now),
+                     json.dumps(v.tags), next_idx + i),
                 )
 
     def _upsert_watch_events(self, events: list[WatchEvent]) -> None:
@@ -628,15 +662,20 @@ class Orchestrator:
     def _do_inference(self, video: VideoMetadata) -> RunArtifacts:
         duration_s = self._resolve_duration_s(video)
 
-        artifacts = self._infer(
+        infer_kwargs: dict[str, Any] = dict(
             video_id=video.id,
             duration_s=duration_s,
             seed=_seed_for(video.id),
             sample_rate_hz=self.cfg.fmri_sample_rate_hz,
             activations_dir=self.cfg.activations_dir,
             extra_params=self.preprocess_cfg.extra_params(),
-            **({"backend": self.cfg.backend} if self.cfg.backend is not None else {}),
         )
+        if self.cfg.backend is not None:
+            infer_kwargs["backend"] = self.cfg.backend
+        compress = self._resolve_compress_flag()
+        if compress is not None:
+            infer_kwargs["compress"] = compress
+        artifacts = self._infer(**infer_kwargs)
 
         self._persist_run(artifacts)
         self._update_job(
@@ -657,6 +696,28 @@ class Orchestrator:
                 (duration_s, video.id),
             )
         return artifacts
+
+    def _resolve_compress_flag(self) -> bool | None:
+        """Pick the value to pass for ``run_inference(compress=...)``.
+
+        We only forward when the runner actually has that parameter — if
+        it doesn't, kwargs would be rejected. Today's runner doesn't
+        expose it; the moment ml-inference adds the slot, mock-mode runs
+        automatically opt out of zlib (saves ~115 ms/video on the
+        documented profile).
+
+        Resolution order:
+          1. Explicit ``OrchestratorConfig.compress_activations``.
+          2. False when both skip flags are set (mock/demo mode).
+          3. None — i.e. don't pass the kwarg at all.
+        """
+        if not self._infer_accepts_compress:
+            return None
+        if self.cfg.compress_activations is not None:
+            return self.cfg.compress_activations
+        if self.cfg.skip_download and self.cfg.skip_preprocess:
+            return False
+        return None
 
     def _resolve_duration_s(self, video: VideoMetadata) -> float:
         """Pick the most reliable duration for an inference call.

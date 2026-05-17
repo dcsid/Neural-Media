@@ -9,6 +9,8 @@ dependencies = [
   "uvicorn[standard]>=0.30",
   "pydantic>=2.6",
   "numpy>=1.26",
+  # FastAPI's multipart form parsing (UploadFile / Form) requires this.
+  "python-multipart>=0.0.9",
   "neural-media-inference",
   "neural-media-pipeline",
 ]

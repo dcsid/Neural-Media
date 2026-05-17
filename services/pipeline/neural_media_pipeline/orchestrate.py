@@ -49,16 +49,23 @@ import hashlib
 import inspect
 import json
 import logging
+import multiprocessing
+import os
 import shutil
 import sqlite3
 import subprocess
-from collections.abc import Callable
+import sys
+from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 from neural_media_inference import InferenceBackend, RunArtifacts, run_inference
+from neural_media_inference.aggregate import aggregate_region_metrics
+from neural_media_inference.backend import MockBackend as _MockBackend
+from neural_media_inference.runner import DEFAULT_PREPROCESSING_PARAMS
 
 from shared.schemas import InferenceRun, VideoMetadata, WatchEvent
 
@@ -130,6 +137,231 @@ def _synth_duration_s(video_id: str) -> float:
     """
     h = int.from_bytes(hashlib.sha256(video_id.encode()).digest()[:4], "big")
     return 15.0 + (h % 46)
+
+
+def _chunks(seq: Sequence[Any], size: int) -> Iterable[Sequence[Any]]:
+    """Yield consecutive slices of ``seq`` of length ``size``."""
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+# ---------------------------------------------------------------------------
+# Mock-fast workers (module level for ProcessPoolExecutor picklability)
+# ---------------------------------------------------------------------------
+#
+# The default ``inference_fn=run_inference`` is the only entry point that is
+# safe to ship across a process boundary — every test in this package
+# injects a closure-based fake, which is not pickleable. The fast path
+# (``_drive_mock_fast``) opts in only when the configured ``inference_fn``
+# is the module default; that keeps the existing 94 tests on the sequential
+# path while production CLI runs (``python -m neural_media_pipeline --mock
+# ...``) get the multi-core speed-up.
+
+_WORKER_BACKEND: InferenceBackend | None = None
+
+
+def _pool_context() -> multiprocessing.context.BaseContext:
+    """Pick the cheapest multiprocessing start method available.
+
+    Default ``spawn`` re-imports every module in each worker — on macOS
+    / Linux that's a hard 100-200 ms tax per worker, which dominated the
+    1000-video bench at 14 workers (spawn 13.9s vs forkserver 6.9s).
+    ``forkserver`` keeps a long-lived helper that fork()s on demand, so
+    workers inherit pre-imported modules without the safety footguns of
+    raw ``fork``. Falls back to whatever default is available on
+    platforms that don't ship forkserver (e.g. native Windows).
+    """
+    available = set(multiprocessing.get_all_start_methods())
+    # fork beats forkserver here because forkserver's helper has its own
+    # cold Python state — every worker re-imports neural_media_inference
+    # via inheritance from a near-empty parent (the helper). Plain fork
+    # inherits the *real* parent, so numpy + pydantic + our modules are
+    # already resident. Empirically: fork-14w 1000 videos = 7.0s vs
+    # forkserver = 12.5s vs spawn = 13.9s. macOS fork is "unsafe" for
+    # ObjC/Cocoa frameworks, but neither our workers nor their imports
+    # touch those.
+    for preferred in ("fork", "forkserver"):
+        if preferred in available:
+            return multiprocessing.get_context(preferred)
+    return multiprocessing.get_context()  # spawn fallback
+
+
+def _mock_worker_init() -> None:
+    """Build the MockBackend once per worker process.
+
+    ``np.random.default_rng`` is cheap but the backend's ``model_id`` /
+    ``model_version`` are class-level constants, so this is mostly a hook
+    for future backends that have heavier setup (e.g. weights load).
+    """
+    global _WORKER_BACKEND
+    _WORKER_BACKEND = _MockBackend()
+
+
+def _lean_config_hash(
+    *, model_id: str, model_version: str, seed: int, params: dict[str, Any],
+) -> str:
+    """Replicates ``runner._config_hash`` without importing the private symbol.
+
+    Same JSON-canonicalisation + SHA-256 the runner uses, so two videos
+    that produce the same hash here would produce the same hash via
+    ``run_inference``. We replicate (rather than import) because the
+    runner's helper is private and out of this worker's scope to refactor.
+    """
+    payload = json.dumps(
+        {"model_id": model_id, "model_version": model_version,
+         "seed": seed, "params": params},
+        sort_keys=True, default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _mock_worker_run_lean(
+    args: dict[str, Any],
+) -> tuple[str, dict[str, Any] | str]:
+    """Inference + row-building with NO disk I/O.
+
+    Used in the ``purge_activations=True`` branch of the mock-fast path.
+    The full ``run_inference`` would write a ``(T, 20484)`` fp32 ``.npz``
+    and a JSON sidecar that the orchestrator then *immediately unlinks*;
+    skipping those writes drops 14-worker contention on the activations
+    directory and is the single biggest win for ``--mock
+    --purge-after-inference`` (the demo path).
+
+    What we keep doing: backend.infer + aggregate_region_metrics + the
+    reproducibility envelope (model id, version, seed, params_json with
+    config_hash). The SQLite rows that land are byte-equal to the
+    full-runner path except for ``activation_path``, which would have
+    been the npz path the orchestrator was about to delete anyway — we
+    seed it with the same conventional name (``<activations_dir>/{run_id}.npz``)
+    so a downstream check that doesn't know the file was never written
+    sees a consistent shape.
+    """
+    video_id = args["video_id"]
+    try:
+        backend: InferenceBackend = _WORKER_BACKEND  # set by init
+        duration_s = float(args["duration_s"])
+        sample_rate_hz = float(args["sample_rate_hz"])
+        seed = int(args["seed"])
+        activations = backend.infer(
+            video_id=video_id, duration_s=duration_s,
+            seed=seed, sample_rate_hz=sample_rate_hz,
+        )
+        num_timepoints = int(activations.shape[0])
+
+        run_id = _uuid_for_run()
+        activations_dir = Path(args["activations_dir"])
+        # Conventional path even though nothing lands on disk — the
+        # orchestrator will set activation_path='' on the purge sweep.
+        activation_path = str(activations_dir / f"{run_id}.npz")
+
+        preprocessing_params = {
+            **DEFAULT_PREPROCESSING_PARAMS, **(args.get("extra_params") or {}),
+        }
+        created_at = datetime.now(timezone.utc)
+        params_json: dict[str, Any] = {
+            "duration_s": duration_s,
+            "sample_rate_hz": sample_rate_hz,
+            "num_timepoints": num_timepoints,
+            "preprocessing": preprocessing_params,
+            "created_at_utc": created_at.isoformat(),
+        }
+        params_json["config_hash"] = _lean_config_hash(
+            model_id=backend.model_id, model_version=backend.model_version,
+            seed=seed, params=params_json,
+        )
+
+        metric_dicts = aggregate_region_metrics(
+            activations, video_id=video_id, inference_run_id=run_id,
+        )
+
+        return (video_id, {
+            "run_row": (
+                run_id, video_id, backend.model_id, backend.model_version,
+                seed, json.dumps(params_json), created_at.isoformat(),
+                activation_path, "complete",
+            ),
+            "metric_rows": [
+                (m["inference_run_id"], m["region_id"], m["video_id"],
+                 m["mean"], m["peak"], m["sustained"],
+                 json.dumps(m["timeseries"]))
+                for m in metric_dicts
+            ],
+            "duration_s": duration_s,
+            "activation_path": activation_path,
+            "sidecar_path": str(activations_dir / f"{run_id}.meta.json"),
+            "inference_run_id": run_id,
+        })
+    except Exception as exc:  # noqa: BLE001 — boundary swallow
+        return (video_id, f"{type(exc).__name__}: {exc}")
+
+
+def _uuid_for_run() -> str:
+    """uuid4 via uuid; module-level so workers don't re-import per task."""
+    import uuid
+    return str(uuid.uuid4())
+
+
+def _mock_worker_run(
+    args: dict[str, Any],
+) -> tuple[str, dict[str, Any] | str]:
+    """Run one inference in the worker. Returns ``(video_id, result)``.
+
+    Why we return SQLite-ready tuples (not RunArtifacts):
+    pickling a full ``RunArtifacts`` back to the parent is ~1 MB/video
+    because ``ActivationOutput.keyframe_vertices`` is 5 keyframes ×
+    20 484 floats. On a 1000-video run that's ~1 GB of inter-process
+    traffic — empirically the parallel path was 2-4× *slower* than the
+    sequential one until we collapsed the return payload to the rows
+    we actually need to insert.
+
+    All side effects (npz, meta.json, optional payload JSON) happen in
+    the worker process; the parent only does the bulk SQLite writes.
+
+    On failure: returns ``(video_id, error_string)``. The worker
+    boundary must not leak exceptions — the parent aggregates failures
+    into the IngestSummary exactly like the sequential path does.
+    """
+    video_id = args["video_id"]
+    try:
+        kw = {
+            "video_id": video_id,
+            "duration_s": args["duration_s"],
+            "seed": args["seed"],
+            "sample_rate_hz": args["sample_rate_hz"],
+            "activations_dir": args["activations_dir"],
+            "extra_params": args["extra_params"],
+            "backend": _WORKER_BACKEND,
+        }
+        artifacts = run_inference(**kw)
+        # Persist the downsampled payload JSON next to the npz only when
+        # purge_activations is off — same gate the orchestrator applies
+        # in the sequential path. Doing it here keeps the (large)
+        # ActivationOutput out of the pickled return value.
+        if not args["purge_activations"]:
+            payload_path = (
+                Path(args["activations_dir"])
+                / f"{artifacts.inference_run.id}.json"
+            )
+            payload_path.write_text(artifacts.activation_payload.model_dump_json())
+        run = artifacts.inference_run
+        return (video_id, {
+            "run_row": (
+                run.id, run.video_id, run.model_id, run.model_version,
+                run.seed, json.dumps(run.params_json),
+                run.created_at.isoformat(), run.activation_path, run.status,
+            ),
+            "metric_rows": [
+                (m.inference_run_id, m.region_id, m.video_id,
+                 m.mean, m.peak, m.sustained, json.dumps(m.timeseries))
+                for m in artifacts.region_metrics
+            ],
+            "duration_s": args["duration_s"],
+            "activation_path": str(artifacts.activation_path),
+            "sidecar_path": str(artifacts.sidecar_path),
+            "inference_run_id": run.id,
+        })
+    except Exception as exc:  # noqa: BLE001 — boundary swallow, see above
+        return (video_id, f"{type(exc).__name__}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +545,16 @@ class OrchestratorConfig:
     # fallback for that. Independent of purge_after_inference: a caller
     # can keep mp4s but drop activations, or vice versa.
     purge_activations: bool = False
+    # Mock-mode parallelism cap. ``None`` (default) means "auto": pick
+    # ``min(cpu_count, max(1, total // 50))`` so a 5k-video ingest fans
+    # out across every core while an 8-video fixture stays single-process
+    # (worker startup overhead would dwarf the wins). ``1`` or ``0``
+    # forces the sequential path — useful for tests and for reproducing
+    # ordering-sensitive bugs. Only honoured when both ``skip_download``
+    # and ``skip_preprocess`` are true AND the orchestrator's
+    # ``inference_fn`` is the module-default ``run_inference`` (the only
+    # one we can pickle across the process boundary).
+    parallel_workers: int | None = None
 
     def __post_init__(self) -> None:
         if self.data_root is not None:
@@ -443,18 +685,34 @@ class Orchestrator:
     # --- inner loop ------------------------------------------------------
 
     def _drive_all(self, cb: ProgressCallback) -> IngestSummary:
-        summary = IngestSummary()
         pending = self._pending_job_ids()
         total = len(pending)
-        # Emit the "switching out of parsing" event with totals known.
-        if total > 0:
-            first_phase: Phase = (
-                "inferring" if self.cfg.skip_download and self.cfg.skip_preprocess
-                else "preprocessing" if self.cfg.skip_download
-                else "downloading"
-            )
-            cb(ProgressEvent(phase=first_phase, videos_total=total, videos_processed=0))
+        if total == 0:
+            return IngestSummary()
 
+        # Mock-mode fast path: bypass the per-video DB chatter, parallelise
+        # the inference loop, and batch SQLite writes at the end. Only
+        # safe when the inference_fn is the picklable module default —
+        # closures (every test in this package) fall through to the
+        # sequential path below.
+        if self._fast_path_available():
+            return self._drive_mock_fast(cb, pending)
+
+        # Emit the "switching out of parsing" event with totals known.
+        first_phase: Phase = (
+            "inferring" if self.cfg.skip_download and self.cfg.skip_preprocess
+            else "preprocessing" if self.cfg.skip_download
+            else "downloading"
+        )
+        cb(ProgressEvent(phase=first_phase, videos_total=total, videos_processed=0))
+
+        # Coalesce per-video progress at large totals — the api worker
+        # writes the dashboard row on every event and the UI can only
+        # render ~200 distinct positions on a progress bar anyway. For
+        # the 8-video fixture every event still fires (every == 1).
+        every = max(1, total // 200)
+
+        summary = IngestSummary()
         processed = 0
         for video_id in pending:
             video = self._load_video(video_id)
@@ -468,14 +726,391 @@ class Orchestrator:
                 summary.errors.append((video_id, outcome.error or "unknown"))
             processed += 1
             # End-of-video event: advances `videos_processed`. The api
-            # worker uses this to update its job-status row.
-            cb(ProgressEvent(
-                phase="inferring",
-                videos_total=total,
-                videos_processed=processed,
-                message=video_id,
-            ))
+            # worker uses this to update its job-status row. Coalesced
+            # at large totals but the last event always fires so the UI
+            # converges on 100%.
+            if processed % every == 0 or processed == total:
+                cb(ProgressEvent(
+                    phase="inferring",
+                    videos_total=total,
+                    videos_processed=processed,
+                    message=video_id,
+                ))
         return summary
+
+    def _fast_path_available(self) -> bool:
+        """Whether the mock-fast path can take over for this run.
+
+        Three conditions:
+          * Both skip flags set (i.e. mock/demo mode — no yt-dlp, no
+            ffmpeg).
+          * The inference callable is the module-default ``run_inference``
+            (the only one we can ship to a worker process; closures fail
+            to pickle).
+          * The user has not explicitly capped workers at 1 (the opt-out
+            for tests that want the sequential path even in mock mode).
+        """
+        if not (self.cfg.skip_download and self.cfg.skip_preprocess):
+            return False
+        if self._infer is not run_inference:
+            return False
+        if self.cfg.parallel_workers is not None and self.cfg.parallel_workers <= 1:
+            return False
+        return True
+
+    # --- mock-mode fast path --------------------------------------------
+
+    def _drive_mock_fast(
+        self,
+        cb: ProgressCallback,
+        pending: list[str],
+    ) -> IngestSummary:
+        """Bulk + parallel mock-mode driver. Replaces ``_drive_all`` when
+        ``_fast_path_available()`` returns True.
+
+        Contract preservation:
+          * Same SQLite rows land (videos.duration_s, inference_runs,
+            region_metrics, pipeline_jobs.status='complete').
+          * Same artifacts on disk when ``purge_activations`` is off
+            (npz + meta.json + payload JSON next to them).
+          * Same purge semantics when either purge flag is on.
+          * Progress events: one initial "totals known" tick, then
+            ``min(200, total)`` per-video ticks coalesced across
+            completions, then a final tick at 100%.
+
+        Failure semantics: each worker swallows exceptions and returns
+        an error string; the parent flips the corresponding job to
+        FAILED via the same code path as the sequential driver.
+        """
+        total = len(pending)
+        summary = IngestSummary()
+
+        cb(ProgressEvent(phase="inferring", videos_total=total, videos_processed=0))
+        every = max(1, total // 200)
+
+        videos = self._load_videos_by_ids(pending)
+        # Bump attempts up-front for every pending job — matches the
+        # sequential path's bump-then-execute order.
+        self._bump_attempts_bulk([v.id for v in videos])
+
+        args_by_id: dict[str, dict[str, Any]] = {}
+        sample_rate_hz = self.cfg.fmri_sample_rate_hz
+        extra_params = self.preprocess_cfg.extra_params()
+        purge_activations = self.cfg.purge_activations
+        for v in videos:
+            duration_s = self._resolve_duration_s(v)
+            args_by_id[v.id] = {
+                "video_id": v.id,
+                "duration_s": duration_s,
+                "seed": _seed_for(v.id),
+                "sample_rate_hz": sample_rate_hz,
+                "activations_dir": self.cfg.activations_dir,
+                "extra_params": extra_params,
+                "purge_activations": purge_activations,
+            }
+
+        n_workers = self._resolve_worker_count(total)
+        completed: list[dict[str, Any]] = []
+        failed: list[tuple[str, str]] = []
+
+        def _record_result(video_id: str, result: dict[str, Any] | str) -> None:
+            if isinstance(result, dict):
+                completed.append(result)
+            else:
+                failed.append((video_id, result))
+
+        processed = 0
+        last_video_id: str | None = None
+
+        # Worker selection: the lean worker skips ``run_inference``'s
+        # ``np.savez`` + sidecar write entirely, which under 14 parallel
+        # workers was contending on the activations directory and
+        # turning a CPU-bound problem into a disk-bound one. Safe only
+        # when the disk artifacts would be unlinked moments later —
+        # i.e. ``purge_activations=True``. Otherwise we go through the
+        # full runner so the npz + sidecar land on disk for /v/[id].
+        worker_fn = (
+            _mock_worker_run_lean if purge_activations else _mock_worker_run
+        )
+
+        args_list = list(args_by_id.values())
+        if n_workers <= 1:
+            # Sequential mock-fast: still bypasses per-video DB chatter
+            # and avoids process-pool startup on small ingests.
+            _mock_worker_init()
+            for args in args_list:
+                video_id, result = worker_fn(args)
+                _record_result(video_id, result)
+                processed += 1
+                last_video_id = video_id
+                if processed % every == 0 or processed == total:
+                    cb(ProgressEvent(
+                        phase="inferring", videos_total=total,
+                        videos_processed=processed, message=video_id,
+                    ))
+        else:
+            # forkserver beats spawn by 2× on macOS / Linux because each
+            # worker doesn't re-import numpy + pydantic + neural_media_*
+            # from scratch — the bench script proved spawn-14w on 1000
+            # videos was *slower* than sequential mock-fast, and switching
+            # to forkserver flipped it to a clean 1.6× speedup. Windows
+            # falls back to the default (spawn) since forkserver isn't
+            # available there.
+            mp_ctx = _pool_context()
+            with ProcessPoolExecutor(
+                max_workers=n_workers, initializer=_mock_worker_init,
+                mp_context=mp_ctx,
+            ) as pool:
+                # chunksize tuned for the typical task size — each call
+                # is ~10 ms of MockBackend.infer + a few ms of npz +
+                # JSON I/O. Empirically (see bench_mock.py log) small
+                # chunks beat large ones for these short tasks: 1000
+                # videos × 14 workers ran 7.8s at chunksize=17 vs 6.7s
+                # at chunksize=1, because tail-stragglers dominate the
+                # wall time. Cap at 4 to keep the queue lock from
+                # bottlenecking on very large ingests.
+                chunksize = max(1, min(4, total // (n_workers * 16) or 1))
+                for video_id, result in pool.map(
+                    worker_fn, args_list, chunksize=chunksize,
+                ):
+                    _record_result(video_id, result)
+                    processed += 1
+                    last_video_id = video_id
+                    if processed % every == 0 or processed == total:
+                        cb(ProgressEvent(
+                            phase="inferring", videos_total=total,
+                            videos_processed=processed, message=video_id,
+                        ))
+
+        # Bulk persistence — one transaction for runs + region_metrics,
+        # one for the job-status updates, one for the duration backfill.
+        self._persist_runs_bulk_from_rows(completed)
+        self._update_jobs_bulk_from_rows(completed=completed, failed=failed)
+        self._backfill_durations_bulk_from_rows(completed)
+
+        # Side-effect work that doesn't fit in a bulk write: optional
+        # post-inference cleanup of mp4s and/or activation blobs.
+        if self.cfg.purge_after_inference:
+            self._purge_video_artifacts_bulk(
+                [row["run_row"][1] for row in completed]  # row[1] = video_id
+            )
+        if purge_activations:
+            self._purge_activation_artifacts_bulk_from_rows(completed)
+
+        # Final tick if the coalescer skipped it.
+        if processed > 0 and processed % every != 0 and last_video_id is not None:
+            cb(ProgressEvent(
+                phase="inferring", videos_total=total,
+                videos_processed=processed, message=last_video_id,
+            ))
+
+        summary.completed = len(completed)
+        summary.failed = len(failed)
+        summary.errors.extend(failed)
+        return summary
+
+    def _resolve_worker_count(self, total: int) -> int:
+        """Pick the number of worker processes for one mock-fast run.
+
+        Honours an explicit ``parallel_workers`` config override. Auto
+        formula = ``min(cpu_count, max(1, total // 50))``: small ingests
+        stay sequential (startup tax) and large ingests spread across
+        every available core.
+        """
+        if self.cfg.parallel_workers is not None:
+            return max(1, self.cfg.parallel_workers)
+        cpu = os.cpu_count() or 1
+        return min(cpu, max(1, total // 50))
+
+    def _load_videos_by_ids(self, ids: list[str]) -> list[VideoMetadata]:
+        """Bulk fetch of VideoMetadata for the mock-fast path.
+
+        One SELECT per IN-chunk instead of N round-trips through
+        ``_load_video``. Returns rows in the input id order so progress
+        callbacks see a stable sequence.
+        """
+        if not ids:
+            return []
+        by_id: dict[str, VideoMetadata] = {}
+        for chunk in _chunks(ids, 500):
+            placeholders = ",".join("?" * len(chunk))
+            cur = self._conn.execute(
+                f"""
+                SELECT id, source_url, title, author, duration_s,
+                       downloaded, local_path, tags_json
+                  FROM videos WHERE id IN ({placeholders})
+                """,
+                chunk,
+            )
+            for row in cur.fetchall():
+                by_id[row[0]] = VideoMetadata(
+                    id=row[0], source_url=row[1], title=row[2],
+                    author=row[3], duration_s=row[4],
+                    downloaded=bool(row[5]), local_path=row[6],
+                    tags=json.loads(row[7]),
+                )
+        return [by_id[i] for i in ids if i in by_id]
+
+    def _bump_attempts_bulk(self, ids: list[str]) -> None:
+        if not ids:
+            return
+        with self._conn:
+            self._conn.executemany(
+                "UPDATE pipeline_jobs SET attempts = attempts + 1 WHERE video_id = ?",
+                [(vid,) for vid in ids],
+            )
+
+    def _persist_runs_bulk_from_rows(
+        self, completed: list[dict[str, Any]],
+    ) -> None:
+        """Bulk inference_runs + region_metrics inserts from worker rows.
+
+        Workers pre-serialise their results into SQLite-ready tuples to
+        keep the inter-process payload small (~1 MB → ~5 KB per video).
+        This consumes those tuples directly.
+        """
+        if not completed:
+            return
+        run_rows = [row["run_row"] for row in completed]
+        metric_rows: list[tuple] = []
+        for row in completed:
+            metric_rows.extend(row["metric_rows"])
+        with self._conn:
+            self._conn.executemany(
+                """
+                INSERT OR REPLACE INTO inference_runs
+                    (id, video_id, model_id, model_version, seed,
+                     params_json, created_at, activation_path, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                run_rows,
+            )
+            if metric_rows:
+                self._conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO region_metrics
+                        (inference_run_id, region_id, video_id,
+                         mean, peak, sustained, timeseries_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    metric_rows,
+                )
+
+    def _update_jobs_bulk_from_rows(
+        self,
+        *,
+        completed: list[dict[str, Any]],
+        failed: list[tuple[str, str]],
+    ) -> None:
+        """Bulk pipeline_jobs status update for the mock-fast path.
+
+        Mirrors the per-video updates the sequential ``_drive_one`` would
+        have issued (status, inference_run_id, last_error). Skips writes
+        when there's nothing to update so the WAL doesn't churn.
+        """
+        if not completed and not failed:
+            return
+        now = _utcnow_iso()
+        with self._conn:
+            if completed:
+                self._conn.executemany(
+                    """
+                    UPDATE pipeline_jobs
+                       SET status = ?, inference_run_id = ?,
+                           last_error = NULL, updated_at = ?
+                     WHERE video_id = ?
+                    """,
+                    [
+                        (STATUS_COMPLETE, row["inference_run_id"], now,
+                         row["run_row"][1])
+                        for row in completed
+                    ],
+                )
+            if failed:
+                self._conn.executemany(
+                    """
+                    UPDATE pipeline_jobs
+                       SET status = ?, last_error = ?, updated_at = ?
+                     WHERE video_id = ?
+                    """,
+                    [(STATUS_FAILED, err, now, vid) for vid, err in failed],
+                )
+
+    def _backfill_durations_bulk_from_rows(
+        self, completed: list[dict[str, Any]],
+    ) -> None:
+        """Write probed durations back to ``videos.duration_s`` in one shot.
+
+        Same WHERE-guard as the sequential path so we never clobber a
+        non-zero duration that arrived from a real ffprobe run.
+        """
+        if not completed:
+            return
+        rows = [
+            (row["duration_s"], row["run_row"][1])  # row[1] = video_id
+            for row in completed
+        ]
+        with self._conn:
+            self._conn.executemany(
+                "UPDATE videos SET duration_s = ? WHERE id = ? AND duration_s <= 0",
+                rows,
+            )
+
+    def _purge_activation_artifacts_bulk_from_rows(
+        self, completed: list[dict[str, Any]],
+    ) -> None:
+        """Mock-fast variant of ``_purge_activation_artifacts_bulk``.
+
+        Takes worker-emitted row dicts (npz path, sidecar path, run id)
+        instead of full RunArtifacts. Same swallow-and-log semantics as
+        the per-video sibling.
+        """
+        if not completed:
+            return
+        for row in completed:
+            paths_to_drop = [
+                Path(row["activation_path"]),
+                Path(row["sidecar_path"]),
+                Path(row["activation_path"]).with_suffix(".json"),
+            ]
+            video_id = row["run_row"][1]
+            for path in paths_to_drop:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    _log.warning(
+                        "activation purge failed for %s: %s", video_id, exc,
+                    )
+        with self._conn:
+            self._conn.executemany(
+                "UPDATE inference_runs SET activation_path = '' WHERE id = ?",
+                [(row["inference_run_id"],) for row in completed],
+            )
+
+    def _purge_video_artifacts_bulk(self, ids: list[str]) -> None:
+        """Bulk variant of ``_purge_video_artifacts``.
+
+        Filesystem unlinks remain per-video (the OS gives us no batch
+        primitive) but the catalog row clears collapse into one
+        executemany.
+        """
+        if not ids:
+            return
+        _log.info("event=cleanup_started kind=videos count=%d", len(ids))
+        for video_id in ids:
+            for path in (
+                self.cfg.videos_dir / f"{video_id}.mp4",
+                self.cfg.processed_dir / f"{video_id}.mp4",
+            ):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    _log.warning("purge failed for %s: %s", video_id, exc)
+        with self._conn:
+            self._conn.executemany(
+                "UPDATE videos SET downloaded = 0, local_path = NULL WHERE id = ?",
+                [(vid,) for vid in ids],
+            )
 
     # -- DB I/O -----------------------------------------------------------
 
@@ -490,55 +1125,78 @@ class Orchestrator:
             "SELECT COALESCE(MAX(first_seen_idx), -1) FROM videos"
         )
         next_idx = int(cur.fetchone()[0]) + 1
+        rows = [
+            (v.id, v.source_url, v.title, v.author, v.duration_s,
+             1 if v.downloaded else 0, v.local_path,
+             json.dumps(v.tags), next_idx + i)
+            for i, v in enumerate(videos)
+        ]
         with self._conn:
-            for i, v in enumerate(videos):
-                self._conn.execute(
-                    """
-                    INSERT OR IGNORE INTO videos
-                        (id, source_url, title, author, duration_s,
-                         downloaded, local_path, tags_json, first_seen_idx)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (v.id, v.source_url, v.title, v.author, v.duration_s,
-                     1 if v.downloaded else 0, v.local_path,
-                     json.dumps(v.tags), next_idx + i),
-                )
+            self._conn.executemany(
+                """
+                INSERT OR IGNORE INTO videos
+                    (id, source_url, title, author, duration_s,
+                     downloaded, local_path, tags_json, first_seen_idx)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
 
     def _upsert_watch_events(self, events: list[WatchEvent]) -> None:
+        if not events:
+            return
+        rows = [
+            (e.id, e.video_id, e.watched_at.isoformat(),
+             e.duration_watched_s, e.completion_pct, e.source)
+            for e in events
+        ]
         with self._conn:
-            for e in events:
-                self._conn.execute(
-                    """
-                    INSERT OR IGNORE INTO watch_events
-                        (id, video_id, watched_at, duration_watched_s,
-                         completion_pct, source)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (e.id, e.video_id, e.watched_at.isoformat(),
-                     e.duration_watched_s, e.completion_pct, e.source),
-                )
+            self._conn.executemany(
+                """
+                INSERT OR IGNORE INTO watch_events
+                    (id, video_id, watched_at, duration_watched_s,
+                     completion_pct, source)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
 
     def _enqueue_pending(self, videos: list[VideoMetadata]) -> int:
-        """Insert a queued row for each video not already tracked."""
+        """Insert a queued row for each video not already tracked.
+
+        Single round-trip to learn which ids already have a job row, then
+        a single executemany insert for the rest. Cuts the per-video
+        SELECT chatter that dominated 100k-video runs.
+        """
+        if not videos:
+            return 0
         now = _utcnow_iso()
-        count = 0
-        with self._conn:
-            for v in videos:
-                cur = self._conn.execute(
-                    "SELECT 1 FROM pipeline_jobs WHERE video_id = ?", (v.id,),
-                )
-                if cur.fetchone():
-                    continue
-                self._conn.execute(
+        ids = [v.id for v in videos]
+        existing: set[str] = set()
+        # IN-clause batched to stay well under SQLite's default 999
+        # parameter ceiling (2026's libsqlite raises it but old wheels
+        # bundle older limits).
+        for chunk in _chunks(ids, 500):
+            placeholders = ",".join("?" * len(chunk))
+            cur = self._conn.execute(
+                f"SELECT video_id FROM pipeline_jobs WHERE video_id IN ({placeholders})",
+                chunk,
+            )
+            existing.update(row[0] for row in cur.fetchall())
+        new_rows = [
+            (v.id, STATUS_QUEUED, now) for v in videos if v.id not in existing
+        ]
+        if new_rows:
+            with self._conn:
+                self._conn.executemany(
                     """
                     INSERT INTO pipeline_jobs
                         (video_id, status, attempts, updated_at)
                     VALUES (?, ?, 0, ?)
                     """,
-                    (v.id, STATUS_QUEUED, now),
+                    new_rows,
                 )
-                count += 1
-        return count
+        return len(new_rows)
 
     def _pending_job_ids(self) -> list[str]:
         cur = self._conn.execute(
@@ -713,9 +1371,12 @@ class Orchestrator:
         )
         # Persist the downsampled ActivationOutput as JSON next to the npz
         # so SqliteStore can serve /videos/{id}/activation without
-        # re-decompressing.
+        # re-decompressing. Skipped under purge_activations because the
+        # file would be unlinked moments later (the JSON sidecar was
+        # ~30% of the 1000-video mock profile — see docs/bench-results.md).
         payload_path = self.cfg.activations_dir / f"{artifacts.inference_run.id}.json"
-        payload_path.write_text(artifacts.activation_payload.model_dump_json())
+        if not self.cfg.purge_activations:
+            payload_path.write_text(artifacts.activation_payload.model_dump_json())
         # Also record duration probed back onto the video row for next time.
         with self._conn:
             self._conn.execute(
@@ -753,6 +1414,10 @@ class Orchestrator:
         the per-vertex payload is gone and fall through to brain-viz's
         graceful fallback (region_metrics-only rendering).
         """
+        _log.info(
+            "event=cleanup_started kind=activations video_id=%s run_id=%s",
+            artifacts.inference_run.video_id, artifacts.inference_run.id,
+        )
         for path in (
             artifacts.activation_path,
             artifacts.sidecar_path,
@@ -780,6 +1445,7 @@ class Orchestrator:
         durable; failing the run because cleanup hit EACCES would be
         the wrong shape.
         """
+        _log.info("event=cleanup_started kind=videos video_id=%s", video_id)
         for path in (
             self.cfg.videos_dir / f"{video_id}.mp4",
             self.cfg.processed_dir / f"{video_id}.mp4",
@@ -851,6 +1517,11 @@ class Orchestrator:
 
     def _persist_run(self, artifacts: RunArtifacts) -> None:
         run: InferenceRun = artifacts.inference_run
+        metric_rows = [
+            (m.inference_run_id, m.region_id, m.video_id,
+             m.mean, m.peak, m.sustained, json.dumps(m.timeseries))
+            for m in artifacts.region_metrics
+        ]
         with self._conn:
             self._conn.execute(
                 """
@@ -863,17 +1534,17 @@ class Orchestrator:
                  run.seed, json.dumps(run.params_json),
                  run.created_at.isoformat(), run.activation_path, run.status),
             )
-            for m in artifacts.region_metrics:
-                self._conn.execute(
+            if metric_rows:
+                self._conn.executemany(
                     """
                     INSERT OR REPLACE INTO region_metrics
                         (inference_run_id, region_id, video_id,
                          mean, peak, sustained, timeseries_json)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (m.inference_run_id, m.region_id, m.video_id,
-                     m.mean, m.peak, m.sustained, json.dumps(m.timeseries)),
+                    metric_rows,
                 )
+
 
 
 __all__ = [

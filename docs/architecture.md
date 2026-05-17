@@ -30,17 +30,45 @@ between them and the merge process — not the implementations.
 
 Data flow per video:
 
-1. **Importer** (data-pipeline) reads the user's TikTok export JSON, writes a
-   `WatchEvent` and `VideoMetadata` row.
-2. **Downloader** fetches the video via yt-dlp with retry + dedup.
-3. **Preprocessor** normalizes resolution / FPS / audio sample rate.
-4. **Inference runner** (ml-inference) calls TRIBE v2 (or the mock backend),
-   emits a `(num_timepoints, 20484)` fp32 tensor + a meta sidecar.
-5. **Aggregator** (ml-inference) reduces vertices → regions and writes
-   `RegionMetrics` rows.
-6. **API** (api-orchestrator) serves all of the above under `/api/v1/*`.
-7. **Frontend** (frontend-dashboard + brain-viz) renders Dashboard, Video
-   Detail, and Compare views.
+1. **Importer** (data-pipeline) reads the user's TikTok export
+   (`.json`, `.txt`, or `.zip`; auto-detected by extension), applies
+   the optional half-open `[since, until)` time-window filter, and
+   writes `WatchEvent` + `VideoMetadata` rows. Events outside the
+   window never enter the queue, so the inference workload is capped
+   at parse time before any I/O happens.
+2. **Mode dispatch.** `mock` mode skips steps 3–4 entirely and goes
+   straight to inference with `MockBackend`. `real` mode runs the
+   full pipeline; the api worker's `/capabilities` endpoint pre-checks
+   that the `[real]` extra + GPU + ffmpeg + yt-dlp are all available
+   and blocks submission with a structured `error_code` if not.
+3. **Downloader** (real mode only) fetches the video via yt-dlp with
+   retry + jitter + UA rotation + dedup. Handles both
+   `tiktok.com/@handle/video/<id>` and the newer
+   `tiktokv.com/share/video/<id>/` URL forms.
+4. **Preprocessor** (real mode only) normalizes resolution / FPS /
+   audio sample rate to TRIBE's expected `224×224 @ 8 fps + 16 kHz`
+   (imported directly from `DEFAULT_PREPROCESSING_PARAMS`).
+5. **Inference runner** (ml-inference) calls TRIBE v2 (or
+   `MockBackend` in mock mode), emits a `(num_timepoints, 20484)`
+   fp32 tensor + a meta sidecar.
+6. **Aggregator** (ml-inference) reduces vertices → 8 canonical
+   regions and writes `RegionMetrics` rows.
+7. **Optional cleanup** (data-pipeline) — opt-in via
+   `--purge-after-inference` (drops raw + preprocessed `.mp4`s) and
+   `--purge-activations` (additionally drops the per-vertex `.npz`
+   and JSON sidecar, keeping only `RegionMetrics` rows). Tier-a keeps
+   peak transient disk to ~10 MB; tier-b cuts steady-state from
+   ~5 MB/video to ~30 KB/video.
+8. **API** (api-orchestrator) serves all of the above under
+   `/api/v1/*` plus the import write surface
+   (`POST /api/v1/import`, `GET /api/v1/import/{id}`,
+   `POST /api/v1/import/{id}/retry`) and meta surfaces
+   (`/api/v1/capabilities`).
+9. **Frontend** (frontend-dashboard + brain-viz) renders Dashboard,
+   Video Detail, and Compare views. `MockModeBadge` surfaces whenever
+   the displayed data is backed by `InferenceRun.model_id` starting
+   with `tribe-v2-mock` — non-negotiable, see
+   `docs/scientific-framing.md`.
 
 ## Boundaries
 

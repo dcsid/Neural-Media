@@ -105,6 +105,22 @@ class ClusterSummary(BaseModel):
     exemplar_video_ids: list[str]
 
 
+class AuthorBucket(BaseModel):
+    """Per-author rollup for the dashboard's "who you watch" panel.
+
+    `top_region` is the region with the highest per-author **peak**
+    across the author's videos (comparative claim — see
+    `docs/scientific-framing.md`). `mean_activation` is the average of
+    each video's per-region mean averaged across all 8 regions.
+    """
+
+    author: str | None
+    videos: int
+    total_watch_time_s: float
+    mean_activation: float
+    top_region: str
+
+
 class AggregateReport(BaseModel):
     total_videos: int
     total_watch_time_s: float
@@ -113,6 +129,11 @@ class AggregateReport(BaseModel):
     by_region: dict[str, AggregateBucket]
     by_hour_of_day: list[float]
     by_day_of_week: list[float]
+    # Capped at top-20 authors by `videos` desc, then `total_watch_time_s`
+    # desc, then `author` asc (lexicographic). Empty until the aggregator
+    # ships the rollup — the frontend's AuthorPlaceholder handles the
+    # transitional state. See `docs/worker-briefs/aggregate-by-author-proposal.md`.
+    by_author: list[AuthorBucket] = Field(default_factory=list)
     clusters: list[ClusterSummary]
 
 
@@ -184,3 +205,33 @@ class ImportJob(BaseModel):
     progress: ImportJobProgress = Field(default_factory=ImportJobProgress)
     error: str | None = None
     source_filename: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Capabilities (CONTRACTS.md §10)
+# ---------------------------------------------------------------------------
+
+CapabilityBlocker = Literal[
+    "missing-extra",
+    "missing-ffmpeg",
+    "missing-yt-dlp",
+    "missing-gpu",
+]
+
+
+class Capabilities(BaseModel):
+    """Response from `GET /api/v1/capabilities`.
+
+    Tells the frontend which modes will actually run on this host so
+    the Real/Mock toggle can disable invalid choices before submission.
+    `real_blockers` is listed in priority order (most-fundamental first
+    per `CAPABILITY_BLOCKER_PRIORITY` in
+    `services/api/neural_media_api/import_jobs.py`). `real` is True iff
+    the list is empty.
+
+    Mirrors `Capabilities` in `shared/types.ts`.
+    """
+
+    mock: bool
+    real: bool
+    real_blockers: list[str] = Field(default_factory=list)

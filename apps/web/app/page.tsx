@@ -6,6 +6,7 @@ import {
 } from "@/lib/format";
 import { ApiOfflineState } from "@/components/ApiOfflineState";
 import { NoVideosState } from "@/components/NoVideosState";
+import { ImportInProgressState } from "@/components/ImportInProgressState";
 import { BrainMeshSlot } from "@/components/BrainMeshSlot";
 import { RegionBalanceBars } from "@/components/RegionBalanceBars";
 import { HourHistogram } from "@/components/HourHistogram";
@@ -23,6 +24,32 @@ export default async function DashboardPage() {
 
     if (aggregate.total_videos === 0) {
       return <NoVideosState scope="dashboard" />;
+    }
+
+    // Mid-import refresh: the catalogue already has videos but no
+    // inference run has landed yet, so every region bucket reports a
+    // zero mean and zero peak. Rendering the populated dashboard in
+    // that state shows flat region bars and a "0.00" mean activation,
+    // which reads as "TikTok activates nothing" rather than "no data
+    // yet". Render a dedicated waiting state instead.
+    const hasAnyActivation = Object.values(aggregate.by_region).some(
+      (b) => (b?.peak ?? 0) > 0 || (b?.mean ?? 0) > 0,
+    );
+    if (!hasAnyActivation) {
+      const inferenceRuns = await api
+        .inferenceRuns({ baseUrl })
+        .catch(() => []);
+      const processed = new Set(
+        inferenceRuns
+          .filter((r) => r.status === "complete")
+          .map((r) => r.video_id),
+      ).size;
+      return (
+        <ImportInProgressState
+          videosParsed={aggregate.total_videos}
+          videosProcessed={processed}
+        />
+      );
     }
 
     const meanActivation =

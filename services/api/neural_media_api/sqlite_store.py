@@ -36,14 +36,12 @@ _WIRE_NUM_KEYFRAMES = 5
 
 SCHEMA_STATEMENTS: tuple[str, ...] = (
     # Videos. tags is JSON-encoded because SQLite has no native list type.
-    # first_seen_idx lets `list_videos` preserve the order the pipeline
-    # discovered URLs in; the column is optional (NULL → fall back to rowid).
-    # `inserted_at` is written by data-pipeline's Orchestrator (ISO-8601
-    # timestamp of first ingest). Nullable here because the api doesn't
-    # read it — it's pipeline-side observability. CREATE TABLE IF NOT
-    # EXISTS means whichever of (api init_db, pipeline Orchestrator
-    # construction) runs first wins, so the two schemas MUST be a
-    # superset of both writers' needs. See note in docs/architecture.md.
+    # `inserted_at` is the timestamp the pipeline writer (data-pipeline's
+    # Orchestrator) stamps on first-seen-URL upserts; we ORDER BY it in
+    # `list_videos` so the dashboard renders rows in discovery order.
+    # `first_seen_idx` is a legacy nullable column from before the
+    # pipeline writer existed — kept so seeded test fixtures that
+    # populate it still order deterministically.
     """
     CREATE TABLE IF NOT EXISTS videos (
         id              TEXT PRIMARY KEY,
@@ -54,8 +52,8 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         downloaded      INTEGER NOT NULL DEFAULT 0,
         local_path      TEXT,
         tags_json       TEXT NOT NULL DEFAULT '[]',
-        first_seen_idx  INTEGER,
-        inserted_at     TEXT
+        inserted_at     TEXT,
+        first_seen_idx  INTEGER
     )
     """,
     """
@@ -239,9 +237,13 @@ class SqliteStore:
     # --- Store protocol ---------------------------------------------------
 
     def list_videos(self) -> list[VideoMetadata]:
+        # Prefer the pipeline writer's `inserted_at` timestamp; fall back
+        # to the legacy `first_seen_idx` (used by test fixtures); finally
+        # rowid so the result is always deterministic.
         rows = self._query(
             "SELECT * FROM videos "
-            "ORDER BY COALESCE(first_seen_idx, rowid)"
+            "ORDER BY COALESCE(inserted_at, '') ASC, "
+            "         COALESCE(first_seen_idx, rowid) ASC"
         )
         return [_decode_video(r) for r in rows]
 

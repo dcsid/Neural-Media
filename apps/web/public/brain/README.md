@@ -26,7 +26,7 @@ CC-BY-NC-4.0.
 Hemispheres are concatenated **left first, then right** — this is the
 vertex order the inference pipeline writes to its activation Parquet
 columns `v_0000`..`v_20483` (see CONTRACTS.md §4 and
-`services/inference/neural_media_inference/aggregate.py:REGION_VERTEX_MASKS`).
+`services/inference/neural_media_inference/data/region_masks.json:vertex_ordering`).
 Triangle indices for the right hemisphere are offset by 10,242 in the
 combined buffer.
 
@@ -58,25 +58,31 @@ each vertex to a region index in the order defined by
 255  background (medial wall / unassigned)
 ```
 
-The partitioning is **the same placeholder slab assignment that the
-inference aggregator uses**
-(`services/inference/neural_media_inference/aggregate.py::REGION_VERTEX_MASKS`):
+The partitioning comes from **ml-inference's HCP-MMP1 / Glasser parcels**
+at `services/inference/neural_media_inference/data/region_masks.json`
+(Glasser et al. 2016, fetched via MNE-Python's
+`fetch_hcp_mmp_parcellation`, doi.org/10.6084/m9.figshare.3498446).
+brain-viz re-bakes that JSON into the byte-aligned `.bin` so the hover
+tooltip and the metrics table agree on which region each vertex belongs
+to. The masks are **disjoint** — the build script fails loud if any
+vertex appears in two regions.
 
-| region   | range (vertex indices) | count  |
-|----------|------------------------|--------|
-| v1       | `[0, 3000)`            | 3000   |
-| v2       | `[3000, 5500)`         | 2500   |
-| v3       | `[5500, 7500)`         | 2000   |
-| v4       | `[7500, 9100)`         | 1600   |
-| auditory | `[9100, 11100)`        | 2000   |
-| language | `[11100, 14300)`       | 3200   |
-| ffa      | `[14300, 16800)`       | 2500   |
-| vwfa     | `[16800, 20484)`       | 3684   |
+Coverage on fsaverage5 (3,806 / 20,484 vertices, ~18.6 %):
 
-These slabs are **not anatomically valid** — they are a vertical-slice
-placeholder that ml-inference and brain-viz share so the hover readout
-matches the metrics table. Replace both sides in lockstep when a real
-parcellation lands.
+| region   | vertices | source parcels                                   |
+|----------|----------|--------------------------------------------------|
+| v1       | 523      | V1                                               |
+| v2       | 383      | V2                                               |
+| v3       | 417      | V3, V3A, V3B, V3CD                               |
+| v4       | 320      | V4, V4t, LO1, LO2, LO3                           |
+| auditory | 590      | A1, LBelt, MBelt, PBelt, RI, A4, A5              |
+| language | 1027     | 44, 45, 55b, IFSa, IFSp, PSL, STSva/p, STSda/dp, STV |
+| ffa      | 104      | FFC                                              |
+| vwfa     | 442      | VVC, TF, PHA1, PHA2, PHA3                        |
+
+Roughly four hovers in five land on unassigned cortex (255). The mesh
+itself is drawn in full because the LUT also paints unassigned vertices
+at activation = 0 (the dark end of cividis); only the tooltip suppresses.
 
 ### Why this lives in `/public/` and not behind `/api/v1/regions`
 
@@ -93,16 +99,25 @@ deleted and the hook can swap to the endpoint without other changes.
 
 ## Rebuild
 
+The geometry and the region mask are now produced by two separate
+stdlib-only scripts. They almost always run independently because the
+underlying sources change at different rates.
+
+Rebake the **region mask** (run this whenever ml-inference updates
+`region_masks.json`):
+
+```
+python3 apps/web/components/brain/scripts/build_regions_bin.py
+```
+
+Rebuild the **GLB geometry** (rarely — only when the fsaverage5 surface
+source itself changes). Network-fetches nilearn's pial GIFTI on first
+run, then parses XML + base64 + zlib + float32 and bakes the GLB:
+
 ```
 python3 apps/web/components/brain/scripts/build_fsaverage5_glb.py \
         apps/web/public/brain
 ```
-
-The script is stdlib-only (no nibabel / no numpy). On first run it
-downloads the two pial GIFTI files from nilearn's GitHub into
-`/tmp/nm-surface` (or a path you pass as the second argument), parses
-them by hand (XML + base64 + zlib + float32), and writes the GLB +
-region mask into the directory you pass as the first argument.
 
 ## Sizing
 

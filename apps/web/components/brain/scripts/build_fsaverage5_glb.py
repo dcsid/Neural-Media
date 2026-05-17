@@ -273,36 +273,14 @@ def write_glb(out_path: Path, positions: array, normals: array, indices: array):
 
 
 # ---------------------------------------------------------------------------
-# Region mask
-# ---------------------------------------------------------------------------
-
-# Must stay in lockstep with
-#   services/inference/neural_media_inference/aggregate.py:_PLACEHOLDER_REGION_RANGES
-# REGION_ORDER mirrors shared/types.ts REGION_IDS.
-REGION_ORDER = ["v1", "v2", "v3", "v4", "auditory", "language", "ffa", "vwfa"]
-REGION_RANGES = {
-    "v1":       (0,     3000),
-    "v2":       (3000,  5500),
-    "v3":       (5500,  7500),
-    "v4":       (7500,  9100),
-    "auditory": (9100,  11100),
-    "language": (11100, 14300),
-    "ffa":      (14300, 16800),
-    "vwfa":     (16800, 20484),
-}
-
-def write_regions_bin(out_path: Path, nv: int):
-    buf = bytearray([255] * nv)
-    for region, (lo, hi) in REGION_RANGES.items():
-        idx = REGION_ORDER.index(region)
-        for v in range(lo, hi):
-            buf[v] = idx
-    out_path.write_bytes(bytes(buf))
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+#
+# The region mask (fsaverage5.regions.bin) is built by a sibling script,
+# build_regions_bin.py, which consumes ml-inference's region_masks.json.
+# Keeping them separate lets you rebake the regions without re-fetching
+# the GIFTI sources — and the regions file changes more often than the
+# geometry does.
 
 def fetch_sources(cache_dir: Path) -> Path:
     """Download nilearn's fsaverage5 pial GIFTI files into a cache dir."""
@@ -338,12 +316,10 @@ def main():
     recenter_unit(positions)
     normals = compute_normals(positions, indices)
     write_glb(out_dir / "fsaverage5.glb", positions, normals, indices)
-    write_regions_bin(out_dir / "fsaverage5.regions.bin", nv)
 
     glb_size = (out_dir / "fsaverage5.glb").stat().st_size
-    bin_size = (out_dir / "fsaverage5.regions.bin").stat().st_size
     print(f"wrote fsaverage5.glb ({glb_size/1024:.1f} KB)")
-    print(f"wrote fsaverage5.regions.bin ({bin_size} bytes)")
+    print("(region mask: run build_regions_bin.py separately)")
 
 if __name__ == "__main__":
     main()

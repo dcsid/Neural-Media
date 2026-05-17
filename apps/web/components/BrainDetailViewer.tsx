@@ -13,10 +13,32 @@
 // worker lands local downloads, swap a `<video>` element in front of this
 // component and let it own `currentTime` per the pattern documented inside
 // TimelineScrubber.tsx.
+//
+// BrainMesh is loaded via next/dynamic with ssr:false so R3F's reconciler
+// never runs in the server-render path — same pattern as BrainMeshSlot.
 
+import dynamic from "next/dynamic";
 import { useState } from "react";
-import { BrainMesh, TimelineScrubber } from "@/components/brain";
+// Import TimelineScrubber from the file directly rather than the barrel
+// so SSR doesn't transitively evaluate BrainMesh / R3F.
+import { TimelineScrubber } from "@/components/brain/TimelineScrubber";
 import type { ActivationOutput } from "@shared/types";
+
+const BrainMeshLazy = dynamic(
+  () =>
+    import("@/components/brain/BrainMesh").then((mod) => ({
+      default: mod.BrainMesh,
+    })),
+  {
+    ssr: false,
+    loading: () => (
+      <div
+        aria-hidden
+        className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(245,165,36,0.05),transparent_60%)]"
+      />
+    ),
+  },
+);
 
 interface BrainDetailViewerProps {
   activation: ActivationOutput;
@@ -33,8 +55,8 @@ export function BrainDetailViewer({
 
   return (
     <div>
-      <div className="relative aspect-[5/4] w-full border border-line bg-canvas">
-        <BrainMesh
+      <div className="relative aspect-[5/4] w-full overflow-hidden border border-line bg-canvas">
+        <BrainMeshLazy
           activation={meanActivation}
           keyframeVertices={activation.keyframe_vertices}
           timestamps={activation.timestamps}

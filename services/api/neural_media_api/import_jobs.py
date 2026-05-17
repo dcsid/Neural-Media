@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import shutil
 import sqlite3
 import threading
 import uuid
@@ -55,6 +56,23 @@ from .schemas_re_export import (
     ImportJobProgress,
     ImportJobStatus,
     ImportMode,
+)
+
+# Capability-blocker tokens. Frontend renders different copy per code; keep
+# in sync with the docstring on ``real_mode_capabilities`` and the
+# capabilities endpoint in ``main.py``.
+CAP_MISSING_EXTRA = "missing-extra"
+CAP_MISSING_GPU = "missing-gpu"
+CAP_MISSING_FFMPEG = "missing-ffmpeg"
+CAP_MISSING_YT_DLP = "missing-yt-dlp"
+
+# Order matters: most-fundamental first. POST /import surfaces the first
+# blocker in this priority order as the structured error_code.
+CAPABILITY_BLOCKER_PRIORITY: tuple[str, ...] = (
+    CAP_MISSING_EXTRA,
+    CAP_MISSING_FFMPEG,
+    CAP_MISSING_YT_DLP,
+    CAP_MISSING_GPU,
 )
 
 _log = logging.getLogger(__name__)
@@ -252,6 +270,25 @@ class JobAlreadyRunning(RuntimeError):
         self.running_job = running_job
 
 
+class JobNotFound(LookupError):
+    """Retry referenced an id that doesn't exist."""
+
+
+class JobNotRetryable(RuntimeError):
+    """Retry referenced a job that isn't in a terminal-failure state.
+
+    Only ``failed`` and ``partial`` jobs may be retried — ``queued`` /
+    ``running`` aren't terminal and ``complete`` has nothing to retry.
+    """
+
+    def __init__(self, job: ImportJob) -> None:
+        super().__init__(
+            f"import job {job.id} has status {job.status!r}; "
+            "only 'failed' or 'partial' jobs can be retried"
+        )
+        self.job = job
+
+
 class ImportRunner:
     """Owns the singleton-job gate and the background worker thread.
 
@@ -291,11 +328,76 @@ class ImportRunner:
         mode: ImportMode,
         *,
         source_filename: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
     ) -> ImportJob:
         """Register a queued job and start its worker thread.
 
         Raises ``JobAlreadyRunning`` if another job is in flight.
+
+        ``since`` / ``until`` (both UTC) are forwarded to the orchestrator
+        to cap the events the importer pulls out of the export — see
+        ``parse_export``'s docstring for the window semantics.
         """
+        job = self._claim_slot(mode=mode, source_filename=source_filename)
+        thread = threading.Thread(
+            target=self._run,
+            kwargs=dict(
+                job_id=job.id,
+                mode=mode,
+                op="ingest",
+                export_path=export_path,
+                since=since,
+                until=until,
+            ),
+            daemon=True,
+            name=f"import-{job.id[:8]}",
+        )
+        thread.start()
+        return job
+
+    def submit_retry(self, prev_job_id: str) -> ImportJob:
+        """Spawn a new job that drives ``run_pending`` instead of re-parsing.
+
+        Reuses the previous job's mode + ``source_filename`` so the UI can
+        show "retry of <filename>". Raises:
+
+        - ``JobNotFound`` if the id is unknown,
+        - ``JobNotRetryable`` if status isn't ``failed`` or ``partial``,
+        - ``JobAlreadyRunning`` if another job is in flight.
+        """
+        prev = self._jobs.get(prev_job_id)
+        if prev is None:
+            raise JobNotFound(prev_job_id)
+        if prev.status not in ("failed", "partial"):
+            raise JobNotRetryable(prev)
+
+        job = self._claim_slot(
+            mode=prev.mode,
+            source_filename=prev.source_filename,
+        )
+        thread = threading.Thread(
+            target=self._run,
+            kwargs=dict(
+                job_id=job.id,
+                mode=prev.mode,
+                op="retry",
+            ),
+            daemon=True,
+            name=f"retry-{job.id[:8]}",
+        )
+        thread.start()
+        return job
+
+    # --- internals -------------------------------------------------------
+
+    def _claim_slot(
+        self,
+        *,
+        mode: ImportMode,
+        source_filename: str | None,
+    ) -> ImportJob:
+        """Atomically reserve the singleton slot, create the row, return it."""
         with self._lock:
             if self._running_job_id is not None:
                 running = self._jobs.get(self._running_job_id)
@@ -315,19 +417,18 @@ class ImportRunner:
             )
             self._jobs.create(job)
             self._running_job_id = job.id
-
-        thread = threading.Thread(
-            target=self._run,
-            args=(job.id, export_path, mode),
-            daemon=True,
-            name=f"import-{job.id[:8]}",
-        )
-        thread.start()
         return job
 
-    # --- internals -------------------------------------------------------
-
-    def _run(self, job_id: str, export_path: Path, mode: ImportMode) -> None:
+    def _run(
+        self,
+        *,
+        job_id: str,
+        mode: ImportMode,
+        op: str,                                  # "ingest" | "retry"
+        export_path: Path | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> None:
         """Background-thread entry point. Owns one orchestrator lifetime."""
         poller_stop = threading.Event()
         poller: threading.Thread | None = None
@@ -337,21 +438,25 @@ class ImportRunner:
             self._jobs.update(
                 job_id,
                 status="running",
+                # Retry starts in the same parsing-like "warming up" state
+                # for UI consistency; the poller flips it the moment the
+                # pipeline starts emitting per-video stages.
                 progress_phase="parsing",
             )
 
+            cb = _progress_callback(self._jobs, job_id)
             orch = self._factory(
                 db_path=self.db_path,
                 activations_dir=self.activations_dir,
                 videos_dir=self.videos_dir,
                 processed_dir=self.processed_dir,
                 mode=mode,
-                on_progress=_progress_callback(self._jobs, job_id),
+                on_progress=cb,
             )
 
             # The on_progress callback only fires if data-pipeline wired
-            # support for it. Polling pipeline_jobs covers the gap when it
-            # didn't (older checkouts).
+            # support for it via the constructor. Polling pipeline_jobs
+            # covers the gap.
             poller = threading.Thread(
                 target=_poll_pipeline_jobs,
                 args=(self.db_path, self._jobs, job_id, poller_stop),
@@ -360,7 +465,13 @@ class ImportRunner:
             )
             poller.start()
 
-            summary = orch.ingest_export(export_path)
+            if op == "retry":
+                summary = _call_run_pending(orch, progress=cb)
+            else:
+                assert export_path is not None, "ingest op requires export_path"
+                summary = _call_ingest_export(
+                    orch, export_path, since=since, until=until,
+                )
 
             completed = (
                 getattr(summary, "completed", 0)
@@ -572,6 +683,55 @@ def default_orchestrator_factory(
     return Orchestrator(cfg, **init_kwargs)
 
 
+def _call_run_pending(orch: Any, *, progress: ProgressCallback) -> Any:
+    """Invoke ``orch.run_pending`` with the ``progress=`` kwarg when supported.
+
+    Stubs in the test suite don't accept a ``progress`` kwarg, and an
+    older real orchestrator may not either — fall back to the bare call
+    in that case. The poller thread already provides a progress signal
+    regardless.
+    """
+    try:
+        sig = inspect.signature(orch.run_pending)
+    except (TypeError, ValueError):
+        sig = None
+
+    if sig is not None and "progress" in sig.parameters:
+        return orch.run_pending(progress=progress)
+    return orch.run_pending()
+
+
+def _call_ingest_export(
+    orch: Any,
+    export_path: Path,
+    *,
+    since: datetime | None,
+    until: datetime | None,
+) -> Any:
+    """Invoke ``orch.ingest_export`` with date-window kwargs when supported.
+
+    The shape we forward depends on the orchestrator's signature: real
+    orchestrators (and any stub that takes ``**kwargs``) get the
+    keyword args; older stubs that only accept a positional path fall
+    back to the legacy call so we don't break them.
+    """
+    if since is None and until is None:
+        return orch.ingest_export(export_path)
+    try:
+        sig = inspect.signature(orch.ingest_export)
+    except (TypeError, ValueError):
+        sig = None
+
+    accepts_kwargs = sig is None or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD
+        for p in sig.parameters.values()
+    ) or {"since", "until"}.issubset(sig.parameters.keys() if sig else set())
+
+    if accepts_kwargs:
+        return orch.ingest_export(export_path, since=since, until=until)
+    return orch.ingest_export(export_path)
+
+
 def _orchestrator_accepts_on_progress() -> bool:
     try:
         from neural_media_pipeline import Orchestrator
@@ -606,27 +766,72 @@ def _build_real_inference_fn() -> Callable[..., Any]:
     return _run
 
 
-def real_mode_available() -> bool:
-    """Cheap precheck used by POST /import to 400 early.
+def real_mode_capabilities() -> tuple[bool, list[str]]:
+    """Probe everything the real pipeline needs and report what's missing.
 
-    ``TribeBackend`` is exposed as a lazy attribute and always imports
-    cleanly even without the ``[real]`` extra. The real signal that the
-    extra is installed is that ``torch`` is importable — it's the
-    heaviest direct dep and the one the extra exists to pull in.
+    Returns ``(ok, blockers)`` where ``blockers`` is a subset of
+    ``{CAP_MISSING_EXTRA, CAP_MISSING_FFMPEG, CAP_MISSING_YT_DLP,
+    CAP_MISSING_GPU}``. ``ok`` is True iff the list is empty.
+
+    Checks, in order:
+
+    - ``torch`` importable AND ``TribeBackend`` re-exported from
+      ``neural_media_inference``. Either failure → ``missing-extra``.
+    - ``ffmpeg`` on PATH (preprocessor depends on it).
+    - ``yt-dlp`` on PATH (downloader depends on it).
+    - When torch is present, ``torch.cuda.is_available()``. The real TRIBE
+      backend will run on CPU but at glacial pace; the UI uses this to
+      warn rather than block.
+
+    Cheap enough to call per-request (no model loading, no subprocesses).
     """
+    blockers: list[str] = []
+
+    torch_ok = True
+    torch_mod = None
     try:
         import importlib
-        importlib.import_module("torch")
+        torch_mod = importlib.import_module("torch")
     except ImportError:
-        return False
-    try:
-        from neural_media_inference import TribeBackend  # noqa: F401
-    except ImportError:
-        return False
-    return True
+        torch_ok = False
+        blockers.append(CAP_MISSING_EXTRA)
+
+    if torch_ok:
+        try:
+            from neural_media_inference import TribeBackend  # noqa: F401
+        except ImportError:
+            blockers.append(CAP_MISSING_EXTRA)
+
+    if shutil.which("ffmpeg") is None:
+        blockers.append(CAP_MISSING_FFMPEG)
+    if shutil.which("yt-dlp") is None:
+        blockers.append(CAP_MISSING_YT_DLP)
+
+    # GPU check only meaningful when torch is actually importable —
+    # otherwise the missing-extra blocker already conveys the bigger
+    # problem and probing CUDA would just AttributeError.
+    if torch_mod is not None:
+        try:
+            if not bool(torch_mod.cuda.is_available()):
+                blockers.append(CAP_MISSING_GPU)
+        except Exception:  # noqa: BLE001 — defensive: any torch shape works
+            blockers.append(CAP_MISSING_GPU)
+
+    return (not blockers), blockers
+
+
+def real_mode_available() -> bool:
+    """Backwards-compatible wrapper. Kept for callers that only need a bool."""
+    ok, _ = real_mode_capabilities()
+    return ok
 
 
 __all__ = [
+    "CAPABILITY_BLOCKER_PRIORITY",
+    "CAP_MISSING_EXTRA",
+    "CAP_MISSING_FFMPEG",
+    "CAP_MISSING_GPU",
+    "CAP_MISSING_YT_DLP",
     "ImportJob",
     "ImportJobProgress",
     "ImportJobStatus",
@@ -634,6 +839,9 @@ __all__ = [
     "ImportMode",
     "ImportRunner",
     "JobAlreadyRunning",
+    "JobNotFound",
+    "JobNotRetryable",
     "default_orchestrator_factory",
     "real_mode_available",
+    "real_mode_capabilities",
 ]

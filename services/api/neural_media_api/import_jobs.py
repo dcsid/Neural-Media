@@ -536,58 +536,40 @@ def default_orchestrator_factory(
 ) -> Any:
     """Construct a real ``neural_media_pipeline.Orchestrator``.
 
-    ``mode="mock"`` (the demo path) skips both yt-dlp and ffmpeg — only
-    parsing + mock inference run, so the catalog populates in seconds
-    against the user's actual TikTok export without any network round
-    trip. Probes the Orchestrator signature for ``on_progress=`` and
-    silently drops it if older checkouts don't accept it (the poller
-    thread provides a fallback signal there).
+    ``mode="mock"`` → ``skip_download=True, skip_preprocess=True`` so the
+    orchestrator never touches yt-dlp or ffmpeg; the synthetic per-video
+    duration matches the committed sample fixtures. ``mode="real"`` →
+    full pipeline + a TribeBackend bound to the real TRIBE v2 weights.
+
+    Probes the Orchestrator signature for ``on_progress=`` and silently
+    drops it if data-pipeline hasn't shipped support yet — the poller
+    thread provides a fallback signal in that case.
     """
     from neural_media_pipeline import Orchestrator, OrchestratorConfig
 
-    cfg_kwargs: dict[str, Any] = {
-        "db_path": db_path,
-        "videos_dir": videos_dir,
-        "processed_dir": processed_dir,
-        "activations_dir": activations_dir,
-    }
-
-    # Pass mock-mode skip flags only if the pipeline version we're
-    # linked against supports them. data-pipeline shipped these in
-    # round 3; the probe keeps older worktrees buildable.
-    cfg_field_names = _orchestrator_config_field_names()
+    cfg_kwargs: dict[str, Any] = dict(
+        db_path=db_path,
+        videos_dir=videos_dir,
+        processed_dir=processed_dir,
+        activations_dir=activations_dir,
+    )
     if mode == "mock":
-        if "skip_download" in cfg_field_names:
-            cfg_kwargs["skip_download"] = True
-        if "skip_preprocess" in cfg_field_names:
-            cfg_kwargs["skip_preprocess"] = True
-
+        cfg_kwargs["skip_download"] = True
+        cfg_kwargs["skip_preprocess"] = True
     cfg = OrchestratorConfig(**cfg_kwargs)
 
-    kwargs: dict[str, Any] = {}
+    init_kwargs: dict[str, Any] = {}
     if mode == "real":
-        kwargs["inference_fn"] = _build_real_inference_fn()
+        # Real backend goes through inference_fn — the OrchestratorConfig
+        # also accepts `backend=` but threading it through inference_fn
+        # keeps the api side in control of how the backend is constructed
+        # (license acceptance, weight resolution, etc.).
+        init_kwargs["inference_fn"] = _build_real_inference_fn()
 
     if _orchestrator_accepts_on_progress():
-        kwargs["on_progress"] = on_progress
+        init_kwargs["on_progress"] = on_progress
 
-    return Orchestrator(cfg, **kwargs)
-
-
-def _orchestrator_config_field_names() -> frozenset[str]:
-    try:
-        from neural_media_pipeline import OrchestratorConfig
-    except ImportError:
-        return frozenset()
-    # Works for both dataclasses (the round-3 implementation) and
-    # Pydantic models — both expose field metadata.
-    fields = getattr(OrchestratorConfig, "__dataclass_fields__", None)
-    if fields is not None:
-        return frozenset(fields)
-    model_fields = getattr(OrchestratorConfig, "model_fields", None)
-    if model_fields is not None:
-        return frozenset(model_fields)
-    return frozenset()
+    return Orchestrator(cfg, **init_kwargs)
 
 
 def _orchestrator_accepts_on_progress() -> bool:

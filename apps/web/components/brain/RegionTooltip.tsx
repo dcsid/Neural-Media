@@ -3,7 +3,12 @@
 import { REGION_DESCRIPTIONS, type RegionId } from "@shared/types";
 
 export interface RegionHoverInfo {
-  regionId: RegionId;
+  // `null` when the hovered vertex sits in the unassigned medial-wall /
+  // off-atlas territory (sentinel 255 in the .regions.bin convention).
+  // The tooltip still renders so the user sees that a hover registered;
+  // it just labels the spot as "(unassigned)" and omits the activation
+  // readout (no calibrated value exists for those vertices).
+  regionId: RegionId | null;
   activation: number;
   // Index into the 20,484-vertex fsaverage5 ordering (left hemisphere then
   // right). Surfaced so the user can tie a tooltip readout back to an
@@ -24,7 +29,8 @@ interface RegionTooltipProps {
 // Small floating readout for hover state. Four lines max, tabular numerals,
 // no editorialising — the value reported is exactly what the model predicted
 // for that vertex (or region mean when per-vertex data isn't available),
-// rounded to 3 decimals.
+// rounded to 3 decimals. The unassigned-vertex branch swaps the activation
+// row for an explanation rather than fabricating a number we don't have.
 
 export function RegionTooltip({ hover }: RegionTooltipProps) {
   if (!hover) return null;
@@ -35,6 +41,10 @@ export function RegionTooltip({ hover }: RegionTooltipProps) {
     left: hover.x + 14,
     top: hover.y + 14,
   };
+
+  const unassigned = hover.regionId === null;
+  const activationDisplay =
+    Number.isFinite(hover.activation) ? hover.activation.toFixed(3) : "—";
 
   return (
     <div
@@ -48,10 +58,12 @@ export function RegionTooltip({ hover }: RegionTooltipProps) {
       ].join(" ")}
     >
       <div className="font-mono uppercase tracking-[0.08em] text-ink-300">
-        {hover.regionId}
+        {unassigned ? "(unassigned)" : hover.regionId}
       </div>
       <div className="mt-0.5 text-ink-100">
-        {REGION_DESCRIPTIONS[hover.regionId]}
+        {unassigned
+          ? "Outside the eight TRIBE regions"
+          : REGION_DESCRIPTIONS[hover.regionId as RegionId]}
       </div>
       <div className="mt-1.5 flex items-baseline justify-between gap-3">
         <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-ink-400">
@@ -61,14 +73,16 @@ export function RegionTooltip({ hover }: RegionTooltipProps) {
           {hover.vertexIndex.toLocaleString("en-US")}
         </span>
       </div>
-      <div className="mt-0.5 flex items-baseline justify-between gap-3">
-        <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-ink-400">
-          activation
-        </span>
-        <span className="font-mono tabular-nums text-accent">
-          {hover.activation.toFixed(3)}
-        </span>
-      </div>
+      {!unassigned && (
+        <div className="mt-0.5 flex items-baseline justify-between gap-3">
+          <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-ink-400">
+            activation
+          </span>
+          <span className="font-mono tabular-nums text-accent">
+            {activationDisplay}
+          </span>
+        </div>
+      )}
     </div>
   );
 }

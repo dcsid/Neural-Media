@@ -1,10 +1,16 @@
 """Aggregator — produces `AggregateReport` from store rows.
 
-Cheap-to-recompute on read (no caching for now). All values are
-predicted-activation aggregates only — see docs/scientific-framing.md.
+All values are predicted-activation aggregates only — see
+docs/scientific-framing.md. The hot path scans every (video, region)
+metrics row plus every watch event, which gets expensive once a store
+holds >1000 videos. We memoize by `(id(store), store.version())` so
+identical inputs hit the cached report; any new run bumps the store's
+version and invalidates automatically.
 """
 
 from __future__ import annotations
+
+from collections import OrderedDict
 
 from .schemas_re_export import (
     AggregateBucket,
@@ -22,7 +28,43 @@ def _video_mean_activation(metrics: list[RegionMetrics]) -> float:
     return sum(m.mean for m in metrics) / len(metrics)
 
 
+# Tiny LRU. A single user usually has one store instance, so this rarely
+# holds more than one entry — the cap exists to bound memory when tests or
+# multi-tenant deployments hand in different store instances.
+_CACHE_CAP = 8
+_AGG_CACHE: "OrderedDict[tuple[int, str], AggregateReport]" = OrderedDict()
+
+
+def _cache_get(key: tuple[int, str]) -> AggregateReport | None:
+    hit = _AGG_CACHE.get(key)
+    if hit is not None:
+        _AGG_CACHE.move_to_end(key)
+    return hit
+
+
+def _cache_put(key: tuple[int, str], report: AggregateReport) -> None:
+    _AGG_CACHE[key] = report
+    _AGG_CACHE.move_to_end(key)
+    while len(_AGG_CACHE) > _CACHE_CAP:
+        _AGG_CACHE.popitem(last=False)
+
+
+def clear_aggregate_cache() -> None:
+    """Drop every memoized aggregate. Used by tests; rarely needed in prod."""
+    _AGG_CACHE.clear()
+
+
 def compute_aggregate(store: Store) -> AggregateReport:
+    key = (id(store), store.version())
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit
+    report = _compute_aggregate(store)
+    _cache_put(key, report)
+    return report
+
+
+def _compute_aggregate(store: Store) -> AggregateReport:
     videos = store.list_videos()
     watch_events = store.list_watch_events()
 
@@ -94,4 +136,4 @@ def compute_aggregate(store: Store) -> AggregateReport:
     )
 
 
-__all__ = ["compute_aggregate"]
+__all__ = ["clear_aggregate_cache", "compute_aggregate"]

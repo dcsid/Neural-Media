@@ -16,12 +16,27 @@ import { ApiOfflineState } from "@/components/ApiOfflineState";
 
 type Phase =
   | { kind: "idle" }
-  | { kind: "rejected"; message: string }
+  | {
+      kind: "rejected";
+      message: string;
+      // True when the server's 400 explicitly cites the [real] extra —
+      // we surface a setup hint below the headline message.
+      realModeSetup?: boolean;
+    }
   | { kind: "starting"; filename: string }
   | { kind: "tracking"; job: ImportJob }
   | { kind: "complete"; job: ImportJob }
   | { kind: "failed"; job: ImportJob }
   | { kind: "offline"; url: string; message: string };
+
+// Pull the FastAPI `detail` field off an HTTP error body when the server
+// returned one. Used to surface real-mode setup errors verbatim instead
+// of the useless "HTTP 400" shape.
+function extractDetail(body: unknown): string | undefined {
+  if (typeof body !== "object" || body === null) return undefined;
+  const detail = (body as Record<string, unknown>).detail;
+  return typeof detail === "string" ? detail : undefined;
+}
 
 const POLL_INTERVAL_MS = 500;
 const MAX_CONSECUTIVE_POLL_FAILURES = 5; // 2.5s of silence → flip to offline.
@@ -29,7 +44,69 @@ const COMPLETION_HOLD_MS = 1100; // Brief acknowledgement frame before redirect.
 
 function isAcceptableFile(file: File): boolean {
   const name = file.name.toLowerCase();
-  return name.endsWith(".json") || name.endsWith(".zip");
+  // .txt covers the newer "Watch History.txt" export — a flat
+  // Date:/Link: block format the backend importer auto-detects.
+  return name.endsWith(".json") || name.endsWith(".zip") || name.endsWith(".txt");
+}
+
+// Time-window units the UI exposes. Wire format is always an ISO
+// `since` timestamp computed from (amount, unit) at submit time — the
+// backend doesn't need to know the unit. "minutes" is here because
+// real-mode demos against the past hour or two are the realistic
+// scale at which TRIBE v2 + yt-dlp on a home IP actually completes.
+type WindowUnit = "minutes" | "hours" | "days";
+const UNIT_TO_MS: Record<WindowUnit, number> = {
+  minutes: 60 * 1000,
+  hours: 60 * 60 * 1000,
+  days: 24 * 60 * 60 * 1000,
+};
+
+// Default window. 14 days yields ~10k videos on the reference history —
+// fine for mock mode, capped enough that real mode is at least
+// approachable. 0 disables the window.
+const DEFAULT_WINDOW_AMOUNT = 14;
+const DEFAULT_WINDOW_UNIT: WindowUnit = "days";
+
+type RunMode = "mock" | "real";
+
+// Heuristic count of videos a typical TikTok history yields per window.
+// Numbers from the integration lead's reference history; this is a hint,
+// not a guarantee — real exports vary wildly. Keyed by total hours so we
+// can interpolate across the (amount, unit) input.
+const WINDOW_ESTIMATE_TABLE: Array<{ hours: number; videos: number }> = [
+  { hours: 1, videos: 30 },
+  { hours: 6, videos: 180 },
+  { hours: 24, videos: 700 },
+  { hours: 24 * 7, videos: 10_000 },
+  { hours: 24 * 30, videos: 40_000 },
+];
+
+function estimateVideos(amount: number, unit: WindowUnit): number {
+  const hours = (amount * UNIT_TO_MS[unit]) / UNIT_TO_MS.hours;
+  if (hours <= 0) return 0;
+  const table = WINDOW_ESTIMATE_TABLE;
+  if (hours <= table[0].hours) {
+    // Linear from 0 to first anchor — short windows scale roughly with time.
+    return Math.max(1, Math.round((hours / table[0].hours) * table[0].videos));
+  }
+  if (hours >= table[table.length - 1].hours) {
+    return table[table.length - 1].videos;
+  }
+  for (let i = 1; i < table.length; i += 1) {
+    const lo = table[i - 1];
+    const hi = table[i];
+    if (hours <= hi.hours) {
+      const t = (hours - lo.hours) / (hi.hours - lo.hours);
+      return Math.round(lo.videos + t * (hi.videos - lo.videos));
+    }
+  }
+  return table[table.length - 1].videos;
+}
+
+function formatEstimate(n: number): string {
+  if (n >= 10_000) return `${Math.round(n / 1000)}k`;
+  if (n >= 1_000) return `${(n / 1000).toFixed(1)}k`;
+  return n.toLocaleString();
 }
 
 function progressLabel(job: ImportJob): string {
@@ -60,6 +137,9 @@ export default function ImportPage() {
   const router = useRouter();
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
   const [dragOver, setDragOver] = useState(false);
+  const [windowAmount, setWindowAmount] = useState<number>(DEFAULT_WINDOW_AMOUNT);
+  const [windowUnit, setWindowUnit] = useState<WindowUnit>(DEFAULT_WINDOW_UNIT);
+  const [mode, setMode] = useState<RunMode>("mock");
   // Track the active polling token so an in-flight loop from a
   // previous upload can't write into a fresh one.
   const pollTokenRef = useRef(0);
@@ -118,8 +198,15 @@ export default function ImportPage() {
   const uploadFile = useCallback(
     async (file: File) => {
       setPhase({ kind: "starting", filename: file.name });
+      // Resolve the window to an ISO `since`. Amount of 0 (or any
+      // non-positive value) disables the filter — the backend treats
+      // a missing `since` the same as "import everything".
+      const since =
+        windowAmount > 0
+          ? new Date(Date.now() - windowAmount * UNIT_TO_MS[windowUnit]).toISOString()
+          : undefined;
       try {
-        const job = await api.importStart(file);
+        const job = await api.importStart(file, { since, mode });
         startPolling(job.id);
       } catch (err) {
         if (err instanceof ApiError) {
@@ -133,19 +220,29 @@ export default function ImportPage() {
             setPhase({ kind: "offline", url: err.url, message: err.message });
             return;
           }
+          // 400 / 422: FastAPI puts the human-readable reason on `detail`.
+          // Surface it verbatim — the most common 400 today is
+          // "real mode requires the [real] inference extra".
+          const detail = extractDetail(err.body);
+          const cited = detail?.toLowerCase() ?? "";
+          const isRealModeSetup =
+            mode === "real" &&
+            err.status === 400 &&
+            (cited.includes("real") || cited.includes("[real]") || cited.includes("license"));
           setPhase({
             kind: "rejected",
             message:
               err.kind === "http"
-                ? `Server rejected the upload (HTTP ${err.status}).`
+                ? detail ?? `Server rejected the upload (HTTP ${err.status}).`
                 : err.message,
+            realModeSetup: isRealModeSetup,
           });
           return;
         }
         throw err;
       }
     },
-    [startPolling],
+    [startPolling, windowAmount, windowUnit, mode],
   );
 
   const acceptingDrop =
@@ -176,13 +273,41 @@ export default function ImportPage() {
       if (!isAcceptableFile(first)) {
         setPhase({
           kind: "rejected",
-          message: `${first.name} isn't a .json or .zip file. Drop your TikTok user_data.json or the export archive.`,
+          message: `${first.name} isn't a .json, .txt, or .zip file. Drop your TikTok user_data.json, Watch History.txt, or the export archive.`,
         });
         return;
       }
       void uploadFile(first);
     },
     [acceptingDrop, uploadFile],
+  );
+
+  const onWindowAmountChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const parsed = Number.parseInt(e.target.value, 10);
+      // NaN → fall through to 0 (means "no window"); negative clamped
+      // to 0 too. uploadFile treats <=0 as "send no since".
+      setWindowAmount(Number.isFinite(parsed) ? Math.max(0, parsed) : 0);
+    },
+    [],
+  );
+
+  const onWindowUnitChange = useCallback(
+    (e: React.ChangeEvent<HTMLSelectElement>) => {
+      const value = e.target.value;
+      if (value === "minutes" || value === "hours" || value === "days") {
+        setWindowUnit(value);
+      }
+    },
+    [],
+  );
+
+  const onModeChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const value = e.target.value;
+      if (value === "mock" || value === "real") setMode(value);
+    },
+    [],
   );
 
   if (phase.kind === "offline") {
@@ -206,11 +331,84 @@ export default function ImportPage() {
           tiktok.com/setting/download-your-data
         </a>
         . When it arrives, drop the{" "}
-        <code className="font-mono text-ink-100">user_data.json</code> file
-        — or the entire <code className="font-mono text-ink-100">.zip</code>{" "}
-        archive — onto the zone below. The pipeline runs entirely on this
+        <code className="font-mono text-ink-100">user_data.json</code>,{" "}
+        the newer <code className="font-mono text-ink-100">Watch History.txt</code>,
+        or the entire <code className="font-mono text-ink-100">.zip</code>{" "}
+        archive onto the zone below. The pipeline runs entirely on this
         machine; nothing is uploaded anywhere else.
       </p>
+
+      <div className="mt-8 grid gap-x-6 gap-y-4 sm:grid-cols-[auto_1fr]">
+        <div className="text-[12px] uppercase tracking-wider text-ink-400 sm:pt-2">
+          Window
+        </div>
+        <div className="flex flex-wrap items-center gap-3 text-[12px] text-ink-300">
+          <label htmlFor="window-amount" className="text-ink-200">
+            Last
+          </label>
+          <input
+            id="window-amount"
+            type="number"
+            min={0}
+            step={1}
+            value={windowAmount}
+            onChange={onWindowAmountChange}
+            disabled={!acceptingDrop}
+            className="w-20 border border-line bg-canvas px-2 py-1 text-center font-mono tabular-nums text-ink-100 focus:border-accent focus:outline-none disabled:opacity-50"
+            aria-describedby="window-hint"
+          />
+          <select
+            id="window-unit"
+            value={windowUnit}
+            onChange={onWindowUnitChange}
+            disabled={!acceptingDrop}
+            className="border border-line bg-canvas px-2 py-1 text-ink-100 focus:border-accent focus:outline-none disabled:opacity-50"
+            aria-label="Window unit"
+          >
+            <option value="minutes">minutes</option>
+            <option value="hours">hours</option>
+            <option value="days">days</option>
+          </select>
+          <span className="text-ink-200">of history.</span>
+          <span id="window-hint" className="basis-full text-ink-400 sm:basis-auto">
+            Set 0 to import everything. Real mode runs TRIBE v2 once per video; keep this small.
+          </span>
+        </div>
+
+        <div className="text-[12px] uppercase tracking-wider text-ink-400 sm:pt-2">
+          Mode
+        </div>
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-2 text-[12px] text-ink-300">
+          <label className="flex items-center gap-2">
+            <input
+              type="radio"
+              name="mode"
+              value="mock"
+              checked={mode === "mock"}
+              onChange={onModeChange}
+              disabled={!acceptingDrop}
+              className="accent-accent disabled:opacity-50"
+            />
+            <span className="text-ink-100">Mock</span>
+            <span className="text-ink-400">fast, synthetic outputs (no download, no GPU)</span>
+          </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="radio"
+              name="mode"
+              value="real"
+              checked={mode === "real"}
+              onChange={onModeChange}
+              disabled={!acceptingDrop}
+              className="accent-accent disabled:opacity-50"
+            />
+            <span className="text-ink-100">Real</span>
+            <span className="text-ink-400">
+              yt-dlp + ffmpeg + TRIBE v2 (needs GPU + <code className="font-mono">[real]</code> install + accepted licenses)
+            </span>
+          </label>
+        </div>
+      </div>
 
       <div
         role="region"
@@ -220,7 +418,7 @@ export default function ImportPage() {
         onDragLeave={onDragLeave}
         onDrop={onDrop}
         className={clsx(
-          "mt-10 flex min-h-[400px] flex-col items-center justify-center border px-8 text-center transition-colors duration-100",
+          "mt-6 flex min-h-[400px] flex-col items-center justify-center border px-8 text-center transition-colors duration-100",
           dragOver && acceptingDrop
             ? "border-accent text-ink-50"
             : "border-line text-ink-300",
@@ -236,12 +434,24 @@ export default function ImportPage() {
         </p>
         <p className="mt-3 max-w-[44ch] text-[12px] leading-relaxed">
           {acceptingDrop
-            ? "user_data.json or the .zip archive. Drag-and-drop only."
+            ? "user_data.json, Watch History.txt, or the .zip archive. Drag-and-drop only."
             : phase.kind === "starting"
               ? `Sending ${phase.filename} to the local API.`
               : "Keep this tab open. You'll be redirected when the run completes."}
         </p>
       </div>
+
+      {/* Pre-submission hint. Static lookup; presented as a soft
+          estimate rather than a guarantee. Hides when the window is
+          set to "everything" (amount = 0). */}
+      {acceptingDrop && windowAmount > 0 && (
+        <p className="mt-3 text-[11px] text-ink-400">
+          ≈ <span className="font-mono tabular-nums text-ink-200">
+            {formatEstimate(estimateVideos(windowAmount, windowUnit))}
+          </span>{" "}
+          videos in the selected window on a typical history. Real exports vary.
+        </p>
+      )}
 
       <div
         className="mt-6 min-h-[44px] border-t border-line pt-4 font-mono text-[12px] tabular-nums"
@@ -256,7 +466,7 @@ export default function ImportPage() {
         <p>
           Power users can skip this page and run the importer directly:{" "}
           <code className="font-mono text-ink-200">
-            python -m neural_media_pipeline.importer data/raw/user_data.json
+            python -m neural_media_pipeline path/to/Watch&nbsp;History.txt --mock --days 1 --purge-after-inference
           </code>
           . The same pipeline runs either way.
         </p>
@@ -311,7 +521,22 @@ function StatusLine({ phase }: { phase: Phase }) {
         </span>
       );
     case "rejected":
-      return <span className="text-accent">{phase.message}</span>;
+      return (
+        <span className="block text-accent">
+          {phase.message}
+          {phase.realModeSetup && (
+            <span className="mt-1 block font-sans text-[11px] normal-case tracking-normal text-ink-300">
+              Install with{" "}
+              <code className="font-mono text-ink-200">
+                pip install -e &apos;services/inference[real]&apos;
+              </code>
+              {" "}— see{" "}
+              <span className="text-ink-200">README → &ldquo;Real TRIBE v2 (GPU required)&rdquo;</span>
+              . Or switch to Mock mode above for a demo run.
+            </span>
+          )}
+        </span>
+      );
     case "starting":
       return (
         <span className="text-ink-200">

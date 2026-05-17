@@ -116,8 +116,17 @@ export const api = {
     apiFetch<WatchEvent[]>(ENDPOINTS.watchEvents, opts),
   inferenceRuns: (opts?: ApiFetchOptions) =>
     apiFetch<InferenceRun[]>(ENDPOINTS.inferenceRuns, opts),
-  importStart: (file: File, opts?: ApiFetchOptions) =>
-    apiFetchMultipart<ImportJob>(ENDPOINTS.importStart, file, opts),
+  importStart: (
+    file: File,
+    extra?: {
+      days?: number;
+      since?: string;
+      until?: string;
+      mode?: "mock" | "real";
+    },
+    opts?: ApiFetchOptions,
+  ) =>
+    apiFetchMultipart<ImportJob>(ENDPOINTS.importStart, file, extra, opts),
   importJob: (id: string, opts?: ApiFetchOptions) =>
     apiFetch<ImportJob>(ENDPOINTS.importJob(id), opts),
 };
@@ -125,11 +134,21 @@ export const api = {
 async function apiFetchMultipart<T>(
   path: string,
   file: File,
+  extra: {
+    days?: number;
+    since?: string;
+    until?: string;
+    mode?: "mock" | "real";
+  } = {},
   opts: ApiFetchOptions = {},
 ): Promise<T> {
   const url = opts.baseUrl ? `${opts.baseUrl.replace(/\/$/, "")}${path}` : path;
   const form = new FormData();
   form.append("file", file, file.name);
+  if (extra.days != null) form.append("days", String(extra.days));
+  if (extra.since) form.append("since", extra.since);
+  if (extra.until) form.append("until", extra.until);
+  if (extra.mode) form.append("mode", extra.mode);
 
   let response: Response;
   try {

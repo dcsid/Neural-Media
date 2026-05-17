@@ -5,6 +5,11 @@ import { REGION_DESCRIPTIONS, type RegionId } from "@shared/types";
 export interface RegionHoverInfo {
   regionId: RegionId;
   activation: number;
+  // Index into the 20,484-vertex fsaverage5 ordering (left hemisphere then
+  // right). Surfaced so the user can tie a tooltip readout back to an
+  // exported activation row by row number — useful for sanity-checking
+  // against the .npz / Parquet file.
+  vertexIndex: number;
   // Cursor position relative to the BrainMesh container's bounding box.
   // BrainMesh translates the global pointer into container space before
   // handing it here so the tooltip can use absolute positioning.
@@ -16,9 +21,10 @@ interface RegionTooltipProps {
   hover: RegionHoverInfo | null;
 }
 
-// Small floating readout for hover state. Three lines max, tabular numerals,
+// Small floating readout for hover state. Four lines max, tabular numerals,
 // no editorialising — the value reported is exactly what the model predicted
-// for that region, no rounding interpretation.
+// for that vertex (or region mean when per-vertex data isn't available),
+// rounded to 3 decimals.
 
 export function RegionTooltip({ hover }: RegionTooltipProps) {
   if (!hover) return null;
@@ -37,7 +43,7 @@ export function RegionTooltip({ hover }: RegionTooltipProps) {
       style={style}
       className={[
         "pointer-events-none absolute z-10",
-        "min-w-[160px] border border-line bg-surface px-3 py-2",
+        "min-w-[180px] border border-line bg-surface px-3 py-2",
         "text-[11px] leading-tight text-ink-100 shadow-sm",
       ].join(" ")}
     >
@@ -47,8 +53,21 @@ export function RegionTooltip({ hover }: RegionTooltipProps) {
       <div className="mt-0.5 text-ink-100">
         {REGION_DESCRIPTIONS[hover.regionId]}
       </div>
-      <div className="mt-1 font-mono tabular-nums text-accent">
-        {hover.activation.toFixed(2)}
+      <div className="mt-1.5 flex items-baseline justify-between gap-3">
+        <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-ink-400">
+          vertex
+        </span>
+        <span className="font-mono tabular-nums text-ink-200">
+          {hover.vertexIndex.toLocaleString("en-US")}
+        </span>
+      </div>
+      <div className="mt-0.5 flex items-baseline justify-between gap-3">
+        <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-ink-400">
+          activation
+        </span>
+        <span className="font-mono tabular-nums text-accent">
+          {hover.activation.toFixed(3)}
+        </span>
       </div>
     </div>
   );

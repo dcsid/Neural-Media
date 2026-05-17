@@ -1,9 +1,14 @@
 """TikTok export → VideoMetadata + WatchEvent rows.
 
-The TikTok "Download your data" archive is a single JSON file. Browsing
-history lives at ``Activity > Video Browsing History > VideoList`` and is
-the only section this importer consumes. Other top-level keys (Profile,
-Favorite Videos, Like List, ...) are ignored.
+TikTok's "Download your data" flow yields either a raw ``user_data.json``
+file or a ``.zip`` archive containing that file (the wrapper has changed
+across product revisions). ``parse_export`` accepts either form. For
+zips we locate ``user_data.json`` case-insensitively at any depth and
+read it directly from the archive — nothing is extracted to disk.
+
+Browsing history lives at ``Activity > Video Browsing History > VideoList``
+and is the only section this importer consumes. Other top-level keys
+(Profile, Favorite Videos, Like List, ...) are ignored.
 
 The export shape drifts between TikTok releases, so this parser is
 deliberately tolerant: missing optional fields are skipped silently, and
@@ -22,6 +27,7 @@ import json
 import logging
 import re
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -78,19 +84,59 @@ def _coerce_float(value: Any) -> float | None:
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
-def parse_export(path: str | Path) -> tuple[list[VideoMetadata], list[WatchEvent]]:
-    """Parse a TikTok ``user_data.json`` into (videos, watch_events).
+def _load_export_payload(path: Path) -> dict[str, Any]:
+    """Return the parsed JSON payload, transparently unpacking a zip.
 
-    - Videos are deduplicated by ``source_url`` (one row per unique URL).
-    - Watch events preserve every playback occurrence in the export.
-    - Order of videos follows first-seen order in the export; watch
-      events follow source order.
-    - The function never raises on missing optional fields; only a
-      malformed JSON file or a file-system error will propagate.
+    For a ``.zip`` (sniffed via :func:`zipfile.is_zipfile`, so a misnamed
+    extension still works) we scan members and pick the first whose
+    basename matches ``user_data.json`` case-insensitively. The file is
+    read from the archive in memory — nothing is extracted to disk.
+    """
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as zf:
+            member = _find_user_data_member(zf)
+            if member is None:
+                raise FileNotFoundError(
+                    f"no user_data.json found in archive: {path.name}"
+                )
+            with zf.open(member) as fh:
+                return json.loads(fh.read().decode("utf-8"))
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _find_user_data_member(zf: zipfile.ZipFile) -> str | None:
+    """Locate ``user_data.json`` (case-insensitive) at any depth."""
+    candidates = [
+        info.filename for info in zf.infolist()
+        if not info.is_dir()
+        and Path(info.filename).name.lower() == "user_data.json"
+    ]
+    if not candidates:
+        return None
+    # Prefer the shallowest path so a top-level file wins over nested
+    # duplicates inside vendor sub-archives.
+    candidates.sort(key=lambda name: (name.count("/"), len(name)))
+    return candidates[0]
+
+
+def parse_export(path: str | Path) -> tuple[list[VideoMetadata], list[WatchEvent]]:
+    """Parse a TikTok export into (videos, watch_events).
+
+    ``path`` is either:
+      * a JSON file (typically ``user_data.json``), or
+      * a ``.zip`` archive that contains ``user_data.json`` at any depth.
+
+    Other guarantees:
+      - Videos are deduplicated by ``source_url`` (one row per unique URL).
+      - Watch events preserve every playback occurrence in the export.
+      - Order of videos follows first-seen order in the export; watch
+        events follow source order.
+      - The function never raises on missing optional fields; only a
+        malformed JSON file or a file-system error will propagate.
     """
     p = Path(path)
-    with p.open("r", encoding="utf-8") as f:
-        data = json.load(f)
+    data = _load_export_payload(p)
 
     activity = (data or {}).get("Activity") or {}
     browsing = activity.get("Video Browsing History") or {}

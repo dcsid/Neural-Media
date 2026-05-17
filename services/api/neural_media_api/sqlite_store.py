@@ -95,20 +95,24 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_region_metrics_video_id ON region_metrics(video_id)",
-    # Import-job tracking — owned by the api-orchestrator, not the pipeline.
-    # status enum: queued | parsing | downloading | preprocessing | inferring
-    #              | complete | failed
+    # Import-job tracking — canonical shape per shared/CONTRACTS.md §8.
+    # status enum: queued | running | complete | partial | failed.
+    # progress is denormalised into three columns (current/total/phase)
+    # rather than a JSON blob so the status index stays cheap and the
+    # poller can write counters without parsing.
     """
     CREATE TABLE IF NOT EXISTS import_jobs (
-        id                TEXT PRIMARY KEY,
-        status            TEXT NOT NULL,
-        mode              TEXT NOT NULL,
-        videos_total      INTEGER NOT NULL DEFAULT 0,
-        videos_processed  INTEGER NOT NULL DEFAULT 0,
-        started_at        TEXT NOT NULL,
-        completed_at      TEXT,
-        error             TEXT,
-        message           TEXT
+        id                 TEXT PRIMARY KEY,
+        status             TEXT NOT NULL,
+        mode               TEXT NOT NULL,
+        created_at         TEXT NOT NULL,
+        updated_at         TEXT NOT NULL,
+        completed_at       TEXT,
+        progress_current   INTEGER NOT NULL DEFAULT 0,
+        progress_total     INTEGER,
+        progress_phase     TEXT,
+        error              TEXT,
+        source_filename    TEXT
     )
     """,
     # Lets the "is anything still running?" check land in one indexed lookup.

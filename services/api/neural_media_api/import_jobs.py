@@ -1,27 +1,35 @@
 """Import-job orchestration.
 
 A POST to ``/api/v1/import`` lands a TikTok export on disk, registers an
-ImportJob row, and hands the file off to ``neural_media_pipeline.Orchestrator``
-on a background daemon thread. Polling ``GET /api/v1/import/{id}`` returns
-the current ImportJob row — the same row is persisted in SQLite so a
-crash mid-run leaves a recoverable trail.
+ImportJob row, and hands the file off to
+``neural_media_pipeline.Orchestrator`` on a background daemon thread.
+Polling ``GET /api/v1/import/{id}`` returns the current ImportJob row —
+the same row is persisted in SQLite so a crash mid-run leaves a
+recoverable trail.
+
+Wire shape: see ``shared/CONTRACTS.md §8`` and ``shared.schemas.ImportJob``.
+Top-level status is one of ``queued | running | complete | partial |
+failed``; progress detail (phase, counters) lives on the nested
+``progress`` block.
 
 ## Concurrency model
 
 Single user, local-first — at most one orchestrator runs at a time. A
 ``threading.Lock`` + a module-level "currently running job id" together
-serve as the gate. A second POST while a job is running returns 409
-naming the in-flight job; no queue, no fan-out.
+serve as the gate. A second POST while a job is running raises
+``JobAlreadyRunning`` (the route handler turns this into 409 carrying
+the in-flight job as the literal ImportJob shape).
 
 ## Progress reporting
 
-The Orchestrator may accept an ``on_progress=`` callback in a future
-data-pipeline revision (see PR description's "Contract additions"). We
-probe for it via ``inspect.signature``. When the callback is wired, we
-get fine-grained status transitions (downloading / preprocessing /
-inferring). Until then, the runner does a coarse parsing → inferring →
-complete walk, and a sibling poller thread reads the orchestrator's own
-``pipeline_jobs`` table to fill ``videos_total`` / ``videos_processed``.
+The Orchestrator emits ``ProgressEvent``s through an ``on_progress=``
+callback when it accepts one (data-pipeline shipped this in round 3).
+We probe for it via ``inspect.signature``; until it's wired in older
+checkouts, a sibling poller thread reads the orchestrator's own
+``pipeline_jobs`` table to fill counters. Either signal updates
+``progress_current`` / ``progress_total`` / ``progress_phase``; neither
+changes the top-level status (which only flips at submission and at
+terminal).
 
 ## Modes
 
@@ -34,79 +42,58 @@ extra isn't installed.
 from __future__ import annotations
 
 import inspect
-import json
 import logging
 import sqlite3
 import threading
-import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable
 
-from pydantic import BaseModel, Field
+from .schemas_re_export import (
+    ImportJob,
+    ImportJobProgress,
+    ImportJobStatus,
+    ImportMode,
+)
 
 _log = logging.getLogger(__name__)
 
-ImportJobStatus = Literal[
-    "queued",
-    "parsing",
-    "downloading",
-    "preprocessing",
-    "inferring",
-    "complete",
-    "failed",
-]
-ImportMode = Literal["mock", "real"]
-
-# Tighter bound than the pipeline's own poll loop — UI polling is once-per-
-# second-ish, so 0.5s gives us a low-jitter signal without spinning.
+# Tighter bound than the pipeline's own poll loop — UI polling is once-
+# per-second-ish, so 0.5s gives us a low-jitter signal without spinning.
 _POLL_INTERVAL_S = 0.5
 
+# Statuses considered terminal — the gate releases on entry to one of
+# these, and orphan recovery flips anything non-terminal to "failed".
+_TERMINAL_STATUSES: frozenset[ImportJobStatus] = frozenset(
+    {"complete", "partial", "failed"}
+)
+
 # Map from pipeline_jobs.status (data-pipeline's per-video state machine)
-# to the import_jobs.status we report up. We pick the "furthest along" not-
-# yet-complete row each tick so the UI shows forward motion, not regress.
-_PIPELINE_TO_IMPORT_STATUS: dict[str, ImportJobStatus] = {
-    "queued":        "downloading",     # queued → about to download
-    "downloaded":    "preprocessing",   # download done → preprocessing next
-    "preprocessed":  "inferring",       # preprocessing done → inferring next
-    "complete":      "inferring",       # treated as "in flight" until all done
-    "failed":        "inferring",       # one failure doesn't flip the whole job
+# to a phase label suitable for `progress.phase`. We pick the
+# "furthest along" not-yet-complete row each tick so the UI shows
+# forward motion, not regress.
+_PIPELINE_TO_PHASE: dict[str, str] = {
+    "queued":       "downloading",
+    "downloaded":   "preprocessing",
+    "preprocessed": "inferring",
+    "complete":     "inferring",   # still in flight until all rows clear
+    "failed":       "inferring",   # one failure doesn't flip the job's phase
 }
 
 
-class ImportJob(BaseModel):
-    """Wire shape returned by ``POST /import`` and ``GET /import/{id}``.
-
-    Mirrors the row layout in the ``import_jobs`` SQLite table. This is the
-    contract addition the frontend needs — terminal 1 will land the
-    canonical copy in shared/schemas once data-pipeline and api have
-    aligned (see PR description).
-    """
-
-    id: str
-    status: ImportJobStatus
-    mode: ImportMode
-    videos_total: int = 0
-    videos_processed: int = 0
-    started_at: datetime
-    completed_at: datetime | None = None
-    error: str | None = None
-    message: str | None = None
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
 class ImportJobsStore:
     """Thin CRUD over the ``import_jobs`` table.
 
-    Per-call connections, same pattern as `SqliteStore`, so this is safe
+    Per-call connections, same pattern as ``SqliteStore``, so this is safe
     to share between the request thread and the runner / poller threads.
     The orchestrator opens its own connection on the same file with
     ``journal_mode=WAL``, which lets us issue concurrent reads here.
@@ -127,17 +114,23 @@ class ImportJobsStore:
         try:
             conn.execute(
                 """
-                INSERT INTO import_jobs
-                  (id, status, mode, videos_total, videos_processed,
-                   started_at, completed_at, error, message)
-                VALUES (?,?,?,?,?,?,?,?,?)
+                INSERT INTO import_jobs (
+                    id, status, mode,
+                    created_at, updated_at, completed_at,
+                    progress_current, progress_total, progress_phase,
+                    error, source_filename
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     job.id, job.status, job.mode,
-                    job.videos_total, job.videos_processed,
-                    job.started_at.isoformat(),
+                    job.created_at.isoformat(),
+                    job.updated_at.isoformat(),
                     job.completed_at.isoformat() if job.completed_at else None,
-                    job.error, job.message,
+                    job.progress.current,
+                    job.progress.total,
+                    job.progress.phase,
+                    job.error,
+                    job.source_filename,
                 ),
             )
             conn.commit()
@@ -155,8 +148,16 @@ class ImportJobsStore:
         return _decode_row(row) if row else None
 
     def update(self, job_id: str, **fields: Any) -> None:
+        """Patch one or more columns.
+
+        Accepts top-level columns (``status``, ``completed_at``, ``error``,
+        ``source_filename``) and nested progress fields (``progress_current``,
+        ``progress_total``, ``progress_phase``). ``updated_at`` is always
+        stamped to now — callers should not pass it.
+        """
         if not fields:
             return
+        fields["updated_at"] = _utcnow().isoformat()
         cols = ", ".join(f"{k} = ?" for k in fields)
         values = [
             v.isoformat() if isinstance(v, datetime) else v
@@ -173,14 +174,14 @@ class ImportJobsStore:
             conn.close()
 
     def latest_running(self) -> ImportJob | None:
-        """Most-recently-started not-yet-terminal job, if any."""
+        """Most-recently-started non-terminal job, if any."""
         conn = self._connect()
         try:
             row = conn.execute(
                 """
                 SELECT * FROM import_jobs
-                 WHERE status NOT IN ('complete', 'failed')
-                 ORDER BY started_at DESC
+                 WHERE status NOT IN ('complete', 'partial', 'failed')
+                 ORDER BY created_at DESC
                  LIMIT 1
                 """
             ).fetchone()
@@ -189,20 +190,22 @@ class ImportJobsStore:
         return _decode_row(row) if row else None
 
     def mark_orphans_failed(self) -> int:
-        """At startup, any "running" row left over from a crashed prior
-        process is no longer actually running. Flip them to failed so the
-        gate doesn't permanently refuse new imports."""
+        """At startup, any non-terminal row left over from a crashed
+        prior process is no longer actually running. Flip them to
+        ``failed`` so the gate doesn't permanently refuse new imports."""
         conn = self._connect()
         try:
+            now = _utcnow().isoformat()
             cur = conn.execute(
                 """
                 UPDATE import_jobs
                    SET status = 'failed',
                        error = COALESCE(error, 'orphaned by api restart'),
+                       updated_at = ?,
                        completed_at = ?
-                 WHERE status NOT IN ('complete', 'failed')
+                 WHERE status NOT IN ('complete', 'partial', 'failed')
                 """,
-                (_utcnow().isoformat(),),
+                (now, now),
             )
             conn.commit()
             return cur.rowcount
@@ -215,12 +218,16 @@ def _decode_row(row: sqlite3.Row) -> ImportJob:
         id=row["id"],
         status=row["status"],
         mode=row["mode"],
-        videos_total=row["videos_total"],
-        videos_processed=row["videos_processed"],
-        started_at=row["started_at"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
         completed_at=row["completed_at"],
+        progress=ImportJobProgress(
+            current=row["progress_current"],
+            total=row["progress_total"],
+            phase=row["progress_phase"],
+        ),
         error=row["error"],
-        message=row["message"],
+        source_filename=row["source_filename"],
     )
 
 
@@ -278,24 +285,33 @@ class ImportRunner:
     def jobs(self) -> ImportJobsStore:
         return self._jobs
 
-    def submit(self, export_path: Path, mode: ImportMode) -> ImportJob:
+    def submit(
+        self,
+        export_path: Path,
+        mode: ImportMode,
+        *,
+        source_filename: str | None = None,
+    ) -> ImportJob:
         """Register a queued job and start its worker thread.
 
-        Raises `JobAlreadyRunning` if another job is in flight.
+        Raises ``JobAlreadyRunning`` if another job is in flight.
         """
         with self._lock:
             if self._running_job_id is not None:
                 running = self._jobs.get(self._running_job_id)
-                if running and running.status not in ("complete", "failed"):
+                if running and running.status not in _TERMINAL_STATUSES:
                     raise JobAlreadyRunning(running)
                 # Stale slot — clear it and proceed.
                 self._running_job_id = None
 
+            now = _utcnow()
             job = ImportJob(
                 id=str(uuid.uuid4()),
                 status="queued",
                 mode=mode,
-                started_at=_utcnow(),
+                created_at=now,
+                updated_at=now,
+                source_filename=source_filename,
             )
             self._jobs.create(job)
             self._running_job_id = job.id
@@ -317,7 +333,12 @@ class ImportRunner:
         poller: threading.Thread | None = None
         orch = None
         try:
-            self._jobs.update(job_id, status="parsing", message="parsing export")
+            # Flip the top-level status once; phase tells the story from here.
+            self._jobs.update(
+                job_id,
+                status="running",
+                progress_phase="parsing",
+            )
 
             orch = self._factory(
                 db_path=self.db_path,
@@ -328,9 +349,9 @@ class ImportRunner:
                 on_progress=_progress_callback(self._jobs, job_id),
             )
 
-            # The progress callback only fires if data-pipeline wired
-            # support for it. Polling pipeline_jobs covers the gap until
-            # they do.
+            # The on_progress callback only fires if data-pipeline wired
+            # support for it. Polling pipeline_jobs covers the gap when it
+            # didn't (older checkouts).
             poller = threading.Thread(
                 target=_poll_pipeline_jobs,
                 args=(self.db_path, self._jobs, job_id, poller_stop),
@@ -339,21 +360,32 @@ class ImportRunner:
             )
             poller.start()
 
-            self._jobs.update(job_id, status="inferring", message="running pipeline")
             summary = orch.ingest_export(export_path)
+
+            completed = (
+                getattr(summary, "completed", 0)
+                + getattr(summary, "skipped_complete", 0)
+            )
+            failed = getattr(summary, "failed", 0)
+            parsed = getattr(summary, "parsed_videos", completed + failed)
+
+            terminal: ImportJobStatus
+            if failed == 0:
+                terminal = "complete"
+            elif completed > 0:
+                terminal = "partial"
+            else:
+                terminal = "failed"
 
             self._jobs.update(
                 job_id,
-                status="complete",
-                videos_total=getattr(summary, "parsed_videos", 0),
-                videos_processed=(
-                    getattr(summary, "completed", 0)
-                    + getattr(summary, "skipped_complete", 0)
-                ),
+                status=terminal,
+                progress_current=completed,
+                progress_total=parsed,
+                progress_phase=None,
                 completed_at=_utcnow(),
-                message=None,
             )
-        except Exception as exc:  # noqa: BLE001  — surface every failure
+        except Exception as exc:  # noqa: BLE001 — surface every failure
             _log.exception("import job %s failed", job_id)
             self._jobs.update(
                 job_id,
@@ -383,30 +415,39 @@ def _progress_callback(jobs: ImportJobsStore, job_id: str) -> ProgressCallback:
     """Build the on_progress callback we hand to the Orchestrator.
 
     Accepts a free-form dict so we don't fail on schema drift. Recognised
-    keys: ``stage`` (one of the ImportJobStatus values), ``videos_total``,
-    ``videos_processed``, ``message``, ``error``.
+    keys: ``phase`` / ``stage`` (either spelling), ``videos_total``,
+    ``videos_processed``, plus an optional ``current``/``total``/``phase``
+    cluster for callers that already speak the canonical shape.
     """
     def _cb(event: dict) -> None:
         fields: dict[str, Any] = {}
-        stage = event.get("stage")
-        if stage in _allowed_stages():
-            fields["status"] = stage
-        for key in ("videos_total", "videos_processed", "message", "error"):
-            if key in event:
-                fields[key] = event[key]
+
+        phase = event.get("phase") or event.get("stage")
+        if phase is not None:
+            fields["progress_phase"] = str(phase)
+
+        # Accept either flat (videos_total / videos_processed) or nested-
+        # style (current / total) field names.
+        if "videos_total" in event:
+            fields["progress_total"] = event["videos_total"]
+        elif "total" in event:
+            fields["progress_total"] = event["total"]
+
+        if "videos_processed" in event:
+            fields["progress_current"] = event["videos_processed"]
+        elif "current" in event:
+            fields["progress_current"] = event["current"]
+
+        if "error" in event and event["error"] is not None:
+            fields["error"] = str(event["error"])
+
         if fields:
             try:
                 jobs.update(job_id, **fields)
             except Exception:  # noqa: BLE001
                 _log.exception("on_progress update failed for %s", job_id)
+
     return _cb
-
-
-def _allowed_stages() -> frozenset[str]:
-    return frozenset({
-        "queued", "parsing", "downloading", "preprocessing",
-        "inferring", "complete", "failed",
-    })
 
 
 def _poll_pipeline_jobs(
@@ -428,13 +469,13 @@ def _poll_pipeline_jobs(
         except sqlite3.OperationalError:
             counts = None
         if counts is not None:
-            total, processed, in_flight_stage = counts
+            total, processed, phase = counts
             fields: dict[str, Any] = {
-                "videos_total": total,
-                "videos_processed": processed,
+                "progress_total": total,
+                "progress_current": processed,
             }
-            if in_flight_stage is not None:
-                fields["status"] = in_flight_stage
+            if phase is not None:
+                fields["progress_phase"] = phase
             try:
                 jobs.update(job_id, **fields)
             except Exception:  # noqa: BLE001
@@ -444,11 +485,11 @@ def _poll_pipeline_jobs(
 
 def _read_pipeline_counts(
     db_path: Path,
-) -> tuple[int, int, ImportJobStatus | None] | None:
-    """(total, processed, in-flight stage) from data-pipeline's table.
+) -> tuple[int, int, str | None] | None:
+    """(total, processed, phase) from data-pipeline's table.
 
     Returns None when ``pipeline_jobs`` doesn't exist yet (orchestrator
-    hasn't initialized its schema).
+    hasn't initialised its schema).
     """
     conn = sqlite3.connect(db_path)
     try:
@@ -472,13 +513,12 @@ def _read_pipeline_counts(
     by_status = {r["status"]: r["n"] for r in rows}
     total = sum(by_status.values())
     processed = by_status.get("complete", 0)
-    # Pick the furthest-along non-complete bucket as the reported stage.
-    stage: ImportJobStatus | None = None
+    phase: str | None = None
     for src in ("preprocessed", "downloaded", "queued", "failed"):
         if by_status.get(src, 0):
-            stage = _PIPELINE_TO_IMPORT_STATUS.get(src)
+            phase = _PIPELINE_TO_PHASE.get(src)
             break
-    return total, processed, stage
+    return total, processed, phase
 
 
 # ---------------------------------------------------------------------------
@@ -494,11 +534,11 @@ def default_orchestrator_factory(
     mode: ImportMode,
     on_progress: ProgressCallback,
 ) -> Any:
-    """Construct a real `neural_media_pipeline.Orchestrator`.
+    """Construct a real ``neural_media_pipeline.Orchestrator``.
 
-    Probes the Orchestrator signature for `on_progress=` and silently
+    Probes the Orchestrator signature for ``on_progress=`` and silently
     drops it if data-pipeline hasn't shipped support yet — the poller
-    thread provides a fallback signal.
+    thread provides a fallback signal in that case.
     """
     from neural_media_pipeline import Orchestrator, OrchestratorConfig
 
@@ -532,10 +572,10 @@ def _orchestrator_accepts_on_progress() -> bool:
 
 
 def _build_real_inference_fn() -> Callable[..., Any]:
-    """Construct a `run_inference` wrapper bound to TribeBackend.
+    """Construct a ``run_inference`` wrapper bound to TribeBackend.
 
     Raises ImportError (which the route handler turns into 400) when the
-    `[real]` extra isn't installed.
+    ``[real]`` extra isn't installed.
     """
     try:
         from neural_media_inference import TribeBackend, run_inference
@@ -556,9 +596,9 @@ def _build_real_inference_fn() -> Callable[..., Any]:
 def real_mode_available() -> bool:
     """Cheap precheck used by POST /import to 400 early.
 
-    `TribeBackend` is exposed as a lazy attribute and always imports
-    cleanly, even without the `[real]` extra. The real signal that the
-    extra is installed is that `torch` is importable — it's the
+    ``TribeBackend`` is exposed as a lazy attribute and always imports
+    cleanly even without the ``[real]`` extra. The real signal that the
+    extra is installed is that ``torch`` is importable — it's the
     heaviest direct dep and the one the extra exists to pull in.
     """
     try:
@@ -575,6 +615,7 @@ def real_mode_available() -> bool:
 
 __all__ = [
     "ImportJob",
+    "ImportJobProgress",
     "ImportJobStatus",
     "ImportJobsStore",
     "ImportMode",

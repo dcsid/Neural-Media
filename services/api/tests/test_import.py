@@ -157,15 +157,15 @@ def test_post_import_json_round_trip(
         "/api/v1/import",
         files={"file": ("user_data.json", io.BytesIO(small_export_bytes), "application/json")},
     )
-    assert resp.status_code == 202, resp.text
+    assert resp.status_code == 200, resp.text
     job = resp.json()
     assert job["mode"] == "mock"
-    assert job["status"] in {"queued", "parsing", "inferring", "complete"}
+    assert job["status"] in {"queued", "running", "complete"}
     assert job["completed_at"] is None or job["status"] == "complete"
 
     final = _wait_until_status(client, job["id"], status="complete")
-    assert final["videos_total"] == 2
-    assert final["videos_processed"] == 2
+    assert final["progress"]["total"] == 2
+    assert final["progress"]["current"] == 2
     assert final["error"] is None
     assert final["completed_at"] is not None
 
@@ -191,7 +191,7 @@ def test_post_import_zip_is_handed_through_unmodified(
         files={"file": ("tiktok_export.zip", io.BytesIO(zip_bytes), "application/zip")},
         data={"mode": "mock"},
     )
-    assert resp.status_code == 202, resp.text
+    assert resp.status_code == 200, resp.text
     _wait_until_status(client, resp.json()["id"], status="complete")
 
     assert seen and seen[0].suffix == ".zip"
@@ -244,19 +244,20 @@ def test_second_post_while_running_returns_409(
         "/api/v1/import",
         files={"file": ("a.json", io.BytesIO(small_export_bytes), "application/json")},
     )
-    assert first.status_code == 202
+    assert first.status_code == 200
     first_id = first.json()["id"]
 
     # The runner spawns a daemon thread; give it a beat to register the job.
-    _wait_until_status(client, first_id, status="inferring", timeout_s=2.0)
+    _wait_until_status(client, first_id, status="running", timeout_s=2.0)
 
     second = client.post(
         "/api/v1/import",
         files={"file": ("b.json", io.BytesIO(small_export_bytes), "application/json")},
     )
     assert second.status_code == 409
-    detail = second.json()["detail"]
-    assert detail["running_job_id"] == first_id
+    # 409 body is the literal ImportJob (per CONTRACTS.md §8) — not a
+    # `{"detail": ...}` envelope. Frontend reads `.id` directly.
+    assert second.json()["id"] == first_id
 
     release.set()
     _wait_until_status(client, first_id, status="complete")
@@ -271,7 +272,7 @@ def test_second_post_while_running_returns_409(
         "/api/v1/import",
         files={"file": ("c.json", io.BytesIO(small_export_bytes), "application/json")},
     )
-    assert third.status_code == 202
+    assert third.status_code == 200
 
 
 # --- failure path ----------------------------------------------------------
@@ -289,8 +290,8 @@ def test_orchestrator_exception_marks_job_failed(
         "/api/v1/import",
         files={"file": ("a.json", io.BytesIO(small_export_bytes), "application/json")},
     )
-    assert resp.status_code == 202
-    final = _wait_until_status(client, resp.json()["id"], status="failed")
+    assert resp.status_code == 200
+    final = _wait_until_status(client, resp.json()["id"], status="failed", timeout_s=8.0)
     assert "boom" in final["error"]
     assert final["completed_at"] is not None
 
@@ -319,9 +320,15 @@ def test_orphan_running_row_does_not_block_new_imports(
     try:
         conn.execute(
             "INSERT INTO import_jobs "
-            "(id, status, mode, videos_total, videos_processed, started_at) "
-            "VALUES (?,?,?,?,?,?)",
-            ("orphan", "inferring", "mock", 0, 0, "2026-05-15T00:00:00+00:00"),
+            "(id, status, mode, created_at, updated_at, "
+            " progress_current, progress_total, progress_phase) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (
+                "orphan", "running", "mock",
+                "2026-05-15T00:00:00+00:00",
+                "2026-05-15T00:00:00+00:00",
+                0, None, "inferring",
+            ),
         )
         conn.commit()
     finally:
@@ -339,7 +346,7 @@ def test_orphan_running_row_does_not_block_new_imports(
         "/api/v1/import",
         files={"file": ("a.json", io.BytesIO(small_export_bytes), "application/json")},
     )
-    assert resp.status_code == 202
+    assert resp.status_code == 200
 
 
 # --- ImportJob shape -------------------------------------------------------
@@ -361,11 +368,13 @@ def test_get_import_returns_full_import_job_shape(
     _wait_until_status(client, job_id, status="complete")
     body = client.get(f"/api/v1/import/{job_id}").json()
     assert set(body) == {
-        "id", "status", "mode", "videos_total", "videos_processed",
-        "started_at", "completed_at", "error", "message",
+        "id", "status", "mode",
+        "created_at", "updated_at", "completed_at",
+        "progress", "error", "source_filename",
     }
-    assert body["videos_total"] == 3
-    assert body["videos_processed"] == 3
+    assert body["progress"]["total"] == 3
+    assert body["progress"]["current"] == 3
+    assert set(body["progress"]) == {"current", "total", "phase"}
 
 
 # --- CORS exposes POST -----------------------------------------------------

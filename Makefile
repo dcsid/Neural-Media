@@ -21,7 +21,7 @@ export PYTHONPATH := $(REPO_ROOT)/services/pipeline:$(REPO_ROOT)/services/api:$(
 
 .PHONY: help install install-python install-web sample ingest init-db \
         dev dev-api dev-api-mock dev-web test test-python test-web \
-        typecheck-web clean unhide-pth
+        typecheck-web clean unhide-pth bench-ingest
 
 help:
 	@echo "Neural Media — make targets"
@@ -38,6 +38,7 @@ help:
 	@echo "  make typecheck-web   tsc --noEmit for the web app"
 	@echo "  make clean           remove generated artifacts (videos, activations, db)"
 	@echo "  make unhide-pth      strip macOS UF_HIDDEN from editable .pth files"
+	@echo "  make bench-ingest    mock-mode ingest perf (N=5000 or EXPORT=...)"
 
 # -----------------------------------------------------------------------------
 # Install
@@ -148,4 +149,36 @@ unhide-pth:
 	  echo "unhid editable .pth files under .venv-dev/lib/"; \
 	else \
 	  echo "skipped (sandbox UF_HIDDEN issue is macOS-specific)"; \
+	fi
+
+# -----------------------------------------------------------------------------
+# Mock-mode ingest benchmark.
+#
+#   make bench-ingest             # uses the user's real Watch History.txt
+#   make bench-ingest N=5000      # synthetic N-video run
+#   make bench-ingest EXPORT=/path/to/Watch\ History.txt
+#
+# Reports wall time + videos/sec for one mock-mode end-to-end ingest with
+# `--purge-after-inference --purge-activations` (the demo path). See
+# docs/bench-results.md for the targets and the numbers we're chasing.
+# -----------------------------------------------------------------------------
+
+# Default export = the location the data-pipeline brief calls out. Override
+# either EXPORT (real export) or N (synthetic). EXPORT wins when both are set.
+EXPORT ?= /Users/siddus/Downloads/TikTok/Your Activity/Watch History.txt
+N ?=
+
+bench-ingest:
+	@if [ -n "$(N)" ]; then \
+	  echo "Benchmarking synthetic $(N)-video ingest..."; \
+	  $(PYTHON) services/pipeline/scripts/bench_mock.py $(N); \
+	elif [ -f "$(EXPORT)" ]; then \
+	  echo "Benchmarking real export: $(EXPORT)"; \
+	  $(PYTHON) services/pipeline/scripts/bench_mock.py --export "$(EXPORT)"; \
+	else \
+	  echo "EXPORT=$(EXPORT) not found and N is unset."; \
+	  echo "Usage:"; \
+	  echo "  make bench-ingest N=5000"; \
+	  echo "  make bench-ingest EXPORT=/path/to/Watch\\ History.txt"; \
+	  exit 1; \
 	fi

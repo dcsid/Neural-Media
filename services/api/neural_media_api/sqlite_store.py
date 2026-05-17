@@ -95,6 +95,24 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_region_metrics_video_id ON region_metrics(video_id)",
+    # Import-job tracking — owned by the api-orchestrator, not the pipeline.
+    # status enum: queued | parsing | downloading | preprocessing | inferring
+    #              | complete | failed
+    """
+    CREATE TABLE IF NOT EXISTS import_jobs (
+        id                TEXT PRIMARY KEY,
+        status            TEXT NOT NULL,
+        mode              TEXT NOT NULL,
+        videos_total      INTEGER NOT NULL DEFAULT 0,
+        videos_processed  INTEGER NOT NULL DEFAULT 0,
+        started_at        TEXT NOT NULL,
+        completed_at      TEXT,
+        error             TEXT,
+        message           TEXT
+    )
+    """,
+    # Lets the "is anything still running?" check land in one indexed lookup.
+    "CREATE INDEX IF NOT EXISTS idx_import_jobs_status ON import_jobs(status)",
 )
 
 

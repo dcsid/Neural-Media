@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 import { Header } from "@/components/Header";
 import { Footer } from "@/components/Footer";
+import { MockModeBadge } from "@/components/MockModeBadge";
 
 export const metadata: Metadata = {
   title: "Neural Media",
@@ -22,6 +23,10 @@ export default function RootLayout({
         </a>
         <div className="flex min-h-screen flex-col">
           <Header />
+          {/* Mock-mode honesty banner. Renders only when at least one
+              complete InferenceRun in the catalogue used a mock backend;
+              hidden in real-mode and on a fresh catalogue. */}
+          <MockModeBadge />
           <div id="main" className="flex-1">
             {children}
           </div>

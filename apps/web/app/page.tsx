@@ -8,12 +8,15 @@ import { ApiOfflineState } from "@/components/ApiOfflineState";
 import { NoVideosState } from "@/components/NoVideosState";
 import { ImportInProgressState } from "@/components/ImportInProgressState";
 import { BrainMeshSlot } from "@/components/BrainMeshSlot";
-import { RegionBalanceBars } from "@/components/RegionBalanceBars";
-import { HourHistogram } from "@/components/HourHistogram";
 import { DayStrip } from "@/components/DayStrip";
 import { WatchedVideosSection } from "@/components/WatchedVideosSection";
 import { WatchedVideosListSkeleton } from "@/components/WatchedVideosListSkeleton";
 import { StatRow } from "@/components/StatRow";
+import { HeroFinding } from "@/components/HeroFinding";
+import { RegionLeaderboard } from "@/components/RegionLeaderboard";
+import { HourHistogramAnnotated } from "@/components/HourHistogramAnnotated";
+import { AuthorPlaceholder } from "@/components/AuthorPlaceholder";
+import { REGION_DESCRIPTIONS, type RegionDef } from "@shared/types";
 
 export const dynamic = "force-dynamic";
 
@@ -52,6 +55,17 @@ export default async function DashboardPage() {
       );
     }
 
+    // Region descriptions for the leaderboard hover. Server-side fetch
+    // so we render with the API's canonical text; if the call fails
+    // we fall back to the contract's REGION_DESCRIPTIONS constant.
+    const regionDefs: RegionDef[] = await api
+      .regions({ baseUrl })
+      .catch(() => []);
+    const descriptions: Record<string, string> = { ...REGION_DESCRIPTIONS };
+    for (const def of regionDefs) {
+      descriptions[def.region_id] = def.description;
+    }
+
     const meanActivation =
       Object.values(aggregate.by_region).reduce(
         (acc, b) => acc + (b?.mean ?? 0),
@@ -60,63 +74,72 @@ export default async function DashboardPage() {
 
     return (
       <main className="mx-auto max-w-[1280px] px-8 pb-10 pt-12">
-        <section className="grid gap-12 md:grid-cols-[1.05fr_1fr] md:items-center">
-          <div>
-            <p className="eyebrow mb-4">Dashboard</p>
-            <h1 className="font-serif text-[40px] leading-[1.1] tracking-tightish text-ink-50">
-              Predicted average cortical response to your TikTok history.
-            </h1>
-            <p className="mt-5 max-w-[60ch] text-[14px] leading-relaxed text-ink-200">
-              Each video in your watch history was passed through Meta FAIR
-              TRIBE v2 to estimate the{" "}
-              <span className="text-ink-50">
-                predicted average BOLD response
-              </span>{" "}
-              across the 720 subjects TRIBE was trained on. Numbers below
-              describe that prediction, not your individual brain.
-            </p>
-            <div className="mt-8">
-              <StatRow
-                items={[
-                  {
-                    label: "Videos",
-                    value: aggregate.total_videos.toString(),
-                  },
-                  {
-                    label: "Watch time",
-                    value: formatWatchTimeHuman(aggregate.total_watch_time_s),
-                  },
-                  {
-                    label: "Mean activation",
-                    value: meanActivation.toFixed(2),
-                    hint: "averaged across regions",
-                  },
-                  {
-                    label: "Date range",
-                    value: formatDateRange(
-                      aggregate.first_watched_at,
-                      aggregate.last_watched_at,
-                    ),
-                  },
-                ]}
-              />
-            </div>
-          </div>
-          <div>
+        <HeroFinding
+          totalVideos={aggregate.total_videos}
+          totalWatchTimeS={aggregate.total_watch_time_s}
+          byRegion={aggregate.by_region}
+          firstWatchedAt={aggregate.first_watched_at}
+          lastWatchedAt={aggregate.last_watched_at}
+        />
+
+        <div className="mt-10">
+          <StatRow
+            items={[
+              {
+                label: "Videos",
+                value: aggregate.total_videos.toLocaleString(),
+              },
+              {
+                label: "Watch time",
+                value: formatWatchTimeHuman(aggregate.total_watch_time_s),
+              },
+              {
+                label: "Mean activation",
+                value: meanActivation.toFixed(2),
+                hint: "averaged across regions",
+              },
+              {
+                label: "Date range",
+                value: formatDateRange(
+                  aggregate.first_watched_at,
+                  aggregate.last_watched_at,
+                ),
+              },
+            ]}
+          />
+        </div>
+
+        <RegionLeaderboard
+          byRegion={aggregate.by_region}
+          descriptions={descriptions}
+        />
+
+        <HourHistogramAnnotated
+          byHourOfDay={aggregate.by_hour_of_day}
+          byRegion={aggregate.by_region}
+        />
+
+        <DayStrip byDayOfWeek={aggregate.by_day_of_week} />
+
+        <AuthorPlaceholder />
+
+        <section className="motion-fade-in border-t border-line py-10">
+          <p className="eyebrow">Brain mesh</p>
+          <h2 className="mt-2 font-serif text-[20px] tracking-tightish text-ink-50">
+            Predicted average BOLD on the fsaverage5 surface
+          </h2>
+          <div className="mt-6 grid gap-8 md:grid-cols-[1.4fr_1fr] md:items-center">
             <BrainMeshSlot activation={meanActivation} />
-            <p className="mt-3 text-[11px] text-ink-400">
-              Predicted average BOLD response across cortical regions on
-              the fsaverage5 surface (20,484 vertices).
+            <p className="text-[12px] leading-relaxed text-ink-300">
+              The cortical mesh shows the predicted average BOLD response
+              across 20,484 vertices on the fsaverage5 surface, summarised
+              over your watch history.{" "}
+              <span className="text-ink-400">
+                Predicted average — not your individual brain.
+              </span>
             </p>
           </div>
         </section>
-
-        <RegionBalanceBars byRegion={aggregate.by_region} />
-
-        <div className="grid gap-12 md:grid-cols-[1.4fr_1fr]">
-          <HourHistogram byHourOfDay={aggregate.by_hour_of_day} />
-          <DayStrip byDayOfWeek={aggregate.by_day_of_week} />
-        </div>
 
         <Suspense fallback={<WatchedVideosListSkeleton />}>
           <WatchedVideosSection />

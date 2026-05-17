@@ -32,6 +32,9 @@ from .orchestrate import (  # noqa: E402
     IngestSummary,
     Orchestrator,
     OrchestratorConfig,
+    Phase,
+    ProgressCallback,
+    ProgressEvent,
 )
 from .preprocess import (  # noqa: E402
     PreprocessConfig,
@@ -47,6 +50,9 @@ __all__ = [
     "IngestSummary",
     "Orchestrator",
     "OrchestratorConfig",
+    "Phase",
+    "ProgressCallback",
+    "ProgressEvent",
     "PreprocessConfig",
     "PreprocessError",
     "PreprocessResult",

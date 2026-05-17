@@ -118,6 +118,48 @@ def test_aggregate_round_trip(client: TestClient) -> None:
     assert report.last_watched_at is not None
 
 
+def test_aggregate_by_author_round_trip(client: TestClient) -> None:
+    """Pins the by_author rollup against the 2-video fixture.
+
+    Fixture has @sampleuser (1 video, 2 rewatches × 12 s = 24 s) and
+    @chefcorpus (1 video, 1 watch × 18 s = 18 s). Tied on `videos`, so
+    the tiebreaker is total_watch_time_s desc → sampleuser first.
+    """
+    r = client.get("/api/v1/aggregate")
+    assert r.status_code == 200
+    report = AggregateReport.model_validate(r.json())
+
+    assert len(report.by_author) == 2
+    authors = [a.author for a in report.by_author]
+    assert authors == ["sampleuser", "chefcorpus"]
+
+    sampleuser, chefcorpus = report.by_author
+    assert sampleuser.videos == 1
+    assert sampleuser.total_watch_time_s == 24.0
+    assert chefcorpus.videos == 1
+    assert chefcorpus.total_watch_time_s == 18.0
+
+    # mean_activation is the per-video mean of per-region means. The 8
+    # fixture regions each step their mean by 0.05 (0.125, 0.175, …,
+    # 0.475), averaging to 0.3 per video. Both authors have one video,
+    # so the per-author mean = the per-video mean = 0.3.
+    assert sampleuser.mean_activation == pytest.approx(0.3, abs=0.005)
+    assert chefcorpus.mean_activation == pytest.approx(0.3, abs=0.005)
+
+    # top_region is the region with the highest per-author peak. Fixture
+    # region peaks rise monotonically by region index — vwfa (index 7)
+    # always wins.
+    assert sampleuser.top_region == "vwfa"
+    assert chefcorpus.top_region == "vwfa"
+
+
+def test_empty_fixture_by_author_is_empty(empty_client: TestClient) -> None:
+    r = empty_client.get("/api/v1/aggregate")
+    assert r.status_code == 200
+    report = AggregateReport.model_validate(r.json())
+    assert report.by_author == []
+
+
 def test_watch_events_round_trip(client: TestClient) -> None:
     r = client.get("/api/v1/watch-events")
     assert r.status_code == 200

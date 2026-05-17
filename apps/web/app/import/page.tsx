@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { AnimatePresence, motion } from "motion/react";
 import clsx from "clsx";
 import { api, ApiError } from "@/lib/api";
 import type { ImportJob } from "@shared/types";
@@ -18,11 +19,13 @@ type Phase =
   | { kind: "rejected"; message: string }
   | { kind: "starting"; filename: string }
   | { kind: "tracking"; job: ImportJob }
+  | { kind: "complete"; job: ImportJob }
   | { kind: "failed"; job: ImportJob }
   | { kind: "offline"; url: string; message: string };
 
 const POLL_INTERVAL_MS = 500;
 const MAX_CONSECUTIVE_POLL_FAILURES = 5; // 2.5s of silence → flip to offline.
+const COMPLETION_HOLD_MS = 1100; // Brief acknowledgement frame before redirect.
 
 function isAcceptableFile(file: File): boolean {
   const name = file.name.toLowerCase();
@@ -77,13 +80,13 @@ export default function ImportPage() {
           consecutiveFailures = 0;
           if (token !== pollTokenRef.current) return;
           if (job.status === "complete" || job.status === "partial") {
-            // Show the terminal frame briefly before redirecting so the
-            // user sees "X / X" land before the route changes. "partial"
+            // Hold on a brief acknowledgement frame so the user sees the
+            // terminal "X / X" land before the route changes. "partial"
             // means some videos failed but at least one succeeded — show
             // the dashboard so the user can see what did process.
-            setPhase({ kind: "tracking", job });
             stopPolling();
-            router.push("/");
+            setPhase({ kind: "complete", job });
+            window.setTimeout(() => router.push("/"), COMPLETION_HOLD_MS);
             return;
           }
           if (job.status === "failed") {
@@ -258,7 +261,44 @@ export default function ImportPage() {
           . The same pipeline runs either way.
         </p>
       </section>
+
+      <AnimatePresence>
+        {phase.kind === "complete" && (
+          <CompletionOverlay job={phase.job} />
+        )}
+      </AnimatePresence>
     </main>
+  );
+}
+
+function CompletionOverlay({ job }: { job: ImportJob }) {
+  const { current, total } = job.progress;
+  const label =
+    total != null && total > 0
+      ? `Imported ${current} / ${total}`
+      : `Imported ${current}`;
+
+  return (
+    <motion.div
+      // Fixed-position fade-in panel between the terminal poll frame and
+      // router.push. ~250ms in, holds for ~600ms, ~200ms out as the route
+      // changes underneath. Honest acknowledgement — no celebration.
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.25, ease: "easeOut" }}
+      className="fixed inset-0 z-40 flex items-center justify-center bg-canvas/85 backdrop-blur-[2px]"
+      role="status"
+      aria-live="polite"
+    >
+      <div className="text-center">
+        <p className="eyebrow mb-3">Import complete</p>
+        <p className="font-serif text-[26px] tracking-tightish text-ink-50">
+          <span data-num>{label}</span>{" "}
+          <span className="text-ink-300">— opening dashboard</span>
+        </p>
+      </div>
+    </motion.div>
   );
 }
 

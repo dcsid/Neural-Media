@@ -38,6 +38,12 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     # Videos. tags is JSON-encoded because SQLite has no native list type.
     # first_seen_idx lets `list_videos` preserve the order the pipeline
     # discovered URLs in; the column is optional (NULL → fall back to rowid).
+    # `inserted_at` is written by data-pipeline's Orchestrator (ISO-8601
+    # timestamp of first ingest). Nullable here because the api doesn't
+    # read it — it's pipeline-side observability. CREATE TABLE IF NOT
+    # EXISTS means whichever of (api init_db, pipeline Orchestrator
+    # construction) runs first wins, so the two schemas MUST be a
+    # superset of both writers' needs. See note in docs/architecture.md.
     """
     CREATE TABLE IF NOT EXISTS videos (
         id              TEXT PRIMARY KEY,
@@ -48,7 +54,8 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         downloaded      INTEGER NOT NULL DEFAULT 0,
         local_path      TEXT,
         tags_json       TEXT NOT NULL DEFAULT '[]',
-        first_seen_idx  INTEGER
+        first_seen_idx  INTEGER,
+        inserted_at     TEXT
     )
     """,
     """

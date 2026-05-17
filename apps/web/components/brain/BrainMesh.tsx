@@ -91,6 +91,8 @@ export function BrainMesh({
     keyframeVertices,
     timestamps,
     playheadSec,
+    regionMask,
+    REGION_IDS,
   );
 
   const devEnabled = useDevModeEnabled();
@@ -154,6 +156,7 @@ export function BrainMesh({
               <CorticalSurface
                 url={SURFACE_URL}
                 byRegion={frame.byRegion}
+                perVertex={frame.perVertex ?? undefined}
                 vertexRegions={regionMask ?? undefined}
                 regionOrder={REGION_IDS}
                 onReady={handleReady}

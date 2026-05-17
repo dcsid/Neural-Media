@@ -1,6 +1,6 @@
 "use client";
 
-import { useFrame } from "@react-three/fiber";
+import { useFrame, useThree } from "@react-three/fiber";
 import { useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
 import type { RegionId } from "@shared/types";
@@ -46,6 +46,7 @@ function buildBrainGeometry(): THREE.BufferGeometry {
 export function PlaceholderMesh({ byRegion, onReady }: PlaceholderMeshProps) {
   const meshRef = useRef<THREE.Mesh>(null);
   const reduceMotion = useReducedMotion();
+  const invalidate = useThree((s) => s.invalidate);
 
   // Build geometry + per-vertex region assignment + color buffer once.
   const { geometry, regionPerVertex, colorAttr, scratch } = useMemo(() => {
@@ -80,6 +81,12 @@ export function PlaceholderMesh({ byRegion, onReady }: PlaceholderMeshProps) {
     onReady?.();
   }, [onReady]);
 
+  // Wake the render loop when byRegion changes — needed under demand
+  // frameloop (reduce-motion), no-op otherwise.
+  useEffect(() => {
+    invalidate();
+  }, [byRegion, invalidate]);
+
   // Smoothly track region activation values so changes in `activation` glide
   // rather than pop. Under prefers-reduced-motion the smoothing collapses to
   // an instant snap.
@@ -103,6 +110,7 @@ export function PlaceholderMesh({ byRegion, onReady }: PlaceholderMeshProps) {
       }
       cividisFill(scratch, colorAttr.array as Float32Array);
       colorAttr.needsUpdate = true;
+      if (reduceMotion) invalidate();
     }
 
     if (meshRef.current && !reduceMotion) {
@@ -111,13 +119,16 @@ export function PlaceholderMesh({ byRegion, onReady }: PlaceholderMeshProps) {
   });
 
   // Initial paint — fill colours once before the first useFrame runs.
+  // Also runs whenever byRegion changes so demand-mode (reduce-motion)
+  // gets a fresh paint without waiting on a frame tick.
   useEffect(() => {
     for (let i = 0; i < regionPerVertex.length; i++) {
       scratch[i] = displayed.current[regionPerVertex[i]] ?? 0;
     }
     cividisFill(scratch, colorAttr.array as Float32Array);
     colorAttr.needsUpdate = true;
-  }, [regionPerVertex, colorAttr, scratch]);
+    invalidate();
+  }, [regionPerVertex, colorAttr, scratch, invalidate]);
 
   return (
     <mesh ref={meshRef} geometry={geometry} castShadow={false} receiveShadow={false}>

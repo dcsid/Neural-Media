@@ -8,15 +8,19 @@ export function StatRow({ items }: StatRowProps) {
       {items.map((item) => (
         <div key={item.label}>
           <dt className="eyebrow">{item.label}</dt>
-          <dd
-            className="mt-2 font-serif text-[24px] tracking-tightish text-ink-50"
-            data-num
-          >
-            {item.value}
+          <dd className="mt-2">
+            <span
+              className="font-serif text-[24px] tracking-tightish text-ink-50"
+              data-num
+            >
+              {item.value}
+            </span>
+            {item.hint && (
+              <span className="mt-1 block text-[11px] text-ink-400">
+                {item.hint}
+              </span>
+            )}
           </dd>
-          {item.hint && (
-            <p className="mt-1 text-[11px] text-ink-400">{item.hint}</p>
-          )}
         </div>
       ))}
     </dl>

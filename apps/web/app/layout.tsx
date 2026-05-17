@@ -17,9 +17,14 @@ export default function RootLayout({
   return (
     <html lang="en" className="dark">
       <body className="min-h-screen antialiased">
+        <a href="#main" className="skip-link">
+          Skip to main content
+        </a>
         <div className="flex min-h-screen flex-col">
           <Header />
-          <div className="flex-1">{children}</div>
+          <div id="main" className="flex-1">
+            {children}
+          </div>
           <Footer />
         </div>
       </body>

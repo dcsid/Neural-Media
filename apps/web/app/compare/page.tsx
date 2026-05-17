@@ -1,6 +1,7 @@
 import { REGION_IDS, type RegionId, type RegionMetrics } from "@shared/types";
 import { api, ApiError, serverBaseUrl } from "@/lib/api";
 import { ApiOfflineState } from "@/components/ApiOfflineState";
+import { NoVideosState } from "@/components/NoVideosState";
 import { ComparePicker } from "@/components/ComparePicker";
 import { CompareRegionRow } from "@/components/CompareRegionRow";
 import { videoTitle } from "@/lib/format";
@@ -17,6 +18,28 @@ export default async function ComparePage({ searchParams }: PageProps) {
 
   try {
     const videos = await api.videos({ baseUrl });
+
+    if (videos.length === 0) {
+      return <NoVideosState scope="compare" />;
+    }
+
+    if (videos.length < 2) {
+      return (
+        <main className="mx-auto max-w-[1280px] px-8 py-16">
+          <p className="eyebrow mb-3">Compare</p>
+          <h1 className="font-serif text-[32px] tracking-tightish text-ink-50">
+            One video isn&apos;t enough to compare.
+          </h1>
+          <p className="mt-4 max-w-[60ch] text-[13px] leading-relaxed text-ink-200">
+            Compare needs at least two videos in your local catalogue. Import
+            more of your TikTok export, or generate the mock sample with{" "}
+            <code className="font-mono text-ink-100">make sample</code> to see
+            the side-by-side view.
+          </p>
+        </main>
+      );
+    }
+
     const haveBoth = !!a && !!b && a !== b;
 
     const [metricsA, metricsB] = haveBoth

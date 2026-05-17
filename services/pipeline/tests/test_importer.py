@@ -8,7 +8,7 @@ same commit.
 from __future__ import annotations
 
 import json
-from datetime import timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -22,6 +22,7 @@ from shared.schemas import VideoMetadata, WatchEvent
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 FIXTURE = REPO_ROOT / "data" / "sample" / "tiktok_export" / "user_data.json"
+TXT_FIXTURE = REPO_ROOT / "data" / "sample" / "tiktok_export" / "watch_history.txt"
 
 
 def test_fixture_parses_to_eight_events_and_eight_videos() -> None:
@@ -157,3 +158,89 @@ def test_empty_or_missing_browsing_history(tmp_path: Path) -> None:
 def test_missing_file_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         parse_export(tmp_path / "does_not_exist.json")
+
+
+# ---------------------------------------------------------------------------
+# Newer .txt export format ("Watch History.txt")
+# ---------------------------------------------------------------------------
+
+
+def test_txt_fixture_parses_to_eight_events_and_eight_videos() -> None:
+    videos, events = parse_export(TXT_FIXTURE)
+    assert len(events) == 8
+    assert len(videos) == 8
+
+
+def test_txt_export_strips_utc_suffix_and_assumes_utc() -> None:
+    _, events = parse_export(TXT_FIXTURE)
+    for e in events:
+        assert e.watched_at.tzinfo is not None
+        assert e.watched_at.utcoffset() == timezone.utc.utcoffset(e.watched_at)
+
+
+def test_txt_export_leaves_author_none_for_share_shortlinks() -> None:
+    # tiktokv.com/share/video/<id>/ has no @handle, so author is unset.
+    videos, _ = parse_export(TXT_FIXTURE)
+    assert all(v.author is None for v in videos)
+    assert all("tiktokv.com/share/video/" in v.source_url for v in videos)
+
+
+def test_txt_export_tolerates_extra_blank_lines_and_partial_records(tmp_path: Path) -> None:
+    p = tmp_path / "Watch History.txt"
+    p.write_text(
+        "Date: 2026-05-12 08:14:03 UTC\n"
+        "Link: https://www.tiktokv.com/share/video/1/\n"
+        "\n"
+        "\n"  # extra blank line
+        "Date: not a date\n"
+        "Link: https://www.tiktokv.com/share/video/2/\n"
+        "\n"
+        "Date: 2026-05-12 09:00:00 UTC\n"
+        # missing Link line — record should be silently dropped
+        "\n"
+        "Date: 2026-05-12 10:00:00 UTC\n"
+        "Link: https://www.tiktokv.com/share/video/3/\n",
+        encoding="utf-8",
+    )
+    videos, events = parse_export(p)
+    # Records 1 and 3 are valid; record 2 has an unparseable date, record
+    # with no Link is missing the required field.
+    assert len(events) == 2
+    assert len(videos) == 2
+
+
+# ---------------------------------------------------------------------------
+# Date-range filter
+# ---------------------------------------------------------------------------
+
+
+def _utc(s: str) -> datetime:
+    return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+
+
+def test_since_filter_includes_only_in_window_events() -> None:
+    # Fixture spans 2026-05-12 .. 2026-05-14. since=2026-05-13 drops
+    # everything before midnight 2026-05-13.
+    _, events = parse_export(FIXTURE, since=_utc("2026-05-13T00:00:00"))
+    assert {e.watched_at.date().isoformat() for e in events} == {
+        "2026-05-13", "2026-05-14",
+    }
+
+
+def test_until_filter_is_exclusive_upper_bound() -> None:
+    # until=2026-05-13 keeps 2026-05-12 events only.
+    _, events = parse_export(FIXTURE, until=_utc("2026-05-13T00:00:00"))
+    assert {e.watched_at.date().isoformat() for e in events} == {"2026-05-12"}
+
+
+def test_date_window_drops_video_with_no_in_window_events() -> None:
+    # Window contains only the 2026-05-14 morning event; we should still
+    # surface its video and only its video.
+    videos, events = parse_export(
+        FIXTURE,
+        since=_utc("2026-05-14T00:00:00"),
+        until=_utc("2026-05-15T00:00:00"),
+    )
+    assert len(events) == 1
+    assert len(videos) == 1
+    assert events[0].video_id == videos[0].id

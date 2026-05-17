@@ -43,6 +43,18 @@ class PreprocessError(RuntimeError):
 RunFn = Callable[[list[str]], None]
 
 
+def ffmpeg_available() -> bool:
+    """True iff a usable ``ffmpeg`` binary is on PATH.
+
+    Consumed by the api worker's ``/capabilities`` endpoint so the
+    frontend can degrade the import flow cleanly when the binary is
+    missing (e.g. CI runners or a fresh laptop without ``brew install
+    ffmpeg``). Cheap — ``shutil.which`` is a single PATH walk and does
+    not exec anything.
+    """
+    return shutil.which("ffmpeg") is not None
+
+
 def _ffmpeg_run(args: list[str]) -> None:
     """Run system ffmpeg with the given argv tail. Raises on non-zero.
 
@@ -190,5 +202,6 @@ __all__ = [
     "PreprocessResult",
     "RunFn",
     "build_ffmpeg_args",
+    "ffmpeg_available",
     "preprocess_video",
 ]

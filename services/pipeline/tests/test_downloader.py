@@ -20,6 +20,7 @@ from neural_media_pipeline.downloader import (
     DownloadError,
     download_batch,
     download_video,
+    yt_dlp_available,
 )
 from shared.schemas import VideoMetadata
 
@@ -288,3 +289,45 @@ def test_invalid_config_rejected(tmp_path: Path) -> None:
         DownloadConfig(videos_dir=tmp_path, max_attempts=0)
     with pytest.raises(ValueError):
         DownloadConfig(videos_dir=tmp_path, user_agents=())
+
+
+# ---------------------------------------------------------------------------
+# Precheck: yt_dlp_available
+# ---------------------------------------------------------------------------
+
+def test_yt_dlp_available_returns_true_when_module_importable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib.util
+
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name: object() if name == "yt_dlp" else None,
+    )
+    assert yt_dlp_available() is True
+
+
+def test_yt_dlp_available_falls_back_to_binary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib.util
+
+    import neural_media_pipeline.downloader as dl
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _: None)
+    monkeypatch.setattr(dl.shutil, "which",
+                        lambda name: "/usr/local/bin/yt-dlp" if name == "yt-dlp" else None)
+    assert yt_dlp_available() is True
+
+
+def test_yt_dlp_available_returns_false_when_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib.util
+
+    import neural_media_pipeline.downloader as dl
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _: None)
+    monkeypatch.setattr(dl.shutil, "which", lambda _name: None)
+    assert yt_dlp_available() is False

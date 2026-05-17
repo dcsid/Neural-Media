@@ -536,18 +536,33 @@ def default_orchestrator_factory(
 ) -> Any:
     """Construct a real ``neural_media_pipeline.Orchestrator``.
 
-    Probes the Orchestrator signature for ``on_progress=`` and silently
-    drops it if data-pipeline hasn't shipped support yet — the poller
-    thread provides a fallback signal in that case.
+    ``mode="mock"`` (the demo path) skips both yt-dlp and ffmpeg — only
+    parsing + mock inference run, so the catalog populates in seconds
+    against the user's actual TikTok export without any network round
+    trip. Probes the Orchestrator signature for ``on_progress=`` and
+    silently drops it if older checkouts don't accept it (the poller
+    thread provides a fallback signal there).
     """
     from neural_media_pipeline import Orchestrator, OrchestratorConfig
 
-    cfg = OrchestratorConfig(
-        db_path=db_path,
-        videos_dir=videos_dir,
-        processed_dir=processed_dir,
-        activations_dir=activations_dir,
-    )
+    cfg_kwargs: dict[str, Any] = {
+        "db_path": db_path,
+        "videos_dir": videos_dir,
+        "processed_dir": processed_dir,
+        "activations_dir": activations_dir,
+    }
+
+    # Pass mock-mode skip flags only if the pipeline version we're
+    # linked against supports them. data-pipeline shipped these in
+    # round 3; the probe keeps older worktrees buildable.
+    cfg_field_names = _orchestrator_config_field_names()
+    if mode == "mock":
+        if "skip_download" in cfg_field_names:
+            cfg_kwargs["skip_download"] = True
+        if "skip_preprocess" in cfg_field_names:
+            cfg_kwargs["skip_preprocess"] = True
+
+    cfg = OrchestratorConfig(**cfg_kwargs)
 
     kwargs: dict[str, Any] = {}
     if mode == "real":
@@ -557,6 +572,22 @@ def default_orchestrator_factory(
         kwargs["on_progress"] = on_progress
 
     return Orchestrator(cfg, **kwargs)
+
+
+def _orchestrator_config_field_names() -> frozenset[str]:
+    try:
+        from neural_media_pipeline import OrchestratorConfig
+    except ImportError:
+        return frozenset()
+    # Works for both dataclasses (the round-3 implementation) and
+    # Pydantic models — both expose field metadata.
+    fields = getattr(OrchestratorConfig, "__dataclass_fields__", None)
+    if fields is not None:
+        return frozenset(fields)
+    model_fields = getattr(OrchestratorConfig, "model_fields", None)
+    if model_fields is not None:
+        return frozenset(model_fields)
+    return frozenset()
 
 
 def _orchestrator_accepts_on_progress() -> bool:

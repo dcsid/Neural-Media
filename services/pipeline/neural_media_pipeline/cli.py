@@ -58,6 +58,12 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Skip the export parse; just drive queued/failed jobs.")
     p.add_argument("--dry-run", action="store_true",
                    help="Parse the export and print counts only — no downloads.")
+    p.add_argument("--skip-download", action="store_true",
+                   help="Demo mode: bypass yt-dlp; rows stay downloaded=false.")
+    p.add_argument("--skip-preprocess", action="store_true",
+                   help="Demo mode: bypass ffmpeg; mock-mode duration is synthesised.")
+    p.add_argument("--mock", action="store_true",
+                   help="Shortcut for --skip-download --skip-preprocess.")
     p.add_argument("-v", "--verbose", action="count", default=0,
                    help="-v for INFO, -vv for DEBUG.")
     return p
@@ -79,11 +85,15 @@ def _default_data_root() -> Path:
 
 def _resolve_paths(args: argparse.Namespace) -> OrchestratorConfig:
     root = args.data_root or _default_data_root()
+    skip_d = args.skip_download or args.mock
+    skip_p = args.skip_preprocess or args.mock
     return OrchestratorConfig(
         db_path=args.db or root / "sqlite" / "neural_media.db",
         videos_dir=args.videos_dir or root / "videos",
         processed_dir=args.processed_dir or root / "videos_processed",
         activations_dir=args.activations_dir or root / "activations",
+        skip_download=skip_d,
+        skip_preprocess=skip_p,
     )
 
 
@@ -128,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.run_pending:
             summary = orch.run_pending()
         else:
-            summary = orch.ingest_export(args.export)
+            summary = orch.run(args.export)
 
     _print_summary(summary)
     return 1 if summary.failed and not summary.completed else 0

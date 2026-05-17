@@ -17,6 +17,7 @@ import { CorticalSurface, type CorticalHoverEvent } from "./CorticalSurface";
 import { useActivationFrame } from "./hooks/useActivationFrame";
 import { useReducedMotion } from "./hooks/useReducedMotion";
 import { useRegionMask } from "./hooks/useRegionMask";
+import { RegionLegend } from "./RegionLegend";
 import { RegionTooltip, type RegionHoverInfo } from "./RegionTooltip";
 import {
   DevOverlay,
@@ -35,6 +36,17 @@ export interface BrainMeshProps {
   keyframeVertices?: Record<string, number[]>;
   timestamps?: number[];
   playheadSec?: number;
+  // Set to true when /api/v1/videos/{id}/activation returned 404 because
+  // the per-vertex .npz was purged after region_metrics were aggregated
+  // (a tier-b cleanup path). The component keeps rendering — the
+  // placeholder/cortical surface still shows, region readings still work
+  // upstream — and overlays a banner so the user knows why the
+  // per-vertex resolution is missing.
+  activationPurged?: boolean;
+  // Hide the region legend overlay. Default false (legend shown). Set to
+  // true on the Dashboard hero where the surrounding chrome already
+  // labels the regions and the legend would compete for attention.
+  hideLegend?: boolean;
   onReady?: () => void;
 }
 
@@ -81,6 +93,8 @@ export function BrainMesh({
   keyframeVertices,
   timestamps,
   playheadSec,
+  activationPurged = false,
+  hideLegend = false,
   onReady,
 }: BrainMeshProps) {
   const reduceMotion = useReducedMotion();
@@ -113,6 +127,7 @@ export function BrainMesh({
     setHover({
       regionId: e.regionId,
       activation: e.activation,
+      vertexIndex: e.vertexIndex,
       x: e.clientX - rect.left,
       y: e.clientY - rect.top,
     });
@@ -152,7 +167,16 @@ export function BrainMesh({
               />
             }
           >
-            {surfaceAvailable ? (
+            {activationPurged ? (
+              // Per-vertex data was purged after region aggregation. The
+              // brief calls for the low-poly placeholder in this state —
+              // it's an honest signal that vertex resolution is gone
+              // while region readings (driven by byRegion) keep working.
+              <PlaceholderMesh
+                byRegion={frame.byRegion}
+                onReady={handleReady}
+              />
+            ) : surfaceAvailable ? (
               <CorticalSurface
                 url={SURFACE_URL}
                 byRegion={frame.byRegion}
@@ -184,7 +208,30 @@ export function BrainMesh({
         )}
       </Canvas>
 
+      {/* Show the legend on the Detail view (per-region data resolved from
+          keyframes) but not on the Dashboard hero, where every region is
+          painted with the same uniform scalar and a per-region readout
+          would be misleading. Callers can force it off with hideLegend. */}
+      {!hideLegend && keyframeVertices !== undefined && (
+        <RegionLegend byRegion={frame.byRegion} />
+      )}
       <RegionTooltip hover={hover} />
+      {activationPurged && (
+        <div
+          role="status"
+          className={[
+            "pointer-events-none absolute inset-x-3 bottom-3 z-10",
+            "border border-line bg-surface/95 px-3 py-2 backdrop-blur-sm",
+            "text-[11px] leading-snug text-ink-200 shadow-sm",
+          ].join(" ")}
+        >
+          <span className="mr-1.5 font-mono uppercase tracking-[0.08em] text-ink-300">
+            Aggregated only
+          </span>
+          Per-vertex data was purged after aggregation. The region readings
+          below still reflect the full inference run.
+        </div>
+      )}
       {devEnabled && <DevOverlay sample={devSample} />}
     </div>
   );

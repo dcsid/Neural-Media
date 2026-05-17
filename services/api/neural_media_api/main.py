@@ -18,7 +18,7 @@ from typing import Literal
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
 from .aggregate import compute_aggregate
 from .import_jobs import (
@@ -242,11 +242,11 @@ def create_app(
     def list_inference_runs() -> list[InferenceRun]:
         return app.state.store.list_runs()
 
-    @app.post("/api/v1/import", response_model=ImportJob, status_code=202)
+    @app.post("/api/v1/import", response_model=ImportJob)
     async def post_import(
         file: UploadFile = File(...),
         mode: Literal["mock", "real"] = Form("mock"),
-    ) -> ImportJob:
+    ):
         filename = file.filename or "upload"
         if not _accepts_export_filename(filename):
             raise HTTPException(
@@ -271,26 +271,28 @@ def create_app(
         # makes the file traceable to the row it'll spawn.
         import uuid as _uuid
         staged_id = str(_uuid.uuid4())
-        dest = imports_dir / f"{staged_id}__{_safe_filename(filename)}"
+        safe_name = _safe_filename(filename)
+        dest = imports_dir / f"{staged_id}__{safe_name}"
         with dest.open("wb") as out:
             shutil.copyfileobj(file.file, out)
         await file.close()
 
         try:
-            return runner.submit(dest, mode)
+            return runner.submit(dest, mode, source_filename=safe_name)
         except JobAlreadyRunning as exc:
             # Clean up the staged upload — it'll never be read.
             try:
                 dest.unlink()
             except OSError:
                 pass
-            raise HTTPException(
+            # The 409 body MUST be the literal ImportJob shape (not a
+            # `{"detail": ...}` envelope) — frontend reads it directly to
+            # pick up the running job's id and resume polling.
+            # See CONTRACTS.md §8.
+            return JSONResponse(
                 status_code=409,
-                detail={
-                    "error": "another import is in progress",
-                    "running_job_id": exc.running_job.id,
-                },
-            ) from exc
+                content=exc.running_job.model_dump(mode="json"),
+            )
 
     @app.get("/api/v1/import/{job_id}", response_model=ImportJob)
     def get_import(job_id: str) -> ImportJob:

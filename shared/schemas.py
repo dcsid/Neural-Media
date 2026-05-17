@@ -147,3 +147,40 @@ class ActivationOutput(BaseModel):
     timestamps: list[float]
     keyframe_vertices: dict[str, list[float]]
     region_means: dict[str, list[float]]
+
+
+# ---------------------------------------------------------------------------
+# Import job (CONTRACTS.md §8)
+# ---------------------------------------------------------------------------
+
+ImportJobStatus = Literal["queued", "running", "complete", "partial", "failed"]
+ImportMode = Literal["mock", "real"]
+ImportPhase = Literal["parsing", "downloading", "preprocessing", "inferring"]
+
+
+class ImportJobProgress(BaseModel):
+    """Nested progress block on `ImportJob`. `total` is null until the
+    parsing phase completes; `phase` is null until the first progress
+    event arrives.
+    """
+
+    current: int = 0
+    total: int | None = None
+    phase: str | None = None
+
+
+class ImportJob(BaseModel):
+    """Polling response from `GET /api/v1/import/{job_id}`. Also returned
+    by `POST /api/v1/import` on success and on the 409 single-job-gate
+    response (where it carries the running job).
+    """
+
+    id: str
+    status: ImportJobStatus
+    mode: ImportMode
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None = None
+    progress: ImportJobProgress = Field(default_factory=ImportJobProgress)
+    error: str | None = None
+    source_filename: str | None = None

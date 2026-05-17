@@ -2,13 +2,13 @@ import {
   ENDPOINTS,
   type ActivationOutput,
   type AggregateReport,
+  type ImportJob,
   type InferenceRun,
   type RegionDef,
   type RegionMetrics,
   type VideoMetadata,
   type WatchEvent,
 } from "@shared/types";
-import { IMPORT_ENDPOINTS, type ImportJob } from "./import-types";
 
 // Local fetch errors are normalised to this single class so callers can
 // distinguish "server unreachable" from "server replied with HTTP 4xx/5xx"
@@ -117,9 +117,9 @@ export const api = {
   inferenceRuns: (opts?: ApiFetchOptions) =>
     apiFetch<InferenceRun[]>(ENDPOINTS.inferenceRuns, opts),
   importStart: (file: File, opts?: ApiFetchOptions) =>
-    apiFetchMultipart<ImportJob>(IMPORT_ENDPOINTS.importStart, file, opts),
+    apiFetchMultipart<ImportJob>(ENDPOINTS.importStart, file, opts),
   importJob: (id: string, opts?: ApiFetchOptions) =>
-    apiFetch<ImportJob>(IMPORT_ENDPOINTS.importJob(id), opts),
+    apiFetch<ImportJob>(ENDPOINTS.importJob(id), opts),
 };
 
 async function apiFetchMultipart<T>(

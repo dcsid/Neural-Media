@@ -176,12 +176,84 @@ default and reject `Host` headers other than `localhost`/`127.0.0.1`.
 | GET    | `/api/v1/aggregate`               | `AggregateReport`                |
 | GET    | `/api/v1/watch-events`            | `WatchEvent[]`                   |
 | GET    | `/api/v1/inference-runs`          | `InferenceRun[]`                 |
+| POST   | `/api/v1/import`                  | `ImportJob` (see §8)             |
+| GET    | `/api/v1/import/{job_id}`         | `ImportJob`                      |
 
 The frontend MUST use only these endpoints. The frontend MUST NOT read files
 from the filesystem directly. If you find yourself wanting to, add a new
 endpoint here first.
 
-## 8. Reproducibility envelope
+CORS: `GET` is the default. `/api/v1/import` is the only non-GET surface
+and is the only reason api-orchestrator's `allow_methods` includes `POST`.
+
+## 8. ImportJob
+
+`POST /api/v1/import` accepts a single file in `multipart/form-data` under
+the field name `file`. The file is either:
+
+- A raw TikTok `user_data.json`, **or**
+- A TikTok export `.zip` archive — the orchestrator reads `user_data.json`
+  in memory from the archive at any depth.
+
+Optional form field `mode` (default `"mock"`):
+
+- `mock` — orchestrator runs with `MockBackend`, skips yt-dlp + ffmpeg.
+  Demo path. Completes in seconds, no GPU.
+- `real` — full pipeline: yt-dlp → ffmpeg → `TribeBackend`. Requires
+  `pip install '.[real]'`; 400 if the extra isn't installed.
+
+The endpoint returns 200 immediately with an `ImportJob` whose status is
+`queued`. Frontend polls `GET /api/v1/import/{job_id}` until status flips
+to a terminal value. The orchestrator runs in a background thread on the
+API process — single-user, no distributed queue.
+
+If a job is already in flight, POST returns **409** with the running
+job's `ImportJob` as the body (not an error envelope — the literal
+`ImportJob` shape, so the frontend can pick up the id and resume
+polling).
+
+`ImportJob` JSON shape:
+
+```json
+{
+  "id": "5d0a…",
+  "status": "running",
+  "mode": "mock",
+  "created_at": "2026-05-16T18:01:22Z",
+  "updated_at": "2026-05-16T18:01:24Z",
+  "completed_at": null,
+  "progress": {
+    "current": 12,
+    "total": 200,
+    "phase": "inferring"
+  },
+  "error": null,
+  "source_filename": "user_data.json"
+}
+```
+
+`ImportJob.status` is one of:
+
+| Status     | Meaning                                                       |
+|------------|---------------------------------------------------------------|
+| `queued`   | accepted, background thread hasn't started yet                |
+| `running`  | at least one `ProgressEvent` received; pipeline in progress   |
+| `complete` | orchestrator returned; `failed_count == 0`                    |
+| `partial`  | orchestrator returned; both `completed > 0` and `failed > 0`  |
+| `failed`   | orchestrator raised before completing (e.g. unparseable export) |
+
+Frontend treats `complete` and `partial` as terminal-success (redirect
+to `/`); `failed` is terminal-error.
+
+`ImportJob.progress.phase` is informational, **not** a status value.
+Vocabulary mirrors `neural_media_pipeline.orchestrate.Phase`:
+`"parsing" | "downloading" | "preprocessing" | "inferring"`, or
+`null` until the first progress event.
+
+`progress.total` is `null` until the parsing phase completes (the
+orchestrator doesn't know the video count yet).
+
+## 9. Reproducibility envelope
 
 Every `InferenceRun` MUST log:
 

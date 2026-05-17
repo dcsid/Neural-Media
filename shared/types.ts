@@ -131,6 +131,46 @@ export interface ActivationOutput {
 }
 
 // ---------------------------------------------------------------------------
+// Import job (CONTRACTS.md §8)
+// ---------------------------------------------------------------------------
+
+export type ImportJobStatus =
+  | "queued"
+  | "running"
+  | "complete"
+  | "partial"
+  | "failed";
+
+export type ImportMode = "mock" | "real";
+
+export type ImportPhase =
+  | "parsing"
+  | "downloading"
+  | "preprocessing"
+  | "inferring";
+
+export interface ImportJobProgress {
+  current: number;
+  total: number | null;
+  // Free-form phase string. The four documented values are listed in
+  // `ImportPhase`, but the frontend does not branch on them — it only
+  // renders the string after a dash on the status line.
+  phase: string | null;
+}
+
+export interface ImportJob {
+  id: string;
+  status: ImportJobStatus;
+  mode: ImportMode;
+  created_at: ISODateString;
+  updated_at: ISODateString;
+  completed_at: ISODateString | null;
+  progress: ImportJobProgress;
+  error: string | null;
+  source_filename: string | null;
+}
+
+// ---------------------------------------------------------------------------
 // API endpoint paths — used by the frontend, kept here so the contract is
 // type-checked.
 // ---------------------------------------------------------------------------
@@ -147,4 +187,6 @@ export const ENDPOINTS = {
   aggregate: `${API_BASE}/aggregate`,
   watchEvents: `${API_BASE}/watch-events`,
   inferenceRuns: `${API_BASE}/inference-runs`,
+  importStart: `${API_BASE}/import`,
+  importJob: (id: string) => `${API_BASE}/import/${id}`,
 } as const;

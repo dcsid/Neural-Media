@@ -1,13 +1,13 @@
 {
-  "id": "a339ebc5-9849-5acb-b180-e3b74b15600a",
-  "video_id": "e4ad0955-31db-5080-96ec-8eea5c0c4957",
+  "id": "5bc37aa8-036d-5a89-9bc6-a48faead58b1",
+  "video_id": "93ccb2ba-7a57-5120-97a9-f48c7181e123",
   "model_id": "tribe-v2-mock",
   "model_version": "0.0.0-mock",
   "seed": 7,
   "params_json": {
-    "duration_s": 29.0,
+    "duration_s": 25.0,
     "sample_rate_hz": 1.5,
-    "num_timepoints": 44,
+    "num_timepoints": 38,
     "preprocessing": {
       "video_resolution": "224x224",
       "video_fps": 8,
@@ -15,9 +15,9 @@
       "source_url": "https://www.tiktok.com/@morningbrew/video/7300000000000000008"
     },
     "created_at_utc": "2026-05-16T00:00:00+00:00",
-    "config_hash": "92a89a6a97a2ab76053f9b9a701983d45ec369ac81f01fc36dd0f746bd4fbc96"
+    "config_hash": "3700dbfe745385172a796aff7494e15cf0f964c5b437e925e4686dbc4aa9d06c"
   },
   "created_at": "2026-05-16T00:00:00Z",
-  "activation_path": "/Users/siddus/Documents/UVAWork/Spring 2026/Neural-Media-ml-inference/data/sample/activations/a339ebc5-9849-5acb-b180-e3b74b15600a.npz",
+  "activation_path": "/Users/siddus/Documents/UVAWork/Spring 2026/Neural-Media/data/sample/activations/5bc37aa8-036d-5a89-9bc6-a48faead58b1.npz",
   "status": "complete"
 }

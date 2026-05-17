@@ -28,6 +28,11 @@ from .downloader import (  # noqa: E402
     download_video,
 )
 from .importer import parse_export, stable_video_id, stable_watch_event_id  # noqa: E402
+from .orchestrate import (  # noqa: E402
+    IngestSummary,
+    Orchestrator,
+    OrchestratorConfig,
+)
 from .preprocess import (  # noqa: E402
     PreprocessConfig,
     PreprocessError,
@@ -39,6 +44,9 @@ __all__ = [
     "DownloadConfig",
     "DownloadError",
     "DownloadResult",
+    "IngestSummary",
+    "Orchestrator",
+    "OrchestratorConfig",
     "PreprocessConfig",
     "PreprocessError",
     "PreprocessResult",

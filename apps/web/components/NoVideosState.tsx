@@ -1,5 +1,8 @@
-import Link from "next/link";
-import { EmptyState, EmptyStateStep } from "./EmptyState";
+import {
+  EmptyState,
+  EmptyStatePrimaryCta,
+  EmptyStateStep,
+} from "./EmptyState";
 
 interface NoVideosStateProps {
   // The view the user landed on. Used to tailor the headline only.
@@ -7,8 +10,9 @@ interface NoVideosStateProps {
 }
 
 // Rendered when the API is reachable but there are no videos yet — either
-// the user hasn't run `make sample` on a fresh install, or hasn't imported
-// their TikTok export. The CTA covers both paths.
+// the user hasn't imported their TikTok export, or hasn't run `make
+// sample` on a fresh install. /import is now the primary action; the CLI
+// stays for power users who'd rather skip the drop zone.
 export function NoVideosState({ scope = "dashboard" }: NoVideosStateProps) {
   const headline =
     scope === "compare"
@@ -21,42 +25,46 @@ export function NoVideosState({ scope = "dashboard" }: NoVideosStateProps) {
       headline={headline}
       cta={
         <>
-          <EmptyStateStep
+          <EmptyStatePrimaryCta
             index={1}
-            label="Use the mock sample"
-            command="make sample"
+            label="Import your TikTok export"
+            heading="Drop your export at /import"
+            href="/import"
             hint={
               <>
-                Builds a deterministic set of mock TRIBE outputs so you can
-                explore the views without ingesting your own export.
+                Drag-and-drop your{" "}
+                <code className="font-mono text-ink-200">user_data.json</code>{" "}
+                or the original{" "}
+                <code className="font-mono text-ink-200">.zip</code> archive.
+                Nothing leaves your machine.
               </>
             }
           />
           <EmptyStateStep
             index={2}
-            label="Import your TikTok export"
+            label="Or, from the command line"
             command="python -m neural_media_pipeline.importer data/raw/user_data.json"
             hint={
               <>
-                Drop a TikTok &quot;Download your data&quot; archive at{" "}
-                <code className="font-mono">data/raw/user_data.json</code>{" "}
-                first. A guided import flow will live at{" "}
-                <Link
-                  href="/import"
-                  className="text-ink-100 underline-offset-2 hover:text-accent hover:underline focus:text-accent focus:underline focus:outline-none"
-                >
-                  /import
-                </Link>{" "}
-                once the upload UI lands.
+                Equivalent path for users who would rather not touch a
+                browser. The same pipeline runs either way.
               </>
             }
           />
         </>
       }
+      diagnostic={
+        <p>
+          Just here for a look around? Run{" "}
+          <code className="font-mono text-ink-300">make sample</code> to
+          generate a deterministic set of mock TRIBE outputs and explore the
+          views without ingesting your own export.
+        </p>
+      }
     >
       Neural Media analyses videos that exist in your local watch history.
-      The API is reachable, but the catalogue is empty. Generate the mock
-      sample for a quick tour, or import your TikTok export to see your{" "}
+      The API is reachable, but the catalogue is empty. Drop your TikTok
+      export to see your{" "}
       <span className="text-ink-50">
         predicted average cortical response
       </span>

@@ -10,6 +10,7 @@ dependencies = [
   "pydantic>=2.6",
   "numpy>=1.26",
   "neural-media-inference",
+  "neural-media-pipeline",
 ]
 
 [project.optional-dependencies]
@@ -21,6 +22,7 @@ dev = [
 
 [tool.uv.sources]
 neural-media-inference = { path = "../inference", editable = true }
+neural-media-pipeline = { path = "../pipeline", editable = true }
 
 [build-system]
 requires = ["setuptools>=68"]

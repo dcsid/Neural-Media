@@ -1,14 +1,17 @@
+import { Suspense } from "react";
 import { api, ApiError, serverBaseUrl } from "@/lib/api";
 import {
   formatDateRange,
   formatWatchTimeHuman,
 } from "@/lib/format";
 import { ApiOfflineState } from "@/components/ApiOfflineState";
-import { BrainMesh } from "@/components/brain";
+import { NoVideosState } from "@/components/NoVideosState";
+import { BrainMeshSlot } from "@/components/BrainMeshSlot";
 import { RegionBalanceBars } from "@/components/RegionBalanceBars";
 import { HourHistogram } from "@/components/HourHistogram";
 import { DayStrip } from "@/components/DayStrip";
-import { WatchedVideosList } from "@/components/WatchedVideosList";
+import { WatchedVideosSection } from "@/components/WatchedVideosSection";
+import { WatchedVideosListSkeleton } from "@/components/WatchedVideosListSkeleton";
 import { StatRow } from "@/components/StatRow";
 
 export const dynamic = "force-dynamic";
@@ -16,16 +19,17 @@ export const dynamic = "force-dynamic";
 export default async function DashboardPage() {
   const baseUrl = serverBaseUrl();
   try {
-    const [aggregate, videos, watchEvents] = await Promise.all([
-      api.aggregate({ baseUrl }),
-      api.videos({ baseUrl }),
-      api.watchEvents({ baseUrl }),
-    ]);
+    const aggregate = await api.aggregate({ baseUrl });
 
-    const meanActivation = Object.values(aggregate.by_region).reduce(
-      (acc, b) => acc + (b?.mean ?? 0),
-      0,
-    ) / Math.max(1, Object.keys(aggregate.by_region).length);
+    if (aggregate.total_videos === 0) {
+      return <NoVideosState scope="dashboard" />;
+    }
+
+    const meanActivation =
+      Object.values(aggregate.by_region).reduce(
+        (acc, b) => acc + (b?.mean ?? 0),
+        0,
+      ) / Math.max(1, Object.keys(aggregate.by_region).length);
 
     return (
       <main className="mx-auto max-w-[1280px] px-8 pb-10 pt-12">
@@ -72,9 +76,7 @@ export default async function DashboardPage() {
             </div>
           </div>
           <div>
-            <div className="relative aspect-[5/4] w-full border border-line bg-canvas">
-              <BrainMesh activation={meanActivation} />
-            </div>
+            <BrainMeshSlot activation={meanActivation} />
             <p className="mt-3 text-[11px] text-ink-400">
               Predicted average BOLD response across cortical regions.
               Falls back to a low-poly placeholder until{" "}
@@ -91,7 +93,9 @@ export default async function DashboardPage() {
           <DayStrip byDayOfWeek={aggregate.by_day_of_week} />
         </div>
 
-        <WatchedVideosList videos={videos} watchEvents={watchEvents} />
+        <Suspense fallback={<WatchedVideosListSkeleton />}>
+          <WatchedVideosSection />
+        </Suspense>
       </main>
     );
   } catch (err) {

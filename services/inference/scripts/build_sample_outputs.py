@@ -30,8 +30,16 @@ from pathlib import Path
 # regardless of cwd by walking up to the repo root explicitly.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO_ROOT / "services" / "inference"))
+sys.path.insert(0, str(_REPO_ROOT / "services" / "pipeline"))
 
 from neural_media_inference import MockBackend, run_inference  # noqa: E402
+# The canonical URL → video_id mapping lives in the data-pipeline package.
+# Importing it here keeps the sample fixtures byte-aligned with whatever the
+# real importer would produce against the same TikTok export. Previously
+# this script used its own UUID namespace, which caused video_id drift
+# (api-orchestrator saw 2 disjoint id-spaces and reported 16 videos for an
+# 8-video export). Coordinated via the integration lead.
+from neural_media_pipeline import stable_video_id  # noqa: E402
 
 DEFAULT_EXPORT = _REPO_ROOT / "data" / "sample" / "tiktok_export" / "user_data.json"
 DEFAULT_OUT_DIR = _REPO_ROOT / "data" / "sample" / "mock_inference"
@@ -40,10 +48,11 @@ DEFAULT_SEED = 7
 DEFAULT_SAMPLE_RATE_HZ = 1.5
 DEFAULT_DURATION_S = 30.0
 
-# UUID namespace for stable video_id / run_id derivation. Arbitrary but fixed;
-# the data-pipeline worker owns the canonical mapping URL → video_id, but for
-# the offline scaffold this namespace is sufficient.
-_NEURAL_MEDIA_NAMESPACE = uuid.UUID("00000000-0000-0000-0000-000000005ee0")
+# UUID namespace for stable run_id derivation. video_id derivation is
+# delegated to `neural_media_pipeline.stable_video_id` so the inference-
+# side and pipeline-side id-spaces stay byte-identical. run_id is internal
+# to this script (the real orchestrator allocates its own).
+_RUN_ID_NAMESPACE = uuid.UUID("00000000-0000-0000-0000-000000005ee0")
 # Pinned timestamp used for committed fixtures — keeps the JSON byte-stable
 # across regenerations. Real runs use wallclock UTC.
 _FIXTURE_CREATED_AT = datetime(2026, 5, 16, 0, 0, 0, tzinfo=timezone.utc)
@@ -64,12 +73,8 @@ def _iter_videos(export_path: Path):
         yield url
 
 
-def _video_id_for(url: str) -> str:
-    return str(uuid.uuid5(_NEURAL_MEDIA_NAMESPACE, url))
-
-
 def _run_id_for(video_id: str, seed: int) -> str:
-    return str(uuid.uuid5(_NEURAL_MEDIA_NAMESPACE, f"run|{video_id}|{seed}"))
+    return str(uuid.uuid5(_RUN_ID_NAMESPACE, f"run|{video_id}|{seed}"))
 
 
 def _duration_for(video_id: str) -> float:
@@ -103,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
     backend = MockBackend()
     manifest = []
     for url in _iter_videos(args.export):
-        video_id = _video_id_for(url)
+        video_id = stable_video_id(url)
         run_id = _run_id_for(video_id, args.seed)
         duration_s = args.duration_s if args.duration_s is not None else _duration_for(video_id)
 

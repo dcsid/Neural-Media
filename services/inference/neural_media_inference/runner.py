@@ -134,6 +134,13 @@ def run_inference(
         "preprocessing": preprocessing_params,
         "created_at_utc": created_at.isoformat(),
     }
+    # Optional protocol extension: backends may expose an `extra_params`
+    # property (e.g. TribeBackend records torch + CUDA versions and the
+    # resolved weights hash). The runner merges whatever the backend
+    # offers under a "backend" key so the schema stays open-ended.
+    backend_extra = getattr(backend, "extra_params", None)
+    if isinstance(backend_extra, dict) and backend_extra:
+        params_json["backend"] = dict(backend_extra)
     params_json["config_hash"] = _config_hash(
         model_id=backend.model_id,
         model_version=backend.model_version,

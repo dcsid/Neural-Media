@@ -5,7 +5,8 @@ slice runs end-to-end without GPU, without downloading any video, and
 without any external dependency beyond NumPy + Pydantic + FastAPI.
 
 ```
-tiktok_export/user_data.json    Sample TikTok export — 8 watched videos
+tiktok_export/user_data.json    Sample TikTok export (older JSON shape) — 8 watched videos
+tiktok_export/watch_history.txt Sample TikTok export (newer .txt shape) — same 8 events
 videos/                         (intentionally empty; real videos never committed)
 mock_inference/                 Pre-generated per-video activation payloads (JSON)
 activations/                    Cache dir for raw NPZ outputs; gitignored

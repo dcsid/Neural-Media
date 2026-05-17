@@ -182,3 +182,111 @@ def test_dunder_main_module_runs() -> None:
 
     spec = importlib.util.find_spec("neural_media_pipeline.__main__")
     assert spec is not None and spec.origin is not None
+
+
+# ---------------------------------------------------------------------------
+# Time-window flag precedence (--minutes > --hours > --days > --since)
+# ---------------------------------------------------------------------------
+
+def _parse(argv: list[str]) -> object:
+    return cli._build_parser().parse_args(argv)
+
+
+def test_resolve_since_minutes_beats_hours_days_since() -> None:
+    args = _parse([
+        "fixture.json",
+        "--since", "2020-01-01",
+        "--days", "30",
+        "--hours", "12",
+        "--minutes", "5",
+    ])
+    now = datetime.now(timezone.utc)
+    cutoff = cli._resolve_since(args)
+    assert cutoff is not None
+    delta = (now - cutoff).total_seconds()
+    # Should be ~5 minutes (300 s). Allow a 2-second window for clock jitter.
+    assert 298.0 < delta < 302.0
+
+
+def test_resolve_since_hours_beats_days_and_since() -> None:
+    args = _parse([
+        "fixture.json",
+        "--since", "2020-01-01",
+        "--days", "30",
+        "--hours", "2",
+    ])
+    cutoff = cli._resolve_since(args)
+    assert cutoff is not None
+    delta = (datetime.now(timezone.utc) - cutoff).total_seconds()
+    assert 7195.0 < delta < 7205.0  # 2h ± 5s
+
+
+def test_resolve_since_days_beats_explicit_since() -> None:
+    args = _parse(["fixture.json", "--since", "2020-01-01", "--days", "7"])
+    cutoff = cli._resolve_since(args)
+    assert cutoff is not None
+    # If --days won, the cutoff is recent — anything within the last day.
+    age = (datetime.now(timezone.utc) - cutoff).total_seconds()
+    assert 7 * 86400 - 5 < age < 7 * 86400 + 5
+
+
+def test_resolve_since_falls_back_to_explicit_since() -> None:
+    args = _parse(["fixture.json", "--since", "2024-06-01"])
+    cutoff = cli._resolve_since(args)
+    assert cutoff == datetime(2024, 6, 1, tzinfo=timezone.utc)
+
+
+def test_resolve_since_none_when_unset() -> None:
+    args = _parse(["fixture.json"])
+    assert cli._resolve_since(args) is None
+
+
+def test_cli_dry_run_minutes_filters_old_history(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """--minutes 1 on a fixture with only ancient events parses 0 events."""
+    rc = cli.main([
+        str(FIXTURE),
+        "--data-root", str(tmp_path),
+        "--dry-run",
+        "--minutes", "1",
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # FIXTURE's events are from 2026-05-12 onwards; --minutes 1 from now
+    # excludes them all. parse_export still emits 0 videos because no
+    # event survives the window.
+    assert "parsed: 0 videos, 0 events" in out
+
+
+def test_cli_purge_activations_threads_through_to_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``--purge-activations`` must reach ``OrchestratorConfig`` unchanged."""
+    captured: dict = {}
+
+    real = cli.Orchestrator
+
+    def factory(cfg):
+        captured["cfg"] = cfg
+        return real(
+            cfg,
+            fetch=lambda *a, **k: (a[1].parent.mkdir(parents=True, exist_ok=True)
+                                   or a[1].write_bytes(b"x")),
+            ffmpeg=lambda args: (Path(args[-1]).parent.mkdir(parents=True, exist_ok=True)
+                                 or Path(args[-1]).write_bytes(b"y")),
+            sleep=lambda _s: None,
+            probe_duration=lambda _p: 12.0,
+        )
+
+    monkeypatch.setattr(cli, "Orchestrator", factory)
+    rc = cli.main([
+        str(FIXTURE),
+        "--data-root", str(tmp_path),
+        "--purge-activations",
+        # also pass --mock so we don't depend on ffmpeg/yt-dlp here.
+        "--mock",
+    ])
+    assert rc == 0
+    assert captured["cfg"].purge_activations is True
+    assert captured["cfg"].purge_after_inference is False

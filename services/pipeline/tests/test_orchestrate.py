@@ -115,12 +115,20 @@ def _fake_inference_factory():
 # Config factory
 # ---------------------------------------------------------------------------
 
-def _make_orch(tmp_path: Path, **stubs) -> tuple[Orchestrator, list[dict]]:
+def _make_orch(
+    tmp_path: Path,
+    *,
+    purge_after_inference: bool = False,
+    purge_activations: bool = False,
+    **stubs,
+) -> tuple[Orchestrator, list[dict]]:
     cfg = OrchestratorConfig(
         db_path=tmp_path / "sqlite" / "neural_media.db",
         videos_dir=tmp_path / "videos",
         processed_dir=tmp_path / "videos_processed",
         activations_dir=tmp_path / "activations",
+        purge_after_inference=purge_after_inference,
+        purge_activations=purge_activations,
     )
     fake_inf, calls = _fake_inference_factory()
     orch = Orchestrator(
@@ -193,6 +201,63 @@ def test_idempotent_rerun_is_a_noop(tmp_path: Path) -> None:
     # And the side-effect side: artifact files still exactly 8.
     runs = list((tmp_path / "activations").glob("*.npz"))
     assert len(runs) == 8
+
+
+# ---------------------------------------------------------------------------
+# Post-inference cleanup (purge_after_inference)
+# ---------------------------------------------------------------------------
+
+def test_purge_after_inference_deletes_mp4s_keeps_activations(
+    tmp_path: Path,
+) -> None:
+    """With purge_after_inference=True, raw + preprocessed mp4s are gone
+    once a run completes, but every inference artifact survives and the
+    SQLite catalog reflects that videos are no longer on disk."""
+    orch, _ = _make_orch(tmp_path, purge_after_inference=True)
+    try:
+        summary = orch.ingest_export(FIXTURE)
+    finally:
+        orch.close()
+
+    assert summary.completed == 8 and summary.failed == 0
+
+    # Source mp4s gone.
+    assert list((tmp_path / "videos").glob("*.mp4")) == []
+    assert list((tmp_path / "videos_processed").glob("*.mp4")) == []
+
+    # Activation outputs are intact — that's the whole point of the run.
+    npzs = list((tmp_path / "activations").glob("*.npz"))
+    sidecars = list((tmp_path / "activations").glob("*.meta.json"))
+    payloads = list((tmp_path / "activations").glob("*.json"))
+    assert len(npzs) == 8
+    assert len(sidecars) == 8
+    assert len(payloads) >= 8  # includes the per-run JSON payload sidecar
+
+    # Catalog rows reflect "predicted, not on disk anymore".
+    conn = sqlite3.connect(tmp_path / "sqlite" / "neural_media.db")
+    try:
+        rows = conn.execute(
+            "SELECT downloaded, local_path FROM videos"
+        ).fetchall()
+        assert all(r[0] == 0 and r[1] is None for r in rows)
+        # region_metrics still there — purge only touches mp4s, not data.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM region_metrics"
+        ).fetchone()[0] == 8 * len(REGION_IDS)
+    finally:
+        conn.close()
+
+
+def test_purge_disabled_by_default_keeps_cache(tmp_path: Path) -> None:
+    """Sanity: without the opt-in flag, the dedup cache survives."""
+    orch, _ = _make_orch(tmp_path)
+    try:
+        orch.ingest_export(FIXTURE)
+    finally:
+        orch.close()
+
+    assert len(list((tmp_path / "videos").glob("*.mp4"))) == 8
+    assert len(list((tmp_path / "videos_processed").glob("*.mp4"))) == 8
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +402,120 @@ def test_real_run_inference_integration(tmp_path: Path) -> None:
     assert any(p.name.endswith(".meta.json") for p in (tmp_path / "activations").iterdir())
     assert any(p.suffix == ".json" and not p.name.endswith(".meta.json")
                for p in (tmp_path / "activations").iterdir())
+
+
+# ---------------------------------------------------------------------------
+# Tier-b cleanup (purge_activations)
+# ---------------------------------------------------------------------------
+
+def test_purge_activations_deletes_npz_meta_payload_keeps_metrics(
+    tmp_path: Path,
+) -> None:
+    """purge_activations=True drops the per-vertex blobs but the irreducible
+    region_metrics rows survive and inference_runs.activation_path is
+    cleared so the api can fall through to the no-payload path."""
+    orch, _ = _make_orch(tmp_path, purge_activations=True)
+    try:
+        summary = orch.ingest_export(FIXTURE)
+    finally:
+        orch.close()
+
+    assert summary.completed == 8 and summary.failed == 0
+
+    # Activation blobs gone.
+    assert list((tmp_path / "activations").glob("*.npz")) == []
+    assert list((tmp_path / "activations").glob("*.meta.json")) == []
+    # The per-run downsampled JSON payload sits next to the npz; only it
+    # is named ``<run_id>.json``. Anything else .json in that dir would
+    # be a bug.
+    leftover_json = list((tmp_path / "activations").glob("*.json"))
+    assert leftover_json == [], leftover_json
+
+    # mp4s remain (purge_activations is independent of purge_after_inference).
+    assert len(list((tmp_path / "videos").glob("*.mp4"))) == 8
+    assert len(list((tmp_path / "videos_processed").glob("*.mp4"))) == 8
+
+    conn = sqlite3.connect(tmp_path / "sqlite" / "neural_media.db")
+    try:
+        # region_metrics survives — that's the whole point of this tier.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM region_metrics"
+        ).fetchone()[0] == 8 * len(REGION_IDS)
+        # activation_path cleared on every run so /videos/{id}/activation
+        # can detect the purged state.
+        paths = [r[0] for r in conn.execute(
+            "SELECT activation_path FROM inference_runs"
+        ).fetchall()]
+        assert paths == [""] * 8
+    finally:
+        conn.close()
+
+
+def test_purge_activations_and_mp4s_can_run_together(tmp_path: Path) -> None:
+    """Both tiers on: every byte the pipeline wrote to disk is gone, only
+    SQLite rows remain."""
+    orch, _ = _make_orch(
+        tmp_path, purge_after_inference=True, purge_activations=True,
+    )
+    try:
+        summary = orch.ingest_export(FIXTURE)
+    finally:
+        orch.close()
+
+    assert summary.completed == 8
+    for sub in ("videos", "videos_processed", "activations"):
+        assert list((tmp_path / sub).rglob("*")) == [], sub
+
+    conn = sqlite3.connect(tmp_path / "sqlite" / "neural_media.db")
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM region_metrics"
+        ).fetchone()[0] == 8 * len(REGION_IDS)
+    finally:
+        conn.close()
+
+
+def test_purge_activations_disabled_by_default_keeps_artifacts(
+    tmp_path: Path,
+) -> None:
+    orch, _ = _make_orch(tmp_path)
+    try:
+        orch.ingest_export(FIXTURE)
+    finally:
+        orch.close()
+
+    assert len(list((tmp_path / "activations").glob("*.npz"))) == 8
+    assert len(list((tmp_path / "activations").glob("*.meta.json"))) == 8
+
+
+def test_purge_activations_swallows_filesystem_errors(tmp_path: Path) -> None:
+    """A failing unlink (e.g. EACCES) is logged but never fails the run.
+
+    Mirrors the contract of _purge_video_artifacts: the inference result
+    is already durable in SQLite by the time cleanup runs, so cleanup
+    must not be the thing that flips the job to FAILED.
+    """
+    orch, _ = _make_orch(tmp_path, purge_activations=True)
+    # Replace Path.unlink with a raiser for activation paths only.
+    original = Path.unlink
+
+    def boom_unlink(self, *args, **kwargs):
+        if self.suffix in (".npz", ".json"):
+            raise OSError("simulated EACCES")
+        return original(self, *args, **kwargs)
+
+    try:
+        Path.unlink = boom_unlink  # type: ignore[assignment]
+        summary = orch.ingest_export(FIXTURE)
+    finally:
+        Path.unlink = original  # type: ignore[assignment]
+        orch.close()
+
+    # Still complete — cleanup failures are advisory.
+    assert summary.completed == 8 and summary.failed == 0
+    # Files still there because the patched unlink refused — that's fine,
+    # the test is about not crashing.
+    assert len(list((tmp_path / "activations").glob("*.npz"))) == 8
 
 
 def test_persisted_rows_round_trip_through_schemas(tmp_path: Path) -> None:

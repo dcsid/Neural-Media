@@ -299,6 +299,20 @@ class OrchestratorConfig:
     compress_activations: bool | None = None
     fmri_sample_rate_hz: float = _DEFAULT_FMRI_SAMPLE_RATE_HZ
     default_duration_s: float = _DEFAULT_DURATION_S
+    # When True, delete the raw + preprocessed mp4s once the inference
+    # run is persisted. Keeps peak transient disk to ~10 MB even on a
+    # multi-thousand-video ingest, at the cost of the yt-dlp dedup
+    # cache — a re-run has to hit TikTok again. Off by default so dev
+    # iteration on a small fixture doesn't pay the redownload tax.
+    purge_after_inference: bool = False
+    # Tier-b cleanup: after the inference run is persisted, also drop
+    # the raw .npz, the .meta.json sidecar, and the downsampled JSON
+    # payload sitting beside them. The region_metrics rows in SQLite
+    # survive — that's the irreducible product. /v/[id] loses its
+    # per-vertex playback for purged videos; brain-viz has a graceful
+    # fallback for that. Independent of purge_after_inference: a caller
+    # can keep mp4s but drop activations, or vice versa.
+    purge_activations: bool = False
 
     def __post_init__(self) -> None:
         if self.data_root is not None:
@@ -376,6 +390,8 @@ class Orchestrator:
         export_path: Path | str,
         *,
         progress: ProgressCallback | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
     ) -> IngestSummary:
         """Parse export → upsert → drive every pending job. Emits progress.
 
@@ -387,11 +403,16 @@ class Orchestrator:
         after each video completes inference (with an incremented
         ``videos_processed``). The callback is synchronous — the api
         worker is responsible for queueing/serialising if it cares.
+
+        ``since`` / ``until`` (both UTC) cap the events parsed out of the
+        export to a half-open ``[since, until)`` window. Use this to
+        avoid pointing the orchestrator at a multi-year history — TRIBE
+        v2 inference is the expensive step, not the parse.
         """
         cb: ProgressCallback = progress or (lambda _e: None)
 
         cb(ProgressEvent(phase="parsing", message="parsing export"))
-        videos, events = parse_export(export_path)
+        videos, events = parse_export(export_path, since=since, until=until)
         self._upsert_videos(videos)
         self._upsert_watch_events(events)
         queued = self._enqueue_pending(videos)
@@ -403,8 +424,14 @@ class Orchestrator:
         return summary
 
     # Back-compat name: thin wrapper around `run`.
-    def ingest_export(self, export_path: Path) -> IngestSummary:
-        return self.run(export_path)
+    def ingest_export(
+        self,
+        export_path: Path,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> IngestSummary:
+        return self.run(export_path, since=since, until=until)
 
     def run_pending(
         self, *, progress: ProgressCallback | None = None,
@@ -695,7 +722,79 @@ class Orchestrator:
                 "UPDATE videos SET duration_s = ? WHERE id = ? AND duration_s <= 0",
                 (duration_s, video.id),
             )
+        # Opt-in cleanup of the source mp4s. Runs only after every
+        # write above has landed — RegionMetrics in SQLite, NPZ + JSON
+        # sidecar on disk — so a crash mid-cleanup never strands a
+        # half-deleted video that the API still thinks is complete.
+        if self.cfg.purge_after_inference:
+            self._purge_video_artifacts(video.id)
+        # Tier-b: drop the activation artifacts too. Independent of the
+        # mp4 purge: a caller can pick either / both / neither. We do
+        # this *after* the mp4 purge so log order matches the layered
+        # intent ("free mp4s, then free activations"). Same crash
+        # semantics — SQLite region_metrics already durable.
+        if self.cfg.purge_activations:
+            self._purge_activation_artifacts(artifacts, payload_path)
         return artifacts
+
+    def _purge_activation_artifacts(
+        self, artifacts: RunArtifacts, payload_path: Path,
+    ) -> None:
+        """Delete the .npz + .meta.json + payload .json for a completed run.
+
+        Triggered by ``purge_activations=True``. Region metrics rows in
+        SQLite stay — that's the whole point of the tier: keep the
+        irreducible product, drop the per-vertex blobs that take >99%
+        of the disk. Filesystem errors are logged and swallowed, same
+        contract as ``_purge_video_artifacts``.
+
+        We also clear ``inference_runs.activation_path`` so the api's
+        SqliteStore-backed ``/videos/{id}/activation`` can detect that
+        the per-vertex payload is gone and fall through to brain-viz's
+        graceful fallback (region_metrics-only rendering).
+        """
+        for path in (
+            artifacts.activation_path,
+            artifacts.sidecar_path,
+            payload_path,
+        ):
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError as exc:
+                _log.warning(
+                    "activation purge failed for %s: %s",
+                    artifacts.inference_run.video_id, exc,
+                )
+        with self._conn:
+            self._conn.execute(
+                "UPDATE inference_runs SET activation_path = '' WHERE id = ?",
+                (artifacts.inference_run.id,),
+            )
+
+    def _purge_video_artifacts(self, video_id: str) -> None:
+        """Delete the raw + preprocessed mp4s for a completed video.
+
+        Best-effort: missing files are fine (mock mode never writes
+        them; skip-* paths leave them off disk too). Filesystem errors
+        are logged and swallowed — the inference result is already
+        durable; failing the run because cleanup hit EACCES would be
+        the wrong shape.
+        """
+        for path in (
+            self.cfg.videos_dir / f"{video_id}.mp4",
+            self.cfg.processed_dir / f"{video_id}.mp4",
+        ):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                _log.warning("purge failed for %s: %s", video_id, exc)
+        # Also drop the videos.local_path pointer so the catalog
+        # doesn't keep advertising a file that no longer exists.
+        with self._conn:
+            self._conn.execute(
+                "UPDATE videos SET downloaded = 0, local_path = NULL WHERE id = ?",
+                (video_id,),
+            )
 
     def _resolve_compress_flag(self) -> bool | None:
         """Pick the value to pass for ``run_inference(compress=...)``.

@@ -11,6 +11,13 @@ import { useReducedMotion } from "./hooks/useReducedMotion";
 interface PlaceholderMeshProps {
   byRegion: Record<RegionId, number>;
   onReady?: () => void;
+  // When true, render the surface as a wireframe outline rather than a
+  // solid fill. Used during the cortical-surface load step so the user
+  // sees an honest "scaffolding" silhouette of the brain — a wireframe
+  // outline fading into the colored surface reads as a deliberate
+  // loading state rather than a blank canvas with a spinner. Default
+  // false (solid fill — the established placeholder behaviour).
+  wireframe?: boolean;
 }
 
 // Low-poly fallback that renders before / instead of the real fsaverage
@@ -43,7 +50,11 @@ function buildBrainGeometry(): THREE.BufferGeometry {
   return geom;
 }
 
-export function PlaceholderMesh({ byRegion, onReady }: PlaceholderMeshProps) {
+export function PlaceholderMesh({
+  byRegion,
+  onReady,
+  wireframe = false,
+}: PlaceholderMeshProps) {
   const meshRef = useRef<THREE.Mesh>(null);
   const reduceMotion = useReducedMotion();
   const invalidate = useThree((s) => s.invalidate);
@@ -137,6 +148,13 @@ export function PlaceholderMesh({ byRegion, onReady }: PlaceholderMeshProps) {
         roughness={0.55}
         metalness={0.05}
         flatShading={false}
+        wireframe={wireframe}
+        // Wireframe lines look better with a slight transparency so
+        // they read as a scaffold rather than a hard cage. The opacity
+        // is only applied in wireframe mode; the solid placeholder
+        // stays fully opaque to keep its silhouette honest.
+        transparent={wireframe}
+        opacity={wireframe ? 0.55 : 1}
       />
     </mesh>
   );

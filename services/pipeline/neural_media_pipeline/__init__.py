@@ -28,14 +28,24 @@ from .downloader import (  # noqa: E402
     download_video,
 )
 from .importer import parse_export, stable_video_id, stable_watch_event_id  # noqa: E402
+from .preprocess import (  # noqa: E402
+    PreprocessConfig,
+    PreprocessError,
+    PreprocessResult,
+    preprocess_video,
+)
 
 __all__ = [
     "DownloadConfig",
     "DownloadError",
     "DownloadResult",
+    "PreprocessConfig",
+    "PreprocessError",
+    "PreprocessResult",
     "download_batch",
     "download_video",
     "parse_export",
+    "preprocess_video",
     "stable_video_id",
     "stable_watch_event_id",
 ]

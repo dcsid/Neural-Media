@@ -536,27 +536,40 @@ def default_orchestrator_factory(
 ) -> Any:
     """Construct a real ``neural_media_pipeline.Orchestrator``.
 
+    ``mode="mock"`` → ``skip_download=True, skip_preprocess=True`` so the
+    orchestrator never touches yt-dlp or ffmpeg; the synthetic per-video
+    duration matches the committed sample fixtures. ``mode="real"`` →
+    full pipeline + a TribeBackend bound to the real TRIBE v2 weights.
+
     Probes the Orchestrator signature for ``on_progress=`` and silently
     drops it if data-pipeline hasn't shipped support yet — the poller
     thread provides a fallback signal in that case.
     """
     from neural_media_pipeline import Orchestrator, OrchestratorConfig
 
-    cfg = OrchestratorConfig(
+    cfg_kwargs: dict[str, Any] = dict(
         db_path=db_path,
         videos_dir=videos_dir,
         processed_dir=processed_dir,
         activations_dir=activations_dir,
     )
+    if mode == "mock":
+        cfg_kwargs["skip_download"] = True
+        cfg_kwargs["skip_preprocess"] = True
+    cfg = OrchestratorConfig(**cfg_kwargs)
 
-    kwargs: dict[str, Any] = {}
+    init_kwargs: dict[str, Any] = {}
     if mode == "real":
-        kwargs["inference_fn"] = _build_real_inference_fn()
+        # Real backend goes through inference_fn — the OrchestratorConfig
+        # also accepts `backend=` but threading it through inference_fn
+        # keeps the api side in control of how the backend is constructed
+        # (license acceptance, weight resolution, etc.).
+        init_kwargs["inference_fn"] = _build_real_inference_fn()
 
     if _orchestrator_accepts_on_progress():
-        kwargs["on_progress"] = on_progress
+        init_kwargs["on_progress"] = on_progress
 
-    return Orchestrator(cfg, **kwargs)
+    return Orchestrator(cfg, **init_kwargs)
 
 
 def _orchestrator_accepts_on_progress() -> bool:

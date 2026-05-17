@@ -57,6 +57,20 @@ class MockBackend:
     modulation, and a small noise term — all derived from a SHA-256 mix of
     ``(video_id, seed)``. The shape and value range match the real backend
     so downstream code does not need to special-case the mock.
+
+    Range agreement with TribeBackend (verified 2026-05-17 — see
+    docs/worker-briefs/ml-inference-status.md "Range alignment"):
+
+    * Both backends produce ``float32`` of shape ``(T, 20484)`` strictly
+      inside ``[0, 1]``. The runner's range assertion at runner.py:120
+      holds for either.
+    * Mock can land on ``1.0`` exactly (``np.clip`` is closed); TRIBE
+      post-sigmoid is open. One-ULP gap, not a contract difference.
+    * Mock mean ≈ 0.32 with std ≈ 0.22. TRIBE post-sigmoid on z~N(0,1)
+      means ≈ 0.50 with std ≈ 0.21. The distributional shift is
+      intentional ("real model produces more variation") and
+      downstream LUT / aggregation paths are linear in ``[0, 1]``, so
+      no special-casing is required.
     """
 
     model_id: str = "tribe-v2-mock"

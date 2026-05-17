@@ -1,0 +1,3 @@
+# FreeSurfer fsaverage subject + HCP-MMP annot files fetched by
+# build_region_masks.py. Multi-GB; never committed. Regenerable.
+_fsaverage_cache/

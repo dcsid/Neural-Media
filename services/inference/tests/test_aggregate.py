@@ -23,17 +23,32 @@ def test_masks_cover_canonical_regions():
     assert set(REGION_VERTEX_MASKS) == set(REGION_IDS)
 
 
-def test_masks_are_disjoint_and_tile_cortex():
+def test_masks_are_disjoint():
+    """HCP-MMP1 parcels are anatomically disjoint, so any two regions in our
+    8-region set must be too. We do NOT assert tiling — the medial wall and
+    cortex outside our curated regions stay unassigned by design (see the
+    aggregate.py docstring and apps/web/public/brain/README.md)."""
     seen: set[int] = set()
-    total = 0
     for region_id, idx_list in REGION_VERTEX_MASKS.items():
         idx_set = set(idx_list)
         assert len(idx_set) == len(idx_list), f"{region_id} has duplicates"
         assert seen.isdisjoint(idx_set), f"{region_id} overlaps a prior region"
         seen |= idx_set
-        total += len(idx_list)
-    assert total == NUM_VERTICES
-    assert seen == set(range(NUM_VERTICES))
+
+
+def test_masks_do_not_tile_cortex():
+    """Sanity: with real anatomy in place, ~10–30% of vertices belong to one
+    of the 8 regions. The rest are medial wall + motor/parietal/PFC parcels
+    we didn't include. This test will fail if someone reverts to placeholder
+    slabs — that regression is exactly what we're guarding against."""
+    total = sum(len(v) for v in REGION_VERTEX_MASKS.values())
+    assert total < NUM_VERTICES, "real atlas masks must not tile the cortex"
+    assert total >= 1_000, f"suspiciously sparse coverage: {total} verts"
+
+
+def test_each_region_has_vertices():
+    for region_id in REGION_IDS:
+        assert len(REGION_VERTEX_MASKS[region_id]) > 0, f"{region_id} is empty"
 
 
 def test_aggregate_returns_one_row_per_region():

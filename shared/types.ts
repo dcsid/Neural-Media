@@ -197,6 +197,37 @@ export interface Capabilities {
 }
 
 // ---------------------------------------------------------------------------
+// Debug / observability (GET /api/v1/debug) — single-call snapshot of
+// process state so the dashboard's planned status sliver doesn't have to
+// fan out four GETs. See CONTRACTS.md §12.
+// ---------------------------------------------------------------------------
+
+export interface DebugCounts {
+  videos: number;
+  watch_events: number;
+  inference_runs: number;
+  import_jobs: number;
+}
+
+export interface DebugDiskUsage {
+  videos: number;       // bytes
+  activations: number;  // bytes
+  imports: number;      // bytes
+  sqlite: number;       // bytes — catalog file only, not WAL/shm sidecars
+}
+
+export interface DebugReport {
+  version: string;
+  db_path: string;
+  videos_dir: string;
+  counts: DebugCounts;
+  latest_import: ImportJob | null;
+  capabilities: Capabilities;
+  disk_usage: DebugDiskUsage;
+  uptime_s: number;
+}
+
+// ---------------------------------------------------------------------------
 // API endpoint paths — used by the frontend, kept here so the contract is
 // type-checked.
 // ---------------------------------------------------------------------------
@@ -215,5 +246,7 @@ export const ENDPOINTS = {
   inferenceRuns: `${API_BASE}/inference-runs`,
   importStart: `${API_BASE}/import`,
   importJob: (id: string) => `${API_BASE}/import/${id}`,
+  importRetry: (id: string) => `${API_BASE}/import/${id}/retry`,
   capabilities: `${API_BASE}/capabilities`,
+  debug: `${API_BASE}/debug`,
 } as const;

@@ -202,6 +202,7 @@ default and reject `Host` headers other than `localhost`/`127.0.0.1`.
 | GET    | `/api/v1/import/{job_id}`         | `ImportJob`                      |
 | POST   | `/api/v1/import/{job_id}/retry`   | `ImportJob` (new, re-drives `run_pending`) |
 | GET    | `/api/v1/capabilities`            | `Capabilities` (see §10)         |
+| GET    | `/api/v1/debug`                   | `DebugReport` (see §12)          |
 
 The frontend MUST use only these endpoints. The frontend MUST NOT read files
 from the filesystem directly. If you find yourself wanting to, add a new
@@ -394,3 +395,77 @@ resume polling.
 On success, returns 200 with a **new** `ImportJob` (new `id`) whose
 `status` starts at `queued`. The old job's row stays where it was so
 the history isn't lost.
+
+## 12. Debug / observability
+
+`GET /api/v1/debug` returns a single-call snapshot of process state.
+Designed so the integration lead (and the planned frontend status
+sliver) doesn't have to fan out four GETs to ask "what does this
+server think the world looks like?". Folds in `/capabilities` for the
+same reason — `disk_usage`, `counts`, `latest_import`, and
+`capabilities` together cover everything you'd want to see when
+diagnosing a sick or surprising state.
+
+```json
+{
+  "version": "0.2.0",
+  "db_path": "/abs/path/to/data/sqlite/neural_media.db",
+  "videos_dir": "/abs/path/to/data/videos",
+  "counts": {
+    "videos": 510,
+    "watch_events": 510,
+    "inference_runs": 510,
+    "import_jobs": 6
+  },
+  "latest_import": { /* ImportJob (§8) | null */ },
+  "capabilities": {
+    "mock": true,
+    "real": false,
+    "real_blockers": ["missing-extra", "missing-ffmpeg"]
+  },
+  "disk_usage": {
+    "videos":      0,
+    "activations": 3545976712,
+    "imports":     45020256,
+    "sqlite":      7503872
+  },
+  "uptime_s": 412.7
+}
+```
+
+Field semantics:
+
+- `version` — `FastAPI.title.version`. Bumps with every release.
+- `db_path` / `videos_dir` — absolute, fully-resolved paths. Useful
+  when the user has overridden them via `NEURAL_MEDIA_DB_PATH` /
+  `NEURAL_MEDIA_IMPORTS_DIR` and forgotten where the catalog lives.
+- `counts` — `SELECT COUNT(*) FROM <table>` for each. Missing tables
+  or missing DB degrade to `0`.
+- `latest_import` — the most-recent `ImportJob` row regardless of
+  status. `null` if no rows yet. Shape is the literal §8 `ImportJob`.
+- `capabilities` — identical body to `GET /api/v1/capabilities`.
+- `disk_usage` — recursive sum of `st_size` over each directory, plus
+  the size of the SQLite file. Missing directories report `0`.
+  `sqlite` covers the catalog file only, not the WAL/shm sidecars.
+- `uptime_s` — seconds since the API process booted (monotonic clock,
+  sampled at module import).
+
+No auth, no `/metrics` Prometheus surface. The loopback-only
+middleware already gates everything; `/debug` leaks no more than
+`/capabilities` + `/import` + the directory paths the user themselves
+configured.
+
+### Logging convention
+
+Any operation that mutates user-visible state OR is rejected at a
+policy boundary emits one INFO-level `event=<name> key=value …` line.
+This greps cleanly without requiring a structured log shipper. Defined
+event sites today:
+
+- `event=import_submitted op={ingest,retry} job_id=… mode=… …`
+- `event=import_rejected reason={file_extension,real_mode_blocked} …`
+- `event=cleanup_started kind={videos,activations} …`
+
+The convention is additive — pre-existing `_log` messages have not
+been reformatted. Workers adding new mutation or rejection sites
+should follow the same pattern.

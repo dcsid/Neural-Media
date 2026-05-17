@@ -235,3 +235,54 @@ class Capabilities(BaseModel):
     mock: bool
     real: bool
     real_blockers: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Debug / observability (CONTRACTS.md §12)
+# ---------------------------------------------------------------------------
+
+class DebugCounts(BaseModel):
+    """Row counts per catalog table for `GET /api/v1/debug`.
+
+    Missing tables / missing DB degrade to 0 (same contract as
+    `SqliteStore._query`).
+    """
+
+    videos: int = 0
+    watch_events: int = 0
+    inference_runs: int = 0
+    import_jobs: int = 0
+
+
+class DebugDiskUsage(BaseModel):
+    """Recursive `st_size` sum per directory for `GET /api/v1/debug`.
+
+    Missing directories report 0. `sqlite` is the size of the catalog
+    file itself, not the WAL or shared-memory sidecars.
+    """
+
+    videos: int = 0
+    activations: int = 0
+    imports: int = 0
+    sqlite: int = 0
+
+
+class DebugReport(BaseModel):
+    """Response from `GET /api/v1/debug`.
+
+    Single-call snapshot of process state so the integration lead (and
+    the planned frontend status sliver) doesn't have to fan out four
+    GETs to ask "what does this server think the world looks like?"
+    Folds in `/capabilities` for the same reason.
+
+    Mirrors `DebugReport` in `shared/types.ts`. See CONTRACTS.md §12.
+    """
+
+    version: str
+    db_path: str
+    videos_dir: str
+    counts: DebugCounts
+    latest_import: ImportJob | None = None
+    capabilities: Capabilities
+    disk_usage: DebugDiskUsage
+    uptime_s: float

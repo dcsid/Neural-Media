@@ -8,6 +8,7 @@ import {
   type VideoMetadata,
   type WatchEvent,
 } from "@shared/types";
+import { IMPORT_ENDPOINTS, type ImportJob } from "./import-types";
 
 // Local fetch errors are normalised to this single class so callers can
 // distinguish "server unreachable" from "server replied with HTTP 4xx/5xx"
@@ -16,18 +17,23 @@ export class ApiError extends Error {
   readonly kind: "offline" | "http" | "parse";
   readonly status?: number;
   readonly url: string;
+  // Raw parsed JSON body when the server returned one alongside the
+  // error — surfaces e.g. the running ImportJob on a 409.
+  readonly body?: unknown;
 
   constructor(args: {
     kind: "offline" | "http" | "parse";
     url: string;
     message: string;
     status?: number;
+    body?: unknown;
   }) {
     super(args.message);
     this.name = "ApiError";
     this.kind = args.kind;
     this.status = args.status;
     this.url = args.url;
+    this.body = args.body;
   }
 }
 
@@ -62,11 +68,21 @@ async function apiFetch<T>(path: string, opts: ApiFetchOptions = {}): Promise<T>
   }
 
   if (!response.ok) {
+    // Best-effort: capture the error body if it's JSON so callers can
+    // inspect e.g. the running job returned by a 409 on /import.
+    let body: unknown;
+    try {
+      const text = await response.clone().text();
+      if (text) body = JSON.parse(text);
+    } catch {
+      body = undefined;
+    }
     throw new ApiError({
       kind: "http",
       url,
       status: response.status,
       message: `HTTP ${response.status} ${response.statusText}`,
+      body,
     });
   }
 
@@ -100,7 +116,67 @@ export const api = {
     apiFetch<WatchEvent[]>(ENDPOINTS.watchEvents, opts),
   inferenceRuns: (opts?: ApiFetchOptions) =>
     apiFetch<InferenceRun[]>(ENDPOINTS.inferenceRuns, opts),
+  importStart: (file: File, opts?: ApiFetchOptions) =>
+    apiFetchMultipart<ImportJob>(IMPORT_ENDPOINTS.importStart, file, opts),
+  importJob: (id: string, opts?: ApiFetchOptions) =>
+    apiFetch<ImportJob>(IMPORT_ENDPOINTS.importJob(id), opts),
 };
+
+async function apiFetchMultipart<T>(
+  path: string,
+  file: File,
+  opts: ApiFetchOptions = {},
+): Promise<T> {
+  const url = opts.baseUrl ? `${opts.baseUrl.replace(/\/$/, "")}${path}` : path;
+  const form = new FormData();
+  form.append("file", file, file.name);
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      body: form,
+      signal: opts.signal,
+      cache: "no-store",
+      headers: { Accept: "application/json" },
+      // Do NOT set Content-Type — the browser fills in the multipart
+      // boundary when the body is a FormData.
+    });
+  } catch (err) {
+    throw new ApiError({
+      kind: "offline",
+      url,
+      message: err instanceof Error ? err.message : "Network request failed",
+    });
+  }
+
+  if (!response.ok) {
+    let body: unknown;
+    try {
+      const text = await response.clone().text();
+      if (text) body = JSON.parse(text);
+    } catch {
+      body = undefined;
+    }
+    throw new ApiError({
+      kind: "http",
+      url,
+      status: response.status,
+      message: `HTTP ${response.status} ${response.statusText}`,
+      body,
+    });
+  }
+
+  try {
+    return (await response.json()) as T;
+  } catch (err) {
+    throw new ApiError({
+      kind: "parse",
+      url,
+      message: err instanceof Error ? err.message : "Response was not valid JSON",
+    });
+  }
+}
 
 // Server components need an absolute URL to hit the Next.js rewrite layer.
 // In Node we know we're talking to the same dev server.

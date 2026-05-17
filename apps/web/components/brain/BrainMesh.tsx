@@ -5,14 +5,25 @@ import { OrbitControls } from "@react-three/drei";
 import {
   Component,
   Suspense,
+  useCallback,
   useEffect,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
+import { REGION_IDS } from "@shared/types";
 import { PlaceholderMesh } from "./PlaceholderMesh";
-import { CorticalSurface } from "./CorticalSurface";
+import { CorticalSurface, type CorticalHoverEvent } from "./CorticalSurface";
 import { useActivationFrame } from "./hooks/useActivationFrame";
 import { useReducedMotion } from "./hooks/useReducedMotion";
+import { useRegionMask } from "./hooks/useRegionMask";
+import { RegionTooltip, type RegionHoverInfo } from "./RegionTooltip";
+import {
+  DevOverlay,
+  DevProbe,
+  useDevModeEnabled,
+  type DevSample,
+} from "./DevOverlay";
 
 // Public component contract — frontend-dashboard imports this by name.
 // See docs/worker-briefs/brain-viz.md for the full brief.
@@ -41,9 +52,7 @@ function useSurfaceAvailable(url: string): boolean {
       .then((r) => {
         if (!cancelled && r.ok) setOk(true);
       })
-      .catch(() => {
-        // Placeholder stays — expected during early development.
-      });
+      .catch(() => {});
     return () => {
       cancelled = true;
     };
@@ -60,8 +69,6 @@ class SurfaceErrorBoundary extends Component<
     return { errored: true };
   }
   componentDidCatch(err: unknown) {
-    // The fallback already shows; surface the error to the console so the
-    // worker can iterate without breaking the dashboard.
     console.warn("[brain-viz] cortical surface failed to render", err);
   }
   render() {
@@ -78,6 +85,7 @@ export function BrainMesh({
 }: BrainMeshProps) {
   const reduceMotion = useReducedMotion();
   const surfaceAvailable = useSurfaceAvailable(SURFACE_URL);
+  const regionMask = useRegionMask();
   const frame = useActivationFrame(
     activation,
     keyframeVertices,
@@ -85,13 +93,42 @@ export function BrainMesh({
     playheadSec,
   );
 
+  const devEnabled = useDevModeEnabled();
+  const [devSample, setDevSample] = useState<DevSample | null>(null);
+  const mountedAt = useRef(performance.now());
+  const [firstPaintMs, setFirstPaintMs] = useState<number | null>(null);
+
+  // Container-relative pointer position for the tooltip.
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [hover, setHover] = useState<RegionHoverInfo | null>(null);
+
+  const handleHover = useCallback((e: CorticalHoverEvent | null) => {
+    if (!e || !containerRef.current) {
+      setHover(null);
+      return;
+    }
+    const rect = containerRef.current.getBoundingClientRect();
+    setHover({
+      regionId: e.regionId,
+      activation: e.activation,
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top,
+    });
+  }, []);
+
+  const handleReady = useCallback(() => {
+    if (firstPaintMs === null) {
+      setFirstPaintMs(performance.now() - mountedAt.current);
+    }
+    onReady?.();
+  }, [firstPaintMs, onReady]);
+
   return (
-    <div className="relative h-full w-full">
+    <div ref={containerRef} className="relative h-full w-full">
       <Canvas
-        // dpr capped to keep the FPS floor on 2021 MBP M1 — the brief budget
-        // is 60fps. 2x is enough for the cortex; higher buys nothing visible.
+        // dpr capped to keep the FPS floor on 2021 MBP M1.
         dpr={[1, 2]}
-        camera={{ position: [0, 0, 3.6], fov: 35 }}
+        camera={{ position: [0, 0, 3.2], fov: 35 }}
         gl={{ antialias: true, alpha: true, powerPreference: "high-performance" }}
         frameloop={reduceMotion ? "demand" : "always"}
       >
@@ -102,22 +139,31 @@ export function BrainMesh({
 
         <SurfaceErrorBoundary
           fallback={
-            <PlaceholderMesh byRegion={frame.byRegion} onReady={onReady} />
+            <PlaceholderMesh byRegion={frame.byRegion} onReady={handleReady} />
           }
         >
           <Suspense
             fallback={
-              <PlaceholderMesh byRegion={frame.byRegion} onReady={onReady} />
+              <PlaceholderMesh
+                byRegion={frame.byRegion}
+                onReady={handleReady}
+              />
             }
           >
             {surfaceAvailable ? (
               <CorticalSurface
                 url={SURFACE_URL}
                 byRegion={frame.byRegion}
-                onReady={onReady}
+                vertexRegions={regionMask ?? undefined}
+                regionOrder={REGION_IDS}
+                onReady={handleReady}
+                onHover={handleHover}
               />
             ) : (
-              <PlaceholderMesh byRegion={frame.byRegion} onReady={onReady} />
+              <PlaceholderMesh
+                byRegion={frame.byRegion}
+                onReady={handleReady}
+              />
             )}
           </Suspense>
         </SurfaceErrorBoundary>
@@ -129,7 +175,14 @@ export function BrainMesh({
           dampingFactor={0.08}
           rotateSpeed={0.6}
         />
+
+        {devEnabled && (
+          <DevProbe onSample={setDevSample} firstPaintMs={firstPaintMs} />
+        )}
       </Canvas>
+
+      <RegionTooltip hover={hover} />
+      {devEnabled && <DevOverlay sample={devSample} />}
     </div>
   );
 }

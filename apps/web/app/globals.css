@@ -38,6 +38,33 @@ body {
   color: theme("colors.ink.300");
 }
 
+/* Single focus-visible ring for every interactive element. Amber-only so
+   it cannot read as a second accent. Strong enough to pass axe / WCAG. */
+:where(a, button, summary, input, select, textarea, [role="slider"], [tabindex]):focus-visible {
+  outline: 2px solid theme("colors.accent.DEFAULT");
+  outline-offset: 2px;
+  border-radius: 1px;
+}
+
+/* Skip link in the layout — only revealed when focused. */
+.skip-link {
+  position: fixed;
+  left: 8px;
+  top: 8px;
+  z-index: 50;
+  background: theme("colors.canvas");
+  color: theme("colors.ink.50");
+  border: 1px solid theme("colors.accent.DEFAULT");
+  padding: 8px 12px;
+  font-size: 12px;
+  text-decoration: none;
+  transform: translateY(-200%);
+  transition: transform 80ms linear;
+}
+.skip-link:focus-visible {
+  transform: translateY(0);
+}
+
 /* Reduce flash of unstyled content during font load. */
 @media (prefers-reduced-motion: reduce) {
   * {

@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .orchestrate import (
@@ -64,9 +65,52 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Demo mode: bypass ffmpeg; mock-mode duration is synthesised.")
     p.add_argument("--mock", action="store_true",
                    help="Shortcut for --skip-download --skip-preprocess.")
+    p.add_argument("--purge-after-inference", action="store_true",
+                   help="After each video's RegionMetrics land in SQLite, "
+                        "delete the raw + preprocessed mp4s. Keeps peak "
+                        "disk to ~10 MB on large ingests but defeats the "
+                        "yt-dlp dedup cache — re-runs hit TikTok again.")
+    p.add_argument("--since", type=_parse_window_arg, default=None,
+                   help="Drop events strictly before this UTC date/datetime "
+                        "(YYYY-MM-DD or ISO-8601).")
+    p.add_argument("--until", type=_parse_window_arg, default=None,
+                   help="Drop events at or after this UTC date/datetime "
+                        "(half-open upper bound).")
+    p.add_argument("--days", type=int, default=None,
+                   help="Convenience: keep only the last N days of history. "
+                        "Equivalent to --since (now - N days). Overrides --since.")
+    p.add_argument("--hours", type=int, default=None,
+                   help="Convenience: keep only the last N hours of history. "
+                        "Overrides --days and --since.")
+    p.add_argument("--minutes", type=int, default=None,
+                   help="Convenience: keep only the last N minutes of history. "
+                        "Overrides --hours, --days, and --since.")
+    p.add_argument("--purge-activations", action="store_true",
+                   help="After each video's RegionMetrics land in SQLite, "
+                        "delete the raw .npz, the .meta.json sidecar, and "
+                        "the downsampled JSON payload. The catalogue keeps "
+                        "the irreducible region readings; per-vertex mesh "
+                        "playback is lost for purged videos.")
     p.add_argument("-v", "--verbose", action="count", default=0,
                    help="-v for INFO, -vv for DEBUG.")
     return p
+
+
+def _parse_window_arg(raw: str) -> datetime:
+    """argparse type for --since/--until.
+
+    Accepts plain dates (``YYYY-MM-DD``) or full ISO-8601 timestamps.
+    Naive values are stamped UTC, matching how the importer treats every
+    other timestamp in this pipeline.
+    """
+    raw = raw.strip()
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"not a valid date/datetime: {raw!r} (expected YYYY-MM-DD or ISO-8601)"
+        ) from exc
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def _default_data_root() -> Path:
@@ -94,7 +138,27 @@ def _resolve_paths(args: argparse.Namespace) -> OrchestratorConfig:
         activations_dir=args.activations_dir or root / "activations",
         skip_download=skip_d,
         skip_preprocess=skip_p,
+        purge_after_inference=args.purge_after_inference,
+        purge_activations=args.purge_activations,
     )
+
+
+def _resolve_since(args: argparse.Namespace) -> datetime | None:
+    """Collapse --minutes / --hours / --days / --since into one cutoff.
+
+    Finest unit wins so a user can pass several without surprises:
+    ``--minutes 5 --days 30`` keeps only the last 5 minutes. ``--since``
+    is the explicit lower bound and is honoured only when no relative
+    flag is set.
+    """
+    now = datetime.now(timezone.utc)
+    if args.minutes is not None:
+        return now - timedelta(minutes=args.minutes)
+    if args.hours is not None:
+        return now - timedelta(hours=args.hours)
+    if args.days is not None:
+        return now - timedelta(days=args.days)
+    return args.since
 
 
 def _print_summary(summary: IngestSummary) -> None:
@@ -126,10 +190,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     cfg = _resolve_paths(args)
+    since = _resolve_since(args)
+    until = args.until
 
     if args.dry_run:
         from .importer import parse_export
-        videos, events = parse_export(args.export)  # type: ignore[arg-type]
+        videos, events = parse_export(args.export, since=since, until=until)  # type: ignore[arg-type]
         summary = IngestSummary(parsed_videos=len(videos), parsed_events=len(events))
         _print_summary(summary)
         return 0
@@ -138,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.run_pending:
             summary = orch.run_pending()
         else:
-            summary = orch.run(args.export)
+            summary = orch.run(args.export, since=since, until=until)
 
     _print_summary(summary)
     return 1 if summary.failed and not summary.completed else 0

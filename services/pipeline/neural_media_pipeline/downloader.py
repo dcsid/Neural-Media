@@ -16,12 +16,34 @@ inject deterministic ``sleep``/``rng`` shims.
 Privacy: this module never logs full source URLs. The stable video id
 is a hash of the URL and is safe to log; the URL itself is not. See
 ``docs/scientific-framing.md``.
+
+URL forms supported by the wrapper
+----------------------------------
+
+The newer TikTok export (``Watch History.txt``) emits share-shortlink
+URLs of the form::
+
+    https://www.tiktokv.com/share/video/<numeric_id>/
+
+rather than the older ``https://www.tiktok.com/@<handle>/video/<id>``
+form. ``yt_dlp`` resolves the share host through a redirect to the
+canonical tiktok.com URL and downloads the underlying mp4 the same way,
+so no code change is needed here.
+
+Probe recorded on 2026-05-17 against
+``https://www.tiktokv.com/share/video/7640163791312801054/`` from the
+user's local ``Watch History.txt`` (yt_dlp 2026.3.17, default
+``_yt_dlp_fetch`` opts): OK, 3 752 713 bytes mp4 written. Re-run
+``services/pipeline/scripts/probe_share_url.py`` (one network call) to
+re-verify if yt-dlp ships an extractor change.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import random
+import shutil
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -99,6 +121,21 @@ class DownloadResult:
 
 def _local_path(cfg: DownloadConfig, video_id: str) -> Path:
     return cfg.videos_dir / f"{video_id}.mp4"
+
+
+def yt_dlp_available() -> bool:
+    """True iff yt-dlp is importable as a Python module OR on PATH.
+
+    Consumed by the api worker's ``/capabilities`` endpoint. The
+    importable check is the operative one (``_yt_dlp_fetch`` does
+    ``import yt_dlp``), but we accept the CLI as a fallback so a
+    pip-uninstalled environment with the Homebrew binary still reports
+    truthfully. ``importlib.util.find_spec`` avoids actually loading the
+    package, so this stays cheap.
+    """
+    if importlib.util.find_spec("yt_dlp") is not None:
+        return True
+    return shutil.which("yt-dlp") is not None
 
 
 def _yt_dlp_fetch(url: str, dest: Path, user_agent: str) -> None:
@@ -257,4 +294,5 @@ __all__ = [
     "SleepFn",
     "download_batch",
     "download_video",
+    "yt_dlp_available",
 ]

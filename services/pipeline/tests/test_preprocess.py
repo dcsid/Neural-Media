@@ -22,6 +22,7 @@ from neural_media_pipeline.preprocess import (
     PreprocessConfig,
     PreprocessError,
     build_ffmpeg_args,
+    ffmpeg_available,
     preprocess_video,
 )
 
@@ -194,3 +195,26 @@ def test_invalid_config_rejected(tmp_path: Path) -> None:
 def test_resolution_wh_property(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path, video_resolution="640x360")
     assert cfg.resolution_wh == (640, 360)
+
+
+# ---------------------------------------------------------------------------
+# Precheck: ffmpeg_available
+# ---------------------------------------------------------------------------
+
+def test_ffmpeg_available_true_when_on_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import neural_media_pipeline.preprocess as pp
+
+    monkeypatch.setattr(pp.shutil, "which",
+                        lambda name: "/usr/local/bin/ffmpeg" if name == "ffmpeg" else None)
+    assert ffmpeg_available() is True
+
+
+def test_ffmpeg_available_false_when_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import neural_media_pipeline.preprocess as pp
+
+    monkeypatch.setattr(pp.shutil, "which", lambda _name: None)
+    assert ffmpeg_available() is False

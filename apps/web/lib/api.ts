@@ -2,6 +2,7 @@ import {
   ENDPOINTS,
   type ActivationOutput,
   type AggregateReport,
+  type Capabilities,
   type ImportJob,
   type InferenceRun,
   type RegionDef,
@@ -129,6 +130,8 @@ export const api = {
     apiFetchMultipart<ImportJob>(ENDPOINTS.importStart, file, extra, opts),
   importJob: (id: string, opts?: ApiFetchOptions) =>
     apiFetch<ImportJob>(ENDPOINTS.importJob(id), opts),
+  capabilities: (opts?: ApiFetchOptions) =>
+    apiFetch<Capabilities>(ENDPOINTS.capabilities, opts),
 };
 
 async function apiFetchMultipart<T>(

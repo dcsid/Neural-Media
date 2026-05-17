@@ -282,3 +282,73 @@ mock-mode dashboard as evidence of low engagement.
    the same `(video_id, seed)` produce byte-identical activations on
    the target GPU; if not, document residual non-determinism in the
    reproducibility envelope.
+
+## What changes once a real-mode smoke runs
+
+Round 2 (2026-05-17) shipped the prerequisite scaffolding without
+re-running real inference (no GPU on the developer's MacBook). The
+following entries in this doc should be **resolved or rewritten** the
+first time a user successfully runs
+`python -m neural_media_pipeline --no-mock` on a cloud GPU box (see
+[`docs/real-mode-setup.md`](../real-mode-setup.md)).
+
+### 1. The cortical-vertex ordering check (highest priority)
+
+The TribeBackend wrapper now logs a one-shot **WARNING** when
+`preds.shape[1] > NUM_VERTICES` (`backend_tribe.py:_WARNED_WIDER_THAN_CORTEX`).
+A real-mode user sees the message inline with their first run, with a
+pointer back to this doc. The triage workflow on first sight of the
+warning is:
+
+```python
+# In a python REPL on the GPU box, after a successful forward pass:
+preds, _ = model.predict(events=df)   # the raw TRIBE output
+print("shape:", preds.shape)
+print("first 5 columns, t=0:", preds[0, :5])
+print("columns 10239:10247, t=0:", preds[0, 10239:10247])
+print("columns 20479:20484, t=0:", preds[0, 20479:20484])
+```
+
+Then load `data/region_masks.json` and check that the V1 vertex
+indices land in the back of the brain on **both** hemispheres. If the
+left-hemisphere V1 mass shows up where the right-hemisphere V1 should
+be, the wrapper needs a `cortex = preds[:, perm]` line where `perm` is
+the lh↔rh swap; the masks file does NOT need to change.
+
+If `preds.shape[1] == NUM_VERTICES` exactly, the warning never fires
+and this whole question collapses — TRIBE doesn't emit subcortical and
+the slice is identity.
+
+### 2. Raw-output range
+
+The sigmoid transform in `backend_tribe.py:213-215` assumes raw output
+is z-scored. After the first real run, dump:
+
+```python
+print(preds.min(), preds.mean(), preds.max())
+```
+
+If the values are already in `[0, 1]` (mean ~0.5, max < 1), the sigmoid
+is a double-application and should be replaced with a passthrough +
+range assertion. If the values are in `[-3, +3]` z-space as the
+wrapper assumes, leave it.
+
+### 3. Pre-flight script accuracy
+
+`services/inference/scripts/validate_real_mode.py` checks four
+transitive HF repos (`facebook/tribev2`, `meta-llama/Llama-3.2-3B`,
+`facebook/vjepa2-vitg-fpc64-256`, `facebook/w2v-bert-2.0`). The exact
+list comes from the upstream model card as of 2026-05-17. If TRIBE
+v2.1 ships and swaps any backbone, the
+`_TRANSITIVE_REPOS` constant in that script needs to be updated.
+A successful real-mode run is the moment to refresh the list and
+re-record this status doc.
+
+### 4. Determinism on the target GPU
+
+Run inference twice with the same `(video_id, seed)`; diff the NPZs.
+If they're byte-identical, leave the reproducibility envelope alone.
+If they drift (likely on Ampere / Hopper due to non-deterministic
+reductions in cuDNN), add a `deterministic_torch_ops: false` flag to
+`extra_params` so anyone reading the sidecar later knows the seed is
+necessary-but-not-sufficient for byte equality.

@@ -11,13 +11,21 @@ dependencies = [
 
 [project.optional-dependencies]
 real = [
-  "torch>=2.3",
-  "transformers>=4.42",
+  # Tribev2 upstream pins torch >=2.5.1,<2.7 (see its pyproject.toml).
+  # Match that window so resolution is stable; without our pin pip may pick
+  # a torch that conflicts with tribev2's transitive constraints.
+  "torch>=2.5.1,<2.7",
+  # We import `huggingface_hub.HfApi` directly in backend_tribe.py to resolve
+  # the commit sha for the reproducibility envelope. Tribev2 also depends on
+  # huggingface_hub (unpinned upstream) — both resolve to the same install.
   "huggingface-hub>=0.24",
-  "pyarrow>=15",
   # TRIBE v2 isn't on PyPI — pull directly from facebookresearch.
-  # CC-BY-NC-4.0; depends on LLaMA 3.2 / V-JEPA2 / Wav2Vec-BERT weights
-  # fetched at first use via huggingface_hub.
+  # CC-BY-NC-4.0. Transitively brings: transformers, numpy==2.2.6, moviepy,
+  # x_transformers, spacy, soundfile, julius, plus Meta's first-party
+  # `neuralset` / `neuraltrain`. Model weights (LLaMA-3.2-3B, V-JEPA2-vitg,
+  # Wav2Vec-BERT 2.0) are fetched at first use via huggingface_hub — run
+  # `python -m neural_media_inference.scripts.validate_real_mode` (or
+  # `services/inference/scripts/validate_real_mode.py`) to confirm gates.
   "tribev2 @ git+https://github.com/facebookresearch/tribev2",
 ]
 atlas-build = [

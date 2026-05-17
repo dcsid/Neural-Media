@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import clsx from "clsx";
 import { api, ApiError } from "@/lib/api";
-import type { ImportJob } from "@/lib/import-types";
+import type { ImportJob } from "@shared/types";
 import { ApiOfflineState } from "@/components/ApiOfflineState";
 
 // /import — drag-and-drop only. There is no file picker, no
@@ -46,6 +46,8 @@ function statusVerb(status: ImportJob["status"]): string {
       return "Running";
     case "complete":
       return "Complete";
+    case "partial":
+      return "Partial";
     case "failed":
       return "Failed";
   }
@@ -74,9 +76,11 @@ export default function ImportPage() {
           const job = await api.importJob(jobId);
           consecutiveFailures = 0;
           if (token !== pollTokenRef.current) return;
-          if (job.status === "complete") {
+          if (job.status === "complete" || job.status === "partial") {
             // Show the terminal frame briefly before redirecting so the
-            // user sees "X / X" land before the route changes.
+            // user sees "X / X" land before the route changes. "partial"
+            // means some videos failed but at least one succeeded — show
+            // the dashboard so the user can see what did process.
             setPhase({ kind: "tracking", job });
             stopPolling();
             router.push("/");
@@ -303,6 +307,8 @@ function isImportJob(value: unknown): value is ImportJob {
   return (
     typeof candidate.id === "string" &&
     typeof candidate.status === "string" &&
-    ["queued", "running", "complete", "failed"].includes(candidate.status as string)
+    ["queued", "running", "complete", "partial", "failed"].includes(
+      candidate.status as string,
+    )
   );
 }

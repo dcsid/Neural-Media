@@ -5,18 +5,23 @@ SHELL := /bin/bash
 PYTHON ?= python3
 PNPM ?= pnpm
 
+REPO_ROOT := $(shell pwd)
+DB_PATH ?= $(REPO_ROOT)/data/sqlite/neural_media.db
+
 .PHONY: help install install-python install-web sample ingest init-db \
-        dev dev-api dev-web test test-python test-web typecheck-web clean
+        dev dev-api dev-api-mock dev-web test test-python test-web \
+        typecheck-web clean
 
 help:
 	@echo "Neural Media — make targets"
 	@echo ""
 	@echo "  make install         install all services and the web app"
-	@echo "  make sample          regenerate mock inference outputs"
-	@echo "  make ingest EXPORT=… ingest a real TikTok export through the pipeline"
+	@echo "  make sample          regenerate mock inference outputs (SampleStore)"
+	@echo "  make ingest EXPORT=… ingest a real TikTok export through the CLI"
 	@echo "  make init-db         create the SQLite catalog (idempotent)"
 	@echo "  make dev             run API (:8000) and web (:3000) together"
-	@echo "  make dev-api         run only the FastAPI service"
+	@echo "  make dev-api         FastAPI on SqliteStore (demo path — drag-drop visible)"
+	@echo "  make dev-api-mock    FastAPI on SampleStore (mock JSON fixtures)"
 	@echo "  make dev-web         run only the Next.js dev server"
 	@echo "  make test            run all tests"
 	@echo "  make typecheck-web   tsc --noEmit for the web app"
@@ -73,7 +78,18 @@ init-db:
 dev:
 	@echo "Run 'make dev-api' and 'make dev-web' in two terminals." && exit 1
 
+# dev-api: SqliteStore by default so drag-and-drop imports show up live on
+# the dashboard without restarting the server. The DB is auto-initialised
+# on first POST to /api/v1/import — `make init-db` is optional.
 dev-api:
+	cd services/api && NEURAL_MEDIA_DB_PATH=$(DB_PATH) \
+	  uvicorn neural_media_api.main:app \
+	  --host 127.0.0.1 --port 8000 --reload
+
+# dev-api-mock: SampleStore (no env var). Reads `data/sample/mock_inference/`.
+# Use this when you want to explore the dashboard with `make sample` data
+# instead of the import flow.
+dev-api-mock:
 	cd services/api && uvicorn neural_media_api.main:app \
 	  --host 127.0.0.1 --port 8000 --reload
 

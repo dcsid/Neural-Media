@@ -2,12 +2,17 @@
 
 Two surfaces matter here:
 
-1. `REGION_VERTEX_MASKS` — disjoint per-region vertex index sets, keyed by
-   region id from `shared.schemas.REGION_IDS`. The masks committed in this
-   slice are **placeholder contiguous slabs**, not real anatomy. They
-   exist so the contract is exercisable today; an HCP MMP1 / Glasser
-   parcel table MUST replace them before any external demo (see
-   docs/worker-briefs/ml-inference.md §3).
+1. `REGION_VERTEX_MASKS` — per-region vertex index sets derived from the
+   HCP-MMP1 atlas (Glasser et al. 2016, Nature 536:171-178) projected to
+   fsaverage5 (the cortical surface TRIBE v2 emits predictions on). Masks
+   are disjoint but **do not tile** the 20,484-vertex space — the medial
+   wall and parcels outside our 8 curated regions stay unassigned, which
+   is the right answer anatomically. The brain-viz worker already encodes
+   unassigned vertices as the `255` sentinel (see
+   `apps/web/public/brain/README.md`). The committed mapping lives in
+   `data/region_masks.json`; regenerate via
+   `scripts/build_region_masks.py`.
+
 2. `aggregate_region_metrics`, `downsample_region_means`,
    `keyframe_vertex_snapshots` — pure functions over a ``(T, 20484)``
    activation array.
@@ -20,54 +25,64 @@ sustains above baseline." If this definition changes, update CONTRACTS.md
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Sequence
 
 import numpy as np
 
 from ._shared import NUM_VERTICES, REGION_IDS
 
-
-# ---------------------------------------------------------------------------
-# Placeholder region masks. Disjoint contiguous slabs covering all 20,484
-# vertices. Sizes are not anatomically meaningful — they only ensure each
-# region has enough vertices to produce a non-degenerate timeseries.
-# ---------------------------------------------------------------------------
-
-_PLACEHOLDER_REGION_RANGES: dict[str, tuple[int, int]] = {
-    "v1":       (0,     3000),
-    "v2":       (3000,  5500),
-    "v3":       (5500,  7500),
-    "v4":       (7500,  9100),
-    "auditory": (9100,  11100),
-    "language": (11100, 14300),
-    "ffa":      (14300, 16800),
-    "vwfa":     (16800, NUM_VERTICES),
-}
-
-# Sanity: every canonical region has a mask, and masks tile [0, NUM_VERTICES).
-assert set(_PLACEHOLDER_REGION_RANGES) == set(REGION_IDS), (
-    "REGION_VERTEX_MASKS must cover exactly shared.schemas.REGION_IDS"
-)
-_covered = 0
-for _lo, _hi in _PLACEHOLDER_REGION_RANGES.values():
-    assert 0 <= _lo < _hi <= NUM_VERTICES
-    _covered += _hi - _lo
-assert _covered == NUM_VERTICES, "placeholder masks must tile the cortex"
-del _lo, _hi, _covered
+_MASKS_PATH = Path(__file__).resolve().parent / "data" / "region_masks.json"
 
 
-REGION_VERTEX_MASKS: dict[str, list[int]] = {
-    region_id: list(range(lo, hi))
-    for region_id, (lo, hi) in _PLACEHOLDER_REGION_RANGES.items()
-}
+def _load_region_masks(path: Path) -> tuple[dict[str, list[int]], dict[str, np.ndarray]]:
+    """Load the committed HCP-MMP1 vertex masks. Validates against the
+    canonical region set and asserts disjointness; raises at import time if
+    the JSON is malformed so a broken atlas can't ship as a silent bug.
+    Returns the published (list[int]) and internal (ndarray) forms."""
+    if not path.exists():
+        raise FileNotFoundError(
+            f"region masks not found at {path}. Run "
+            f"`python services/inference/scripts/build_region_masks.py` "
+            f"to regenerate."
+        )
+    payload = json.loads(path.read_text())
+    if payload.get("num_vertices") != NUM_VERTICES:
+        raise ValueError(
+            f"region_masks.json declares num_vertices={payload.get('num_vertices')}, "
+            f"expected {NUM_VERTICES}"
+        )
+    masks_raw = payload["masks"]
+    if set(masks_raw) != set(REGION_IDS):
+        raise ValueError(
+            f"region_masks.json keys {sorted(masks_raw)} != REGION_IDS {list(REGION_IDS)}"
+        )
+    public: dict[str, list[int]] = {}
+    private: dict[str, np.ndarray] = {}
+    seen: set[int] = set()
+    for region_id in REGION_IDS:
+        idx = masks_raw[region_id]
+        if not idx:
+            raise ValueError(f"region '{region_id}' has no vertices")
+        arr = np.asarray(idx, dtype=np.int64)
+        if arr.min() < 0 or arr.max() >= NUM_VERTICES:
+            raise ValueError(
+                f"region '{region_id}' has out-of-range vertex indices "
+                f"[{int(arr.min())}, {int(arr.max())}]"
+            )
+        as_set = set(int(v) for v in arr.tolist())
+        if len(as_set) != arr.size:
+            raise ValueError(f"region '{region_id}' has duplicate vertex indices")
+        if not seen.isdisjoint(as_set):
+            raise ValueError(f"region '{region_id}' overlaps a previously-loaded region")
+        seen |= as_set
+        public[region_id] = list(arr.tolist())
+        private[region_id] = arr
+    return public, private
 
 
-def _region_slice(region_id: str) -> slice:
-    """Internal fast path. The published `REGION_VERTEX_MASKS` is the API
-    contract; for hot paths we use the contiguous slice directly so we
-    don't materialize a 20k-element index list per call."""
-    lo, hi = _PLACEHOLDER_REGION_RANGES[region_id]
-    return slice(lo, hi)
+REGION_VERTEX_MASKS, _REGION_INDEX = _load_region_masks(_MASKS_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +91,7 @@ def _region_slice(region_id: str) -> slice:
 
 def _region_timeseries(activations: np.ndarray, region_id: str) -> np.ndarray:
     """Per-timepoint mean activation within a region. Shape: (T,)."""
-    return activations[:, _region_slice(region_id)].mean(axis=1, dtype=np.float64)
+    return activations[:, _REGION_INDEX[region_id]].mean(axis=1, dtype=np.float64)
 
 
 def aggregate_region_metrics(
@@ -132,7 +147,6 @@ def downsample_region_means(
         if T <= max_timepoints:
             out[region_id] = ts.astype(np.float32).tolist()
             continue
-        # Mean-pool into max_timepoints contiguous blocks.
         edges = np.linspace(0, T, max_timepoints + 1, dtype=np.int64)
         pooled = np.array(
             [ts[edges[i]:edges[i + 1]].mean() for i in range(max_timepoints)],

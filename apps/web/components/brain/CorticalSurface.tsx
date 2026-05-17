@@ -78,9 +78,25 @@ export function CorticalSurface({
   const invalidate = useThree((s) => s.invalidate);
 
   const { mesh, colorAttr, scratch } = useMemo(() => {
+    // Search by BufferGeometry presence rather than the THREE.Mesh
+    // `isMesh` sentinel. drei v10 / R3F v9 occasionally instantiate
+    // loaded GLB nodes as a class whose `isMesh` flag doesn't survive
+    // the loader pipeline (we hit this with fsaverage5.glb after the
+    // R3F 8→9 upgrade — GLB is well-formed but `isMesh` is falsy).
+    // Any node carrying a BufferGeometry with a `position` attribute
+    // is what the colormap pipeline actually needs.
     let found: THREE.Mesh | null = null;
     gltf.scene.traverse((obj) => {
-      if (!found && (obj as THREE.Mesh).isMesh) found = obj as THREE.Mesh;
+      if (found) return;
+      const candidate = obj as THREE.Mesh & {
+        geometry?: THREE.BufferGeometry;
+      };
+      if (
+        candidate.geometry instanceof THREE.BufferGeometry &&
+        candidate.geometry.getAttribute("position")
+      ) {
+        found = candidate;
+      }
     });
     if (!found) {
       throw new Error(

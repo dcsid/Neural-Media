@@ -122,6 +122,9 @@ def main(argv: list[str] | None = None) -> int:
             extra_params={"source_url": url},
             run_id=run_id,
             created_at=_FIXTURE_CREATED_AT,
+            # NPZ cache is gitignored; the JSON manifest is the contract.
+            # Skip compression — turns ~1 s/video into <100 ms/video.
+            compress=False,
         )
 
         (args.out_dir / f"{video_id}.run.json").write_text(

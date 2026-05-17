@@ -47,16 +47,20 @@ class _StubOrchestrator:
         summary: _StubSummary | None = None,
         raise_with: Exception | None = None,
         seen_paths: list[Path] | None = None,
+        seen_kwargs: list[dict] | None = None,
     ) -> None:
         self._release = release
         self._summary = summary or _StubSummary()
         self._raise = raise_with
         self._seen_paths = seen_paths
+        self._seen_kwargs = seen_kwargs
         self.closed = False
 
-    def ingest_export(self, path: Path) -> _StubSummary:
+    def ingest_export(self, path: Path, **kwargs: Any) -> _StubSummary:
         if self._seen_paths is not None:
             self._seen_paths.append(path)
+        if self._seen_kwargs is not None:
+            self._seen_kwargs.append(kwargs)
         if self._release is not None:
             assert self._release.wait(timeout=10.0), "release event never set"
         if self._raise is not None:
@@ -73,6 +77,7 @@ def _stub_factory(
     summary: _StubSummary | None = None,
     raise_with: Exception | None = None,
     seen_paths: list[Path] | None = None,
+    seen_kwargs: list[dict] | None = None,
 ):
     def factory(**_kwargs: Any) -> _StubOrchestrator:
         return _StubOrchestrator(
@@ -80,6 +85,7 @@ def _stub_factory(
             summary=summary,
             raise_with=raise_with,
             seen_paths=seen_paths,
+            seen_kwargs=seen_kwargs,
         )
     return factory
 
@@ -210,6 +216,54 @@ def test_post_import_rejects_other_extensions(
         files={"file": ("evil.exe", io.BytesIO(b"\x00\x01"), "application/octet-stream")},
     )
     assert resp.status_code == 400
+
+
+# --- .txt + date window plumbing -------------------------------------------
+
+
+def test_post_import_accepts_txt_and_forwards_days_window(
+    import_db: Path, imports_dir: Path, tmp_path: Path,
+) -> None:
+    """A dropped .txt file is staged unmodified and the date window is
+    threaded through to ``orch.ingest_export`` as a ``since`` kwarg."""
+    seen_paths: list[Path] = []
+    seen_kwargs: list[dict] = []
+    client = _make_client(
+        import_db,
+        _stub_factory(seen_paths=seen_paths, seen_kwargs=seen_kwargs),
+        tmp_path / "act",
+    )
+    txt_bytes = (
+        b"Date: 2026-05-12 08:14:03 UTC\n"
+        b"Link: https://www.tiktokv.com/share/video/1/\n"
+    )
+    resp = client.post(
+        "/api/v1/import",
+        files={"file": ("Watch History.txt", io.BytesIO(txt_bytes), "text/plain")},
+        data={"days": "7"},
+    )
+    assert resp.status_code == 200, resp.text
+    _wait_until_status(client, resp.json()["id"], status="complete")
+
+    assert seen_paths and seen_paths[0].suffix == ".txt"
+    assert seen_paths[0].read_bytes() == txt_bytes
+    # since was filled in from days=7; until stays None.
+    kw = seen_kwargs[0]
+    assert kw["since"] is not None
+    assert kw["until"] is None
+
+
+def test_post_import_rejects_unparseable_since(
+    import_db: Path, imports_dir: Path, tmp_path: Path, small_export_bytes: bytes,
+) -> None:
+    client = _make_client(import_db, _stub_factory(), tmp_path / "act")
+    resp = client.post(
+        "/api/v1/import",
+        files={"file": ("user_data.json", io.BytesIO(small_export_bytes), "application/json")},
+        data={"since": "tomorrow"},
+    )
+    assert resp.status_code == 400
+    assert "tomorrow" in resp.json()["detail"]
 
 
 def test_post_import_real_mode_400_when_extra_missing(

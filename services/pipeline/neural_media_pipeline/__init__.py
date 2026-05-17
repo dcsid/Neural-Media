@@ -20,6 +20,40 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from .downloader import (  # noqa: E402
+    DownloadConfig,
+    DownloadError,
+    DownloadResult,
+    download_batch,
+    download_video,
+)
 from .importer import parse_export, stable_video_id, stable_watch_event_id  # noqa: E402
+from .orchestrate import (  # noqa: E402
+    IngestSummary,
+    Orchestrator,
+    OrchestratorConfig,
+)
+from .preprocess import (  # noqa: E402
+    PreprocessConfig,
+    PreprocessError,
+    PreprocessResult,
+    preprocess_video,
+)
 
-__all__ = ["parse_export", "stable_video_id", "stable_watch_event_id"]
+__all__ = [
+    "DownloadConfig",
+    "DownloadError",
+    "DownloadResult",
+    "IngestSummary",
+    "Orchestrator",
+    "OrchestratorConfig",
+    "PreprocessConfig",
+    "PreprocessError",
+    "PreprocessResult",
+    "download_batch",
+    "download_video",
+    "parse_export",
+    "preprocess_video",
+    "stable_video_id",
+    "stable_watch_event_id",
+]

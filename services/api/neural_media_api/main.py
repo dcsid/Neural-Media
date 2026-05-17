@@ -10,11 +10,14 @@ coordinate via the integration lead (terminal 1).
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
+
+_log = logging.getLogger(__name__)
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -339,6 +342,10 @@ def create_app(
     ):
         filename = file.filename or "upload"
         if not _accepts_export_filename(filename):
+            _log.info(
+                "event=import_rejected reason=file_extension filename=%s",
+                filename,
+            )
             return _error_response(
                 status_code=400,
                 error_code=ERR_FILE_EXTENSION_REJECTED,
@@ -347,6 +354,12 @@ def create_app(
         if mode == "real":
             ok, blockers = real_mode_capabilities()
             if not ok:
+                _log.info(
+                    "event=import_rejected reason=real_mode_blocked "
+                    "blockers=%s error_code=%s",
+                    ",".join(blockers),
+                    _pick_blocker_error_code(blockers),
+                )
                 return _error_response(
                     status_code=400,
                     error_code=_pick_blocker_error_code(blockers),
@@ -426,6 +439,20 @@ def create_app(
             "real": ok,
             "real_blockers": blockers,
         }
+
+    @app.get("/api/v1/debug")
+    def get_debug() -> dict:
+        """Host-side observability snapshot. See debug.py for shape."""
+        from .debug import build_debug_payload
+        runner: ImportRunner = app.state.import_runner
+        return build_debug_payload(
+            version=app.version,
+            db_path=runner.db_path,
+            videos_dir=runner.videos_dir,
+            activations_dir=runner.activations_dir,
+            imports_dir=_imports_dir(),
+            jobs_store=runner.jobs,
+        )
 
     @app.post("/api/v1/import/{job_id}/retry", response_model=ImportJob)
     def post_import_retry(job_id: str):

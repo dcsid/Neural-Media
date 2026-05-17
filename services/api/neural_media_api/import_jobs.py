@@ -207,6 +207,22 @@ class ImportJobsStore:
             conn.close()
         return _decode_row(row) if row else None
 
+    def latest(self) -> ImportJob | None:
+        """Most-recently-created job, regardless of status.
+
+        Used by the /debug endpoint to surface the latest import for
+        diagnostics. Returns None if the table is empty.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM import_jobs "
+                "ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+        return _decode_row(row) if row else None
+
     def mark_orphans_failed(self) -> int:
         """At startup, any non-terminal row left over from a crashed
         prior process is no longer actually running. Flip them to
@@ -340,6 +356,13 @@ class ImportRunner:
         ``parse_export``'s docstring for the window semantics.
         """
         job = self._claim_slot(mode=mode, source_filename=source_filename)
+        _log.info(
+            "event=import_submitted op=ingest job_id=%s mode=%s "
+            "source_filename=%s since=%s until=%s",
+            job.id, mode, source_filename or "",
+            since.isoformat() if since else "",
+            until.isoformat() if until else "",
+        )
         thread = threading.Thread(
             target=self._run,
             kwargs=dict(
@@ -375,6 +398,11 @@ class ImportRunner:
         job = self._claim_slot(
             mode=prev.mode,
             source_filename=prev.source_filename,
+        )
+        _log.info(
+            "event=import_submitted op=retry job_id=%s prev_job_id=%s "
+            "mode=%s source_filename=%s",
+            job.id, prev_job_id, prev.mode, prev.source_filename or "",
         )
         thread = threading.Thread(
             target=self._run,

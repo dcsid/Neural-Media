@@ -13,7 +13,19 @@ dependencies = [
 real = [
   "torch>=2.3",
   "transformers>=4.42",
+  "huggingface-hub>=0.24",
   "pyarrow>=15",
+  # TRIBE v2 isn't on PyPI — pull directly from facebookresearch.
+  # CC-BY-NC-4.0; depends on LLaMA 3.2 / V-JEPA2 / Wav2Vec-BERT weights
+  # fetched at first use via huggingface_hub.
+  "tribev2 @ git+https://github.com/facebookresearch/tribev2",
+]
+atlas-build = [
+  # Build-time only — used by scripts/build_region_masks.py to (re)generate
+  # data/region_masks.json. End users never need these; the committed JSON
+  # is the contract.
+  "mne>=1.6",
+  "nibabel>=5.0",
 ]
 dev = [
   "pytest>=8",
@@ -27,6 +39,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["neural_media_inference*"]
+
+[tool.setuptools.package-data]
+neural_media_inference = ["data/*.json"]
 
 [tool.ruff]
 line-length = 100

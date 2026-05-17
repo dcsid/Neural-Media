@@ -20,6 +20,7 @@ compare against the same ground truth.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +30,17 @@ import pytest
 from neural_media_api.sqlite_store import init_db
 from neural_media_pipeline import stable_video_id, stable_watch_event_id
 from shared.schemas import NUM_VERTICES
+
+# Match the importer's author-extraction regex so the SqliteStore
+# fixture rows carry the same authors SampleStore derives via
+# parse_export. Without this, by_author tests would see populated
+# authors on the sample store and only the None-bucket on sqlite.
+_AUTHOR_RE = re.compile(r"/@([^/]+)/")
+
+
+def _author_from_url(url: str) -> str | None:
+    m = _AUTHOR_RE.search(url)
+    return m.group(1) if m else None
 
 
 def _parse_ts(ts: str) -> datetime:
@@ -143,11 +155,21 @@ def _index() -> dict:
 
 
 def _tiktok_export() -> dict:
-    """The shape `neural_media_pipeline.parse_export` reads."""
+    """The shape `neural_media_pipeline.parse_export` reads.
+
+    Includes `DurationWatchedSeconds` per event so SampleStore-backed
+    tests see realistic per-event durations (parse_export sets
+    `VideoMetadata.duration_s` to 0 — the SqliteStore fixture would
+    otherwise carry richer per-event timing than the sample one).
+    """
     video_list = []
     for v in _VIDEOS:
         for ts in v["watched_at"]:
-            video_list.append({"Date": ts, "Link": v["source_url"]})
+            video_list.append({
+                "Date": ts,
+                "Link": v["source_url"],
+                "DurationWatchedSeconds": v["duration_s"],
+            })
     return {
         "Activity": {
             "Video Browsing History": {"VideoList": video_list},
@@ -223,7 +245,8 @@ def populated_sqlite_db(tmp_path: Path) -> Path:
                 "(id, source_url, title, author, duration_s, downloaded, "
                 " local_path, tags_json, first_seen_idx) "
                 "VALUES (?,?,?,?,?,?,?,?,?)",
-                (vid, v["source_url"], None, None, v["duration_s"], 0, None, "[]", idx),
+                (vid, v["source_url"], None, _author_from_url(v["source_url"]),
+                 v["duration_s"], 0, None, "[]", idx),
             )
             for ts in v["watched_at"]:
                 dt = _parse_ts(ts)

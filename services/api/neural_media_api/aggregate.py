@@ -13,12 +13,20 @@ from __future__ import annotations
 from collections import OrderedDict
 
 from .schemas_re_export import (
+    REGION_IDS,
     AggregateBucket,
     AggregateReport,
+    AuthorBucket,
     ClusterSummary,
     RegionMetrics,
 )
 from .store import Store
+
+# Cap on the by_author leaderboard. The dashboard renders the top 8 by
+# default; 20 lets the future "show all" affordance stay client-side
+# without a second request, while keeping JSON payloads small even on
+# 10k+ unique-creator histories.
+_AUTHOR_TOP_N = 20
 
 
 def _video_mean_activation(metrics: list[RegionMetrics]) -> float:
@@ -129,6 +137,89 @@ def _compute_aggregate(store: Store) -> AggregateReport:
         (day_sum[i] / day_count[i]) if day_count[i] else 0.0 for i in range(7)
     ]
 
+    # by_author: per-creator rollup capped at top-20. See CONTRACTS.md §6
+    # and docs/worker-briefs/aggregate-by-author-proposal.md.
+    #
+    # videos:           distinct videos attributed to this author. Rewatches
+    #                   collapse into one row — the leaderboard tracks who
+    #                   shows up in the catalog, not impression rate.
+    # total_watch_time_s: sums duration_watched_s per rewatch, falling back
+    #                   to VideoMetadata.duration_s when null (the export
+    #                   rarely carries the per-event field).
+    # mean_activation:  average across the author's videos of each video's
+    #                   per-region mean averaged across all 8 regions.
+    # top_region:       region with the highest per-author PEAK across that
+    #                   author's videos (comparative claim — matches
+    #                   docs/scientific-framing.md).
+    #
+    # author=None covers videos whose URL didn't carry an @handle (e.g.
+    # tiktokv.com/share/video/<id>/ share-shortlinks). Surfaced as a real
+    # row so the user can see the bucket size; suppressed from the
+    # frontend's leaderboard view if the placeholder UX prefers.
+    rewatch_count: dict[str | None, int] = {}  # noqa: F841 (tracks rewatches only)
+    author_videos: dict[str | None, set[str]] = {}
+    author_watch_s: dict[str | None, float] = {}
+    author_video_means: dict[str | None, list[float]] = {}
+    author_region_peaks: dict[str | None, dict[str, float]] = {}
+
+    video_by_id = {v.id: v for v in videos}
+    for we in watch_events:
+        v = video_by_id.get(we.video_id)
+        if v is None:
+            continue
+        author = v.author  # may be None
+        author_videos.setdefault(author, set()).add(v.id)
+        author_watch_s[author] = author_watch_s.get(author, 0.0) + (
+            we.duration_watched_s
+            if we.duration_watched_s is not None
+            else video_duration.get(we.video_id, 0.0)
+        )
+
+    for author, vid_ids in author_videos.items():
+        means: list[float] = []
+        region_peaks: dict[str, float] = {}
+        for vid_id in vid_ids:
+            mrows = store.get_metrics(vid_id)
+            if mrows:
+                means.append(_video_mean_activation(mrows))
+                for m in mrows:
+                    prev = region_peaks.get(m.region_id, float("-inf"))
+                    if m.peak > prev:
+                        region_peaks[m.region_id] = m.peak
+        author_video_means[author] = means
+        author_region_peaks[author] = region_peaks
+
+    by_author: list[AuthorBucket] = []
+    for author, vid_ids in author_videos.items():
+        means = author_video_means.get(author, [])
+        mean_activation = sum(means) / len(means) if means else 0.0
+        peaks = author_region_peaks.get(author, {})
+        # Prefer a region the catalog actually has metrics for; fall back
+        # to the first canonical region if this author's videos have no
+        # metrics yet (an inference run could still be pending).
+        top_region = (
+            max(peaks.items(), key=lambda kv: kv[1])[0]
+            if peaks
+            else REGION_IDS[0]
+        )
+        by_author.append(
+            AuthorBucket(
+                author=author,
+                videos=len(vid_ids),
+                total_watch_time_s=author_watch_s.get(author, 0.0),
+                mean_activation=mean_activation,
+                top_region=top_region,
+            )
+        )
+
+    # videos desc, then total_watch_time_s desc, then author asc.
+    # `author=None` sorts after all string handles (None → empty string for
+    # the tertiary key) so the leaderboard prefers attributable rows.
+    by_author.sort(
+        key=lambda a: (-a.videos, -a.total_watch_time_s, a.author or "~")
+    )
+    by_author = by_author[:_AUTHOR_TOP_N]
+
     # Clusters: not computed yet — the ml-inference worker will own this.
     # Return an empty list rather than a fake cluster so the frontend can
     # show an honest "no clusters yet" state.
@@ -142,6 +233,7 @@ def _compute_aggregate(store: Store) -> AggregateReport:
         by_region=by_region,
         by_hour_of_day=by_hour_of_day,
         by_day_of_week=by_day_of_week,
+        by_author=by_author,
         clusters=clusters,
     )
 

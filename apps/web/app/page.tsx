@@ -121,7 +121,7 @@ export default async function DashboardPage() {
 
         <DayStrip byDayOfWeek={aggregate.by_day_of_week} />
 
-        <AuthorPlaceholder />
+        <AuthorPlaceholder byAuthor={aggregate.by_author} />
 
         <section className="motion-fade-in border-t border-line py-10">
           <p className="eyebrow">Brain mesh</p>

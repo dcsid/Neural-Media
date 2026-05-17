@@ -74,8 +74,18 @@ def _compute_aggregate(store: Store) -> AggregateReport:
     }
 
     total_videos = len({we.video_id for we in watch_events}) or len(videos)
+
+    # TikTok's export almost never includes per-event watch durations
+    # (the `duration_watched_s` column is null for the vast majority of
+    # rows). Fall back to the underlying video's `duration_s` so the
+    # dashboard's "watch time" stat reflects a meaningful upper bound
+    # ("if you watched each video to completion") instead of a flat 0.
+    video_duration: dict[str, float] = {v.id: v.duration_s for v in videos}
     total_watch_time_s = sum(
-        (we.duration_watched_s or 0.0) for we in watch_events
+        we.duration_watched_s
+        if we.duration_watched_s is not None
+        else video_duration.get(we.video_id, 0.0)
+        for we in watch_events
     )
 
     sorted_watch = sorted(watch_events, key=lambda we: we.watched_at)

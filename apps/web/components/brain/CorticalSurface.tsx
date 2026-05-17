@@ -211,6 +211,13 @@ export function CorticalSurface({
       }
 
       const regionIdx = vertexRegions[best];
+      // 255 = "unassigned" in the .regions.bin convention (see
+      // build_regions_bin.py:UNASSIGNED). HCP-MMP1 only covers ~18.6%
+      // of cortical vertices — the eight canonical TRIBE regions — so
+      // roughly four hovers in five land outside any curated parcel.
+      // Suppress the tooltip in that case rather than show a stand-in
+      // value: we have no calibrated activation for those vertices and
+      // a "—" readout would imply we do.
       if (regionIdx === 255) {
         onHover(null);
         return;

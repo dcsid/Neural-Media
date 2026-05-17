@@ -8,9 +8,20 @@ PNPM ?= pnpm
 REPO_ROOT := $(shell pwd)
 DB_PATH ?= $(REPO_ROOT)/data/sqlite/neural_media.db
 
+# Every Python package in this repo (pipeline, api, inference) is exposed
+# to children via PYTHONPATH rather than relying on the editable .pth files
+# pip drops into site-packages. macOS's sandbox occasionally marks those
+# .pth files with the UF_HIDDEN flag, and Python's site.py silently skips
+# hidden .pth files — so editable installs vanish from import resolution
+# even though `pip list` still claims them. PYTHONPATH bypasses the .pth
+# mechanism entirely and is reliable across reboots, reinstalls, and
+# sandbox re-scans. The `unhide-pth` target is the manual escape hatch
+# for the cases where you're invoking python directly without `make`.
+export PYTHONPATH := $(REPO_ROOT)/services/pipeline:$(REPO_ROOT)/services/api:$(REPO_ROOT)/services/inference
+
 .PHONY: help install install-python install-web sample ingest init-db \
         dev dev-api dev-api-mock dev-web test test-python test-web \
-        typecheck-web clean
+        typecheck-web clean unhide-pth
 
 help:
 	@echo "Neural Media — make targets"
@@ -26,6 +37,7 @@ help:
 	@echo "  make test            run all tests"
 	@echo "  make typecheck-web   tsc --noEmit for the web app"
 	@echo "  make clean           remove generated artifacts (videos, activations, db)"
+	@echo "  make unhide-pth      strip macOS UF_HIDDEN from editable .pth files"
 
 # -----------------------------------------------------------------------------
 # Install
@@ -81,8 +93,9 @@ dev:
 # dev-api: SqliteStore by default so drag-and-drop imports show up live on
 # the dashboard without restarting the server. The DB is auto-initialised
 # on first POST to /api/v1/import — `make init-db` is optional.
+# DB_PATH is quoted because the repo path may contain spaces (e.g. "Spring 2026").
 dev-api:
-	cd services/api && NEURAL_MEDIA_DB_PATH=$(DB_PATH) \
+	cd services/api && NEURAL_MEDIA_DB_PATH="$(DB_PATH)" \
 	  uvicorn neural_media_api.main:app \
 	  --host 127.0.0.1 --port 8000 --reload
 
@@ -117,3 +130,22 @@ typecheck-web:
 clean:
 	rm -rf data/videos/* data/activations/* data/sqlite/*
 	@echo "Cleared user data. (Sample fixtures under data/sample/ are kept.)"
+
+# -----------------------------------------------------------------------------
+# macOS sandbox helper.
+#
+# pip occasionally writes editable .pth files into site-packages with the
+# UF_HIDDEN BSD flag set. Python's site.py skips hidden .pth files for
+# security, which makes editable installs vanish from import resolution.
+# This target strips the flag so the editable installs become visible
+# again. Idempotent. No-op on non-macOS.
+# -----------------------------------------------------------------------------
+
+unhide-pth:
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+	  find "$(REPO_ROOT)/.venv-dev/lib" -name '__editable__*.pth' \
+	    -exec chflags nohidden {} + 2>/dev/null && \
+	  echo "unhid editable .pth files under .venv-dev/lib/"; \
+	else \
+	  echo "skipped (sandbox UF_HIDDEN issue is macOS-specific)"; \
+	fi

@@ -30,6 +30,7 @@ land in ``[0, 1]`` while preserving comparative order (the only thing
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,8 @@ from typing import Any
 import numpy as np
 
 from ._shared import NUM_VERTICES
+
+_log = logging.getLogger(__name__)
 
 # All heavyweight imports (torch, tribev2, huggingface_hub) are deferred
 # to instantiation/inference time so importing this module on a mock-only
@@ -67,6 +70,12 @@ def _import_heavies() -> _LazyImports:
             "`pip install -e '.[real]'` (this pulls torch + tribev2)."
         ) from e
     return _LazyImports(torch=torch, TribeModel=TribeModel, HfApi=HfApi)
+
+
+# Class-level latch so the "wider than 20484 cortical vertices" warning fires
+# exactly once per process — once a real-mode user sees the message they don't
+# need it re-emitted on every video.
+_WARNED_WIDER_THAN_CORTEX = False
 
 
 class TribeBackend:
@@ -205,8 +214,25 @@ class TribeBackend:
                 f"TRIBE returned unexpected shape {preds.shape}; "
                 f"expected (T, >={NUM_VERTICES})"
             )
-        # If TRIBE emits cortex+subcortical, take the cortical prefix
-        # (CONTRACTS.md §4: we only ship the 20,484 cortical vertices).
+        # If TRIBE emits more than the cortical vertices, we take the leading
+        # NUM_VERTICES columns and assume lh[0:10242] then rh[10242:20484]
+        # (the assumption region_masks.json was built against). The upstream
+        # README documents fsaverage5 (~20k) but does not commit to hemisphere
+        # ordering — see docs/worker-briefs/ml-inference-status.md "Open items".
+        # If a real-mode user sees this warning, run the smoke check from
+        # docs/real-mode-setup.md before trusting region aggregates.
+        global _WARNED_WIDER_THAN_CORTEX
+        if preds.shape[1] > NUM_VERTICES and not _WARNED_WIDER_THAN_CORTEX:
+            _log.warning(
+                "TRIBE preds.shape=%s wider than NUM_VERTICES=%d. Taking the "
+                "leading %d columns as cortical vertices (assumed lh then rh). "
+                "If region aggregates look off, verify hemisphere ordering — see "
+                "docs/worker-briefs/ml-inference-status.md 'Open items'.",
+                tuple(preds.shape),
+                NUM_VERTICES,
+                NUM_VERTICES,
+            )
+            _WARNED_WIDER_THAN_CORTEX = True
         cortex = preds[:, :NUM_VERTICES].astype(np.float32, copy=False)
 
         # Z-scored BOLD → [0, 1] via logistic sigmoid (see module docstring).

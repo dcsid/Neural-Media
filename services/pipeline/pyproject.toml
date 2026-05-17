@@ -9,7 +9,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# yt-dlp + ffmpeg deps land with the downloader / preprocess modules.
+# Real network/media tooling. Tests monkeypatch the network seam, so
+# yt-dlp is not required to run the test suite — install it only when
+# you actually need to pull videos. ffmpeg comes from the system (brew
+# install ffmpeg); we shell out to it rather than wrapping a binding.
+download = [
+  "yt-dlp>=2024.5",
+]
 dev = [
   "pytest>=8",
   "ruff>=0.5",

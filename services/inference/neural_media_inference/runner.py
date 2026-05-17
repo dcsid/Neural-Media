@@ -93,6 +93,7 @@ def run_inference(
     num_keyframes: int = DEFAULT_NUM_KEYFRAMES,
     run_id: str | None = None,
     created_at: datetime | None = None,
+    compress: bool = True,
 ) -> RunArtifacts:
     backend = backend if backend is not None else MockBackend()
     activations_dir = Path(activations_dir)
@@ -150,7 +151,12 @@ def run_inference(
 
     activation_path = activations_dir / f"{run_id}.npz"
     sidecar_path = activations_dir / f"{run_id}.meta.json"
-    np.savez_compressed(activation_path, activations=activations)
+    # `compress=False` is the demo / mock-mode escape hatch — `savez` is
+    # ~25× faster than `savez_compressed` on a (T, 20484) fp32 tensor, at
+    # the cost of ~2× disk. Production callers (real TRIBE, real user
+    # data) leave the default on so on-disk activations stay compact.
+    save_fn = np.savez_compressed if compress else np.savez
+    save_fn(activation_path, activations=activations)
 
     sidecar = ActivationSidecar(
         inference_run_id=run_id,

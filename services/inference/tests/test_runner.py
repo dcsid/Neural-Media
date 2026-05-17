@@ -94,6 +94,30 @@ def test_activation_payload_has_keyframes_and_region_means(tmp_path):
         assert len(vec) == NUM_VERTICES
 
 
+def test_compress_false_writes_uncompressed_and_round_trips(tmp_path):
+    """`compress=False` is the demo/mock-mode escape hatch — must produce a
+    valid NPZ that still round-trips through np.load, just larger on disk."""
+    kwargs = dict(
+        video_id="vid-compress",
+        duration_s=12.0,
+        seed=4,
+        sample_rate_hz=1.5,
+        backend=MockBackend(),
+    )
+    fast = run_inference(activations_dir=tmp_path / "fast", compress=False, **kwargs)
+    small = run_inference(activations_dir=tmp_path / "small", compress=True, **kwargs)
+
+    fast_arr = np.load(fast.activation_path)["activations"]
+    small_arr = np.load(small.activation_path)["activations"]
+    assert np.array_equal(fast_arr, small_arr)
+    assert fast_arr.dtype == np.float32
+
+    # Uncompressed NPZ should be strictly larger than compressed for a
+    # smooth fp32 signal. This is the regression guard: if the savez
+    # dispatch ever flips, file sizes invert.
+    assert fast.activation_path.stat().st_size > small.activation_path.stat().st_size
+
+
 def test_fixture_overrides_make_run_deterministic(tmp_path):
     from datetime import datetime, timezone
     fixed_run_id = "00000000-0000-0000-0000-000000000abc"

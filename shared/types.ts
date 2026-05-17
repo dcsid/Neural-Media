@@ -94,6 +94,18 @@ export interface ClusterSummary {
   exemplar_video_ids: string[];
 }
 
+// Per-author rollup for the dashboard's "who you watch" panel.
+// `top_region` is the region with the highest per-author peak across
+// the author's videos. Capped at top 20 by `videos` desc. See
+// CONTRACTS.md §6 and docs/worker-briefs/aggregate-by-author-proposal.md.
+export interface AuthorBucket {
+  author: string | null;
+  videos: number;
+  total_watch_time_s: number;
+  mean_activation: number;
+  top_region: RegionId;
+}
+
 export interface AggregateReport {
   total_videos: number;
   total_watch_time_s: number;
@@ -102,6 +114,7 @@ export interface AggregateReport {
   by_region: Record<RegionId, AggregateBucket>;
   by_hour_of_day: number[]; // length 24
   by_day_of_week: number[]; // length 7  (Mon=0)
+  by_author: AuthorBucket[]; // may be empty until aggregator ships
   clusters: ClusterSummary[];
 }
 
@@ -171,6 +184,19 @@ export interface ImportJob {
 }
 
 // ---------------------------------------------------------------------------
+// Capabilities (GET /api/v1/capabilities) — what the backend can run on the
+// current host. `real_blockers` is a list of short tokens (e.g.
+// "missing-extra", "missing-ffmpeg", "missing-yt-dlp", "missing-gpu") when
+// `real` is false.
+// ---------------------------------------------------------------------------
+
+export interface Capabilities {
+  mock: boolean;
+  real: boolean;
+  real_blockers: string[];
+}
+
+// ---------------------------------------------------------------------------
 // API endpoint paths — used by the frontend, kept here so the contract is
 // type-checked.
 // ---------------------------------------------------------------------------
@@ -189,4 +215,5 @@ export const ENDPOINTS = {
   inferenceRuns: `${API_BASE}/inference-runs`,
   importStart: `${API_BASE}/import`,
   importJob: (id: string) => `${API_BASE}/import/${id}`,
+  capabilities: `${API_BASE}/capabilities`,
 } as const;

@@ -153,11 +153,33 @@ User-level rollup across the full history. Computed on demand.
   },
   "by_hour_of_day": [ /* 24 floats, mean engagement */ ],
   "by_day_of_week": [ /*  7 floats, mean engagement */ ],
+  "by_author": [
+    {
+      "author": "chefcorpus",
+      "videos": 12,
+      "total_watch_time_s": 420.5,
+      "mean_activation": 0.42,
+      "top_region": "ffa"
+    }
+  ],
   "clusters": [
     { "cluster_id": 0, "size": 12, "exemplar_video_ids": ["..."] }
   ]
 }
 ```
+
+`by_author` is **capped at the top 20** authors and sorted by
+`videos` desc, then `total_watch_time_s` desc, then `author` asc.
+`author` is the TikTok handle without the leading `@`, or `null`
+when the URL didn't carry one (e.g. `tiktokv.com/share/video/<id>/`
+share-shortlinks). `videos` counts distinct videos, not impressions
+— rewatches collapse into one row. `top_region` is the region with
+the highest per-author **peak** across that author's videos
+(comparative claim, per `docs/scientific-framing.md`).
+
+May be empty (`[]`) until the aggregator implementation ships; the
+frontend's `AuthorPlaceholder` component handles the transitional
+state. See `docs/worker-briefs/aggregate-by-author-proposal.md`.
 
 ## 7. API Endpoints
 
@@ -178,29 +200,82 @@ default and reject `Host` headers other than `localhost`/`127.0.0.1`.
 | GET    | `/api/v1/inference-runs`          | `InferenceRun[]`                 |
 | POST   | `/api/v1/import`                  | `ImportJob` (see §8)             |
 | GET    | `/api/v1/import/{job_id}`         | `ImportJob`                      |
+| POST   | `/api/v1/import/{job_id}/retry`   | `ImportJob` (new, re-drives `run_pending`) |
+| GET    | `/api/v1/capabilities`            | `Capabilities` (see §10)         |
 
 The frontend MUST use only these endpoints. The frontend MUST NOT read files
 from the filesystem directly. If you find yourself wanting to, add a new
 endpoint here first.
 
-CORS: `GET` is the default. `/api/v1/import` is the only non-GET surface
-and is the only reason api-orchestrator's `allow_methods` includes `POST`.
+CORS: `GET` is the default. `/api/v1/import*` are the only non-GET surfaces
+and are the only reason api-orchestrator's `allow_methods` includes `POST`.
 
 ## 8. ImportJob
 
 `POST /api/v1/import` accepts a single file in `multipart/form-data` under
-the field name `file`. The file is either:
+the field name `file`. The file is one of:
 
-- A raw TikTok `user_data.json`, **or**
+- A raw TikTok `user_data.json` (older exports), **or**
+- A TikTok `Watch History.txt` (newer exports — flat `Date:`/`Link:`
+  blocks; auto-detected by the `.txt` extension), **or**
 - A TikTok export `.zip` archive — the orchestrator reads `user_data.json`
   in memory from the archive at any depth.
 
 Optional form field `mode` (default `"mock"`):
 
 - `mock` — orchestrator runs with `MockBackend`, skips yt-dlp + ffmpeg.
-  Demo path. Completes in seconds, no GPU.
+  Demo path. Completes in seconds, no GPU. **Predictions are synthetic,
+  deterministic from `SHA-256(video_id, seed)` — the video is never
+  downloaded or read.** See `docs/scientific-framing.md`.
 - `real` — full pipeline: yt-dlp → ffmpeg → `TribeBackend`. Requires
-  `pip install '.[real]'`; 400 if the extra isn't installed.
+  `pip install '.[real]'` + a GPU + license acceptance on HuggingFace.
+  The endpoint returns 400 with structured `error_code` (see below) if
+  any of these prerequisites are missing. The frontend should consult
+  `/api/v1/capabilities` (§10) to pre-empt this.
+
+Optional date-window form fields cap the events the importer pulls out
+of the export before yt-dlp ever runs. Use these to keep the inference
+workload tractable on long histories:
+
+- `since` (ISO-8601 UTC, e.g. `2026-05-17T03:11:00Z`) — drop events
+  strictly before this timestamp.
+- `until` (ISO-8601 UTC) — drop events at or after this timestamp
+  (half-open upper bound).
+- `days` (int) — convenience for "last N days." Equivalent to setting
+  `since = now - N days`. Wins over `since` when both are sent. `0` or
+  negative disables the window.
+
+Malformed `since`/`until` returns 400 with `error_code=since_unparseable`.
+
+## 8.1. Error envelope (POST surfaces)
+
+Errors from POST endpoints include a machine-readable `error_code`
+alongside the human-readable `detail`:
+
+```json
+{
+  "detail": "real mode requires the [real] inference extra: pip install 'neural-media-inference[real]'",
+  "error_code": "real_extra_missing"
+}
+```
+
+Frontend uses `error_code` for branching UI; `detail` is for display.
+Defined codes:
+
+| `error_code`              | Status | Meaning                                       |
+|---------------------------|--------|-----------------------------------------------|
+| `file_extension_rejected` | 400    | Uploaded file is not `.json`/`.zip`/`.txt`    |
+| `since_unparseable`       | 400    | `since`/`until` not ISO-8601 / `YYYY-MM-DD`  |
+| `real_extra_missing`      | 400    | `[real]` Python extra not installed           |
+| `real_no_gpu`             | 400    | No CUDA device available                      |
+| `real_no_ffmpeg`          | 400    | ffmpeg not on PATH                            |
+| `real_no_yt_dlp`          | 400    | yt-dlp not on PATH                            |
+| `job_not_found`           | 404    | Retry against unknown job id                  |
+| `job_not_retryable`       | 409    | Retry against a `complete` job (only `failed`/`partial` qualify) |
+
+GET endpoints continue to use the FastAPI default `{"detail": "..."}`
+envelope; new codes only attach to POST routes where the frontend
+needs to branch.
 
 The endpoint returns 200 immediately with an `ImportJob` whose status is
 `queued`. Frontend polls `GET /api/v1/import/{job_id}` until status flips
@@ -266,3 +341,56 @@ Every `InferenceRun` MUST log:
 This is non-negotiable — it is the difference between "ran a model" and "did
 science with a model." The mock inference service must also obey this so the
 contract is exercised end-to-end before TRIBE arrives.
+
+## 10. Capabilities
+
+`GET /api/v1/capabilities` reports which modes will actually run on the
+current host. Frontend consults this on `/import` mount to disable the
+Real toggle (with a tooltip explaining why) before the user wastes a
+submission.
+
+```json
+{
+  "mock": true,
+  "real": false,
+  "real_blockers": ["missing-extra", "missing-ffmpeg", "missing-yt-dlp"]
+}
+```
+
+`mock` is currently always `true` — the `MockBackend` ships in the base
+install and has no external dependencies.
+
+`real` is `true` iff `real_blockers` is empty. Each blocker is a short
+token from `{missing-extra, missing-ffmpeg, missing-yt-dlp,
+missing-gpu}`, listed in priority order (most-fundamental first). The
+priority order also governs which token becomes the `error_code` on a
+real-mode POST when prerequisites are missing.
+
+| `real_blockers` token | Remediation                                          |
+|-----------------------|------------------------------------------------------|
+| `missing-extra`       | `pip install -e 'services/inference[real]'`          |
+| `missing-ffmpeg`      | `brew install ffmpeg` (or distro equivalent)         |
+| `missing-yt-dlp`      | `pip install yt-dlp` (pulled by `[real]` extra)      |
+| `missing-gpu`         | Use a CUDA host; CPU is technically possible but glacial |
+
+Mirrors `Capabilities` in `shared/types.ts` and `shared.schemas.Capabilities`.
+
+## 11. Retry semantics
+
+`POST /api/v1/import/{job_id}/retry` re-drives the orchestrator's
+`run_pending()` against a previously-submitted import job. The original
+file does not need to be re-uploaded — `pipeline_jobs` rows survive
+across runs.
+
+Allowed: `status in {failed, partial}`. Anything else returns 409 with
+`error_code=job_not_retryable`. Unknown ids return 404 with
+`error_code=job_not_found`.
+
+Same singleton-gate semantics as the original POST: if another job is
+in flight, returns 409 with the in-flight `ImportJob` as the literal
+body (not an error envelope), so the frontend can pick up the id and
+resume polling.
+
+On success, returns 200 with a **new** `ImportJob` (new `id`) whose
+`status` starts at `queued`. The old job's row stays where it was so
+the history isn't lost.

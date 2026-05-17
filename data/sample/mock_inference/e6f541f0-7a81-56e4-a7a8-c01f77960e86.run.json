@@ -1,13 +1,13 @@
 {
-  "id": "1d458bee-3a31-5846-ae26-0e69c3a9a8da",
-  "video_id": "afe47531-55e4-5d69-a78a-345726166148",
+  "id": "40fe0473-41f7-568f-8255-c63b154c64c9",
+  "video_id": "e6f541f0-7a81-56e4-a7a8-c01f77960e86",
   "model_id": "tribe-v2-mock",
   "model_version": "0.0.0-mock",
   "seed": 7,
   "params_json": {
-    "duration_s": 26.0,
+    "duration_s": 60.0,
     "sample_rate_hz": 1.5,
-    "num_timepoints": 39,
+    "num_timepoints": 90,
     "preprocessing": {
       "video_resolution": "224x224",
       "video_fps": 8,
@@ -15,9 +15,9 @@
       "source_url": "https://www.tiktok.com/@chefcorpus/video/7300000000000000002"
     },
     "created_at_utc": "2026-05-16T00:00:00+00:00",
-    "config_hash": "ee6474ff940380dfe723eb235ff38779a6d25e41c1b5390ddd1764d530633718"
+    "config_hash": "927ac40a42a825f107d5814909ae9aa753dda369422380ffa14f565d04b59d96"
   },
   "created_at": "2026-05-16T00:00:00Z",
-  "activation_path": "/Users/siddus/Documents/UVAWork/Spring 2026/Neural-Media-ml-inference/data/sample/activations/1d458bee-3a31-5846-ae26-0e69c3a9a8da.npz",
+  "activation_path": "/Users/siddus/Documents/UVAWork/Spring 2026/Neural-Media/data/sample/activations/40fe0473-41f7-568f-8255-c63b154c64c9.npz",
   "status": "complete"
 }

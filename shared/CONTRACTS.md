@@ -125,6 +125,17 @@ The canonical region set:
 `timeseries` is the per-region mean activation at each timepoint (so its
 length equals `num_timepoints` in the sidecar).
 
+`REGION_VERTEX_MASKS` (the vertex-index sets backing the regions above)
+are **disjoint** per-region index sets — no vertex appears in two
+regions. Their union MAY be a strict subset of `[0, NUM_VERTICES)`:
+vertices outside the eight curated regions (medial wall; motor,
+parietal, and prefrontal-control parcels not on the canonical list)
+are intentionally unassigned. Implementations using a real cortical
+atlas (HCP-MMP1 / Glasser, Destrieux, Yeo7/17, etc.) will report
+coverage well below 100% — this is correct anatomy, not a contract
+violation. The brain-viz worker handles unassigned vertices via a
+sentinel value (`255`) in `fsaverage5.regions.bin`.
+
 ## 6. AggregateReport
 
 User-level rollup across the full history. Computed on demand.

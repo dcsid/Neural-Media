@@ -78,10 +78,8 @@ export default async function DashboardPage() {
           <div>
             <BrainMeshSlot activation={meanActivation} />
             <p className="mt-3 text-[11px] text-ink-400">
-              Predicted average BOLD response across cortical regions.
-              Falls back to a low-poly placeholder until{" "}
-              <code className="font-mono">/brain/fsaverage5.glb</code>{" "}
-              is committed.
+              Predicted average BOLD response across cortical regions on
+              the fsaverage5 surface (20,484 vertices).
             </p>
           </div>
         </section>

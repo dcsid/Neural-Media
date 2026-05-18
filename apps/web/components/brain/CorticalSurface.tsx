@@ -78,29 +78,51 @@ export function CorticalSurface({
   const invalidate = useThree((s) => s.invalidate);
 
   const { mesh, colorAttr, scratch } = useMemo(() => {
-    // Search by BufferGeometry presence rather than the THREE.Mesh
-    // `isMesh` sentinel. drei v10 / R3F v9 occasionally instantiate
-    // loaded GLB nodes as a class whose `isMesh` flag doesn't survive
-    // the loader pipeline (we hit this with fsaverage5.glb after the
-    // R3F 8→9 upgrade — GLB is well-formed but `isMesh` is falsy).
-    // Any node carrying a BufferGeometry with a `position` attribute
-    // is what the colormap pipeline actually needs.
+    // Find the cortical mesh by duck-typing the geometry, not by class.
+    //
+    // Three earlier strategies failed for the fsaverage5 GLB after the
+    // R3F 8→9 / drei 9→10 upgrade:
+    //   1. `obj.isMesh` (three.js sentinel on Mesh) — falsy on the
+    //      loaded node tree for reasons specific to how drei v10 wraps
+    //      GLTFLoader output for unnamed nodes.
+    //   2. `geometry instanceof THREE.BufferGeometry` — three.js is
+    //      hoisted multiple times by pnpm (one copy for our app, one
+    //      for the older R3F v8 still depended on transitively by
+    //      @react-spring/three). `instanceof` fails across the two
+    //      class instances even though the geometry IS a BufferGeometry.
+    //
+    // The robust check is three.js's own multi-instance-safe sentinel
+    // (`isBufferGeometry === true`) PLUS the structural duck-type for
+    // `getAttribute("position")`. Any node carrying that is the mesh
+    // we want — the colormap pipeline downstream only ever touches
+    // these two methods.
     let found: THREE.Mesh | null = null;
     gltf.scene.traverse((obj) => {
       if (found) return;
       const candidate = obj as THREE.Mesh & {
-        geometry?: THREE.BufferGeometry;
+        geometry?: { isBufferGeometry?: boolean; getAttribute?: (name: string) => unknown };
       };
+      const geom = candidate.geometry;
       if (
-        candidate.geometry instanceof THREE.BufferGeometry &&
-        candidate.geometry.getAttribute("position")
+        geom?.isBufferGeometry === true &&
+        typeof geom.getAttribute === "function" &&
+        geom.getAttribute("position")
       ) {
         found = candidate;
       }
     });
     if (!found) {
+      // Last-ditch diagnostic — dump what's actually in the scene tree
+      // so a future failure has more than "did not contain a mesh".
+      const tree: string[] = [];
+      gltf.scene.traverse((o) => {
+        const g = (o as { geometry?: { type?: string } }).geometry;
+        tree.push(`${o.type ?? "Object3D"}${g ? `[geometry=${g.type ?? "?"}]` : ""}`);
+      });
+      // eslint-disable-next-line no-console
+      console.error("BrainMesh scene contents:", tree);
       throw new Error(
-        `BrainMesh: ${url} did not contain a mesh. Expected fsaverage5 cortical surface.`,
+        `BrainMesh: ${url} did not contain a mesh. Expected fsaverage5 cortical surface. Scene: [${tree.join(", ")}]`,
       );
     }
     const m = found as THREE.Mesh;

@@ -5,20 +5,23 @@ import { ApiOfflineState } from "@/components/ApiOfflineState";
 import { NoVideosState } from "@/components/NoVideosState";
 import { ComparePicker } from "@/components/ComparePicker";
 import { CompareRegionRow } from "@/components/CompareRegionRow";
+import { DemoModeBanner } from "@/components/DemoModeBanner";
 import { videoTitle } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
 
 interface PageProps {
-  searchParams: Promise<{ a?: string; b?: string }>;
+  searchParams: Promise<{ a?: string; b?: string; demo?: string }>;
 }
 
 export default async function ComparePage({ searchParams }: PageProps) {
-  const { a, b } = await searchParams;
+  const { a, b, demo: demoStr } = await searchParams;
+  const demo = demoStr === "1" || demoStr === "true";
   const baseUrl = serverBaseUrl();
+  const opts = { baseUrl, demo };
 
   try {
-    const videos = await api.videos({ baseUrl });
+    const videos = await api.videos(opts);
 
     if (videos.length === 0) {
       return <NoVideosState scope="compare" />;
@@ -45,8 +48,8 @@ export default async function ComparePage({ searchParams }: PageProps) {
 
     const [metricsA, metricsB] = haveBoth
       ? await Promise.all([
-          api.videoMetrics(a!, { baseUrl }).catch(swallow404),
-          api.videoMetrics(b!, { baseUrl }).catch(swallow404),
+          api.videoMetrics(a!, opts).catch(swallow404),
+          api.videoMetrics(b!, opts).catch(swallow404),
         ])
       : [null, null];
 
@@ -63,6 +66,7 @@ export default async function ComparePage({ searchParams }: PageProps) {
 
     return (
       <main className="mx-auto max-w-[1280px] px-8 pb-10 pt-12">
+        {demo ? <DemoModeBanner /> : null}
         <p className="eyebrow mb-4">Compare</p>
         <h1 className="font-serif text-[32px] tracking-tightish text-ink-50">
           Predicted activation, side by side.

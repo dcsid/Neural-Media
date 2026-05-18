@@ -19,7 +19,7 @@ from typing import Literal
 
 _log = logging.getLogger(__name__)
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, Response
@@ -115,6 +115,26 @@ def _select_store() -> Store:
         mock_inference_root=_default_sample_root(),
         tiktok_export_path=_default_export_path(),
     )
+
+
+def _select_demo_store() -> Store | None:
+    """Optional demo store, served when a request carries `?demo=1`.
+
+    Reads from `<repo>/data/demo/sqlite/neural_media.db` by default;
+    overridable via `NEURAL_MEDIA_DEMO_DB_PATH`. Returns None when no
+    demo dataset is on disk — the dependency falls back to the live
+    store in that case so the `?demo=1` toggle is a no-op rather than
+    a 500.
+
+    The demo dataset is a small, curated mock-mode ingest committed
+    under `data/demo/` so a fresh checkout has something browsable
+    without an import. See `docs/demo-dataset.md` for how it's baked.
+    """
+    db_path = os.environ.get("NEURAL_MEDIA_DEMO_DB_PATH")
+    path = Path(db_path) if db_path else _repo_root() / "data" / "demo" / "sqlite" / "neural_media.db"
+    if not path.is_file():
+        return None
+    return SqliteStore(path)
 
 
 def _import_db_path() -> Path:
@@ -275,19 +295,33 @@ def create_app(
     )
 
     app.state.store = store if store is not None else _select_store()
+    app.state.demo_store = _select_demo_store()
     app.state.import_runner = import_runner if import_runner is not None else _build_default_import_runner()
+
+    def pick_store(demo: bool = False) -> Store:
+        """Per-request store selection.
+
+        Every read endpoint takes this as a dependency. When the request
+        carries `?demo=1` AND a demo dataset is on disk, serves from the
+        demo store; otherwise the live store. Falls back silently to live
+        when demo is requested but unavailable so a missing dataset is a
+        graceful no-op, not a 500.
+        """
+        if demo and app.state.demo_store is not None:
+            return app.state.demo_store
+        return app.state.store
 
     @app.get("/api/v1/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
     @app.get("/api/v1/videos", response_model=list[VideoMetadata])
-    def list_videos() -> list[VideoMetadata]:
-        return app.state.store.list_videos()
+    def list_videos(store: Store = Depends(pick_store)) -> list[VideoMetadata]:
+        return store.list_videos()
 
     @app.get("/api/v1/videos/{video_id}", response_model=VideoMetadata)
-    def get_video(video_id: str) -> VideoMetadata:
-        video = app.state.store.get_video(video_id)
+    def get_video(video_id: str, store: Store = Depends(pick_store)) -> VideoMetadata:
+        video = store.get_video(video_id)
         if video is None:
             raise HTTPException(status_code=404, detail="video not found")
         return video
@@ -296,19 +330,23 @@ def create_app(
         "/api/v1/videos/{video_id}/metrics",
         response_model=list[RegionMetrics],
     )
-    def get_video_metrics(video_id: str) -> list[RegionMetrics]:
-        if app.state.store.get_video(video_id) is None:
+    def get_video_metrics(
+        video_id: str, store: Store = Depends(pick_store),
+    ) -> list[RegionMetrics]:
+        if store.get_video(video_id) is None:
             raise HTTPException(status_code=404, detail="video not found")
-        return app.state.store.get_metrics(video_id)
+        return store.get_metrics(video_id)
 
     @app.get(
         "/api/v1/videos/{video_id}/activation",
         response_model=ActivationOutput,
     )
-    def get_video_activation(video_id: str) -> ActivationOutput:
-        if app.state.store.get_video(video_id) is None:
+    def get_video_activation(
+        video_id: str, store: Store = Depends(pick_store),
+    ) -> ActivationOutput:
+        if store.get_video(video_id) is None:
             raise HTTPException(status_code=404, detail="video not found")
-        activation = app.state.store.get_activation(video_id)
+        activation = store.get_activation(video_id)
         if activation is None:
             raise HTTPException(status_code=404, detail="activation not found")
         return activation
@@ -321,16 +359,16 @@ def create_app(
         ]
 
     @app.get("/api/v1/aggregate", response_model=AggregateReport)
-    def get_aggregate() -> AggregateReport:
-        return compute_aggregate(app.state.store)
+    def get_aggregate(store: Store = Depends(pick_store)) -> AggregateReport:
+        return compute_aggregate(store)
 
     @app.get("/api/v1/watch-events", response_model=list[WatchEvent])
-    def list_watch_events() -> list[WatchEvent]:
-        return app.state.store.list_watch_events()
+    def list_watch_events(store: Store = Depends(pick_store)) -> list[WatchEvent]:
+        return store.list_watch_events()
 
     @app.get("/api/v1/inference-runs", response_model=list[InferenceRun])
-    def list_inference_runs() -> list[InferenceRun]:
-        return app.state.store.list_runs()
+    def list_inference_runs(store: Store = Depends(pick_store)) -> list[InferenceRun]:
+        return store.list_runs()
 
     @app.post("/api/v1/import", response_model=ImportJob)
     async def post_import(

@@ -5,14 +5,21 @@ import { WatchedVideosList } from "./WatchedVideosList";
 // before the videos / watch-events fetch resolves. Suspense in the parent
 // shows the skeleton while we wait.
 
-export async function WatchedVideosSection() {
+interface Props {
+  // Forwarded from the dashboard so the watch-history list reads from
+  // the same store the rest of the page is using (live vs demo).
+  demo?: boolean;
+}
+
+export async function WatchedVideosSection({ demo = false }: Props) {
   const baseUrl = serverBaseUrl();
+  const opts = { baseUrl, demo };
   try {
     const [videos, watchEvents] = await Promise.all([
-      api.videos({ baseUrl }),
-      api.watchEvents({ baseUrl }),
+      api.videos(opts),
+      api.watchEvents(opts),
     ]);
-    return <WatchedVideosList videos={videos} watchEvents={watchEvents} />;
+    return <WatchedVideosList videos={videos} watchEvents={watchEvents} demo={demo} />;
   } catch (err) {
     if (err instanceof ApiError) {
       // The dashboard parent already handles offline; here we degrade

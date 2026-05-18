@@ -1,0 +1,9 @@
+{
+  "inference_run_id": "c25d026c-1a43-427d-9508-998423899479",
+  "video_id": "2e8aae07-86cb-51d8-83b3-22942aac7e2d",
+  "num_vertices": 20484,
+  "num_timepoints": 45,
+  "sample_rate_hz": 1.5,
+  "model_id": "tribe-v2-mock",
+  "seed": 566110877
+}

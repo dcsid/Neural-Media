@@ -4,6 +4,7 @@ import { api, ApiError, serverBaseUrl } from "@/lib/api";
 import { formatDurationSeconds, videoTitle } from "@/lib/format";
 import { ApiOfflineState } from "@/components/ApiOfflineState";
 import { BrainDetailViewer } from "@/components/BrainDetailViewer";
+import { DemoModeBanner } from "@/components/DemoModeBanner";
 import { RegionReadingsTable } from "@/components/RegionReadingsTable";
 import { StatRow } from "@/components/StatRow";
 
@@ -11,16 +12,20 @@ export const dynamic = "force-dynamic";
 
 interface PageProps {
   params: Promise<{ id: string }>;
+  searchParams: Promise<{ demo?: string }>;
 }
 
-export default async function VideoDetailPage({ params }: PageProps) {
+export default async function VideoDetailPage({ params, searchParams }: PageProps) {
   const { id } = await params;
+  const sp = await searchParams;
+  const demo = sp.demo === "1" || sp.demo === "true";
   const baseUrl = serverBaseUrl();
+  const opts = { baseUrl, demo };
   try {
     const [video, metrics, activation] = await Promise.all([
-      api.video(id, { baseUrl }),
-      api.videoMetrics(id, { baseUrl }),
-      api.videoActivation(id, { baseUrl }),
+      api.video(id, opts),
+      api.videoMetrics(id, opts),
+      api.videoActivation(id, opts),
     ]);
 
     const meanAvg = average(metrics.map((m) => m.mean));
@@ -32,8 +37,9 @@ export default async function VideoDetailPage({ params }: PageProps) {
 
     return (
       <main className="mx-auto max-w-[1280px] px-8 pb-10 pt-12">
+        {demo ? <DemoModeBanner /> : null}
         <Link
-          href="/"
+          href={demo ? "/?demo=1" : "/"}
           className="eyebrow inline-block transition-colors hover:text-ink-100"
         >
           ← Dashboard

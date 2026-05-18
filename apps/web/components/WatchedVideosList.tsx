@@ -5,6 +5,9 @@ import { formatDurationSeconds, videoTitle } from "@/lib/format";
 interface WatchedVideosListProps {
   videos: VideoMetadata[];
   watchEvents: WatchEvent[];
+  // Pass-through: when true, video-detail links carry `?demo=1` so the
+  // user stays in the demo store after clicking through.
+  demo?: boolean;
 }
 
 interface Row {
@@ -13,8 +16,13 @@ interface Row {
   watchCount: number;
 }
 
-export function WatchedVideosList({ videos, watchEvents }: WatchedVideosListProps) {
+export function WatchedVideosList({
+  videos,
+  watchEvents,
+  demo = false,
+}: WatchedVideosListProps) {
   const rows = buildRows(videos, watchEvents);
+  const demoSuffix = demo ? "?demo=1" : "";
 
   return (
     <section className="border-t border-line py-10">
@@ -35,7 +43,7 @@ export function WatchedVideosList({ videos, watchEvents }: WatchedVideosListProp
             <li key={video.id} className="grid grid-cols-[1fr_auto_auto_auto] items-baseline gap-6 py-4">
               <div className="min-w-0">
                 <Link
-                  href={`/v/${video.id}`}
+                  href={`/v/${video.id}${demoSuffix}`}
                   className="block truncate text-ink-50 hover:text-accent"
                 >
                   {videoTitle(video)}

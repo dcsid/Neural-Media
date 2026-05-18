@@ -391,6 +391,18 @@ export default function ImportPage() {
         machine; nothing is uploaded anywhere else.
       </p>
 
+      <p className="mt-4 max-w-[60ch] text-[12px] leading-relaxed text-ink-300">
+        Just looking around?{" "}
+        <a
+          href="/?demo=1"
+          className="text-accent underline underline-offset-2 hover:text-ink-100"
+        >
+          Browse the demo →
+        </a>{" "}
+        — a 15-video curated sample of someone else&apos;s history,
+        already ingested. No file needed, no import required.
+      </p>
+
       <div className="mt-8 grid gap-x-6 gap-y-4 sm:grid-cols-[auto_1fr]">
         <div className="text-[12px] uppercase tracking-wider text-ink-400 sm:pt-2">
           Window

@@ -278,13 +278,23 @@ class SqliteStore:
         if run is None:
             return None
         activation_path = Path(run.activation_path)
+
+        # Fast path: the orchestrator writes the downsampled wire-format
+        # JSON sidecar (`<run_id>.json`) next to the canonical NPZ. When
+        # present, prefer it — it's both correct (literally the wire shape
+        # we return) and lets shipped artefacts (e.g. `data/demo/`) drop
+        # the heavy NPZ while keeping the brain-mesh path live. Matches
+        # the on-disk contract documented in orchestrate.py:_do_inference.
+        sidecar_json = activation_path.parent / f"{run.id}.json"
+        if sidecar_json.is_file():
+            return ActivationOutput.model_validate_json(sidecar_json.read_text())
+
         if not activation_path.is_file():
             return None
 
-        # Lazy import — numpy is in our deps, but neural_media_inference
-        # is a separate worker's package. Importing here keeps the import
-        # surface for catalog-only endpoints small and skips the dep
-        # entirely when get_activation is never called.
+        # Slow path: recompute from the raw NPZ. Lazy-imports numpy +
+        # neural_media_inference so catalog-only endpoints don't pay for
+        # them.
         import numpy as np
         from neural_media_inference import (
             downsample_region_means,

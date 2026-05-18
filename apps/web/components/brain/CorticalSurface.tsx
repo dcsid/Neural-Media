@@ -1,7 +1,7 @@
 "use client";
 
-import { useGLTF } from "@react-three/drei";
-import { useFrame, useThree, type ThreeEvent } from "@react-three/fiber";
+import { useLoader, useFrame, useThree, type ThreeEvent } from "@react-three/fiber";
+import { GLTFLoader, type GLTF } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
 import { NUM_VERTICES, type RegionId } from "@shared/types";
@@ -72,30 +72,24 @@ export function CorticalSurface({
   onReady,
   onHover,
 }: CorticalSurfaceProps) {
-  const gltf = useGLTF(url) as unknown as { scene: THREE.Group };
+  // Use R3F's useLoader with three.js's vanilla GLTFLoader directly,
+  // bypassing drei's useGLTF. drei v10's useGLTF was loading
+  // fsaverage5.glb as an empty Group (no descendants) — likely a
+  // regression in how it handles unnamed nodes — making mesh
+  // traversal find nothing. Vanilla GLTFLoader has been stable since
+  // R3F v5 and reliably populates `gltf.scene` with the full node
+  // tree. The GLB is uncompressed (no Draco / Meshopt extensions per
+  // its JSON chunk), so no extra loader plugins are needed.
+  const gltf = useLoader(GLTFLoader, url) as GLTF;
   const reduceMotion = useReducedMotion();
   const groupRef = useRef<THREE.Group>(null);
   const invalidate = useThree((s) => s.invalidate);
 
   const { mesh, colorAttr, scratch } = useMemo(() => {
-    // Find the cortical mesh by duck-typing the geometry, not by class.
-    //
-    // Three earlier strategies failed for the fsaverage5 GLB after the
-    // R3F 8→9 / drei 9→10 upgrade:
-    //   1. `obj.isMesh` (three.js sentinel on Mesh) — falsy on the
-    //      loaded node tree for reasons specific to how drei v10 wraps
-    //      GLTFLoader output for unnamed nodes.
-    //   2. `geometry instanceof THREE.BufferGeometry` — three.js is
-    //      hoisted multiple times by pnpm (one copy for our app, one
-    //      for the older R3F v8 still depended on transitively by
-    //      @react-spring/three). `instanceof` fails across the two
-    //      class instances even though the geometry IS a BufferGeometry.
-    //
-    // The robust check is three.js's own multi-instance-safe sentinel
-    // (`isBufferGeometry === true`) PLUS the structural duck-type for
-    // `getAttribute("position")`. Any node carrying that is the mesh
-    // we want — the colormap pipeline downstream only ever touches
-    // these two methods.
+    // Search for any descendant carrying a BufferGeometry with a
+    // position attribute. Duck-typed (isBufferGeometry sentinel +
+    // getAttribute method) so multiple hoisted three.js copies in
+    // pnpm's tree don't trip the check.
     let found: THREE.Mesh | null = null;
     gltf.scene.traverse((obj) => {
       if (found) return;
@@ -112,8 +106,6 @@ export function CorticalSurface({
       }
     });
     if (!found) {
-      // Last-ditch diagnostic — dump what's actually in the scene tree
-      // so a future failure has more than "did not contain a mesh".
       const tree: string[] = [];
       gltf.scene.traverse((o) => {
         const g = (o as { geometry?: { type?: string } }).geometry;
@@ -510,7 +502,9 @@ export function CorticalSurface({
 }
 
 export function preloadCorticalSurface(url: string) {
-  useGLTF.preload(url);
+  // Match the loader the component itself uses (useLoader+GLTFLoader,
+  // not drei's useGLTF — see the loader comment in CorticalSurface).
+  useLoader.preload(GLTFLoader, url);
 }
 
 export const EXPECTED_VERTEX_COUNT = NUM_VERTICES;

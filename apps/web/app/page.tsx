@@ -7,7 +7,9 @@ import {
 import { ApiOfflineState } from "@/components/ApiOfflineState";
 import { NoVideosState } from "@/components/NoVideosState";
 import { ImportInProgressState } from "@/components/ImportInProgressState";
+import { BrainDetailViewer } from "@/components/BrainDetailViewer";
 import { BrainMeshSlot } from "@/components/BrainMeshSlot";
+import { ActivationScale } from "@/components/brain";
 import { DayStrip } from "@/components/DayStrip";
 import { WatchedVideosSection } from "@/components/WatchedVideosSection";
 import { WatchedVideosListSkeleton } from "@/components/WatchedVideosListSkeleton";
@@ -80,9 +82,64 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
         0,
       ) / Math.max(1, Object.keys(aggregate.by_region).length);
 
+    // Fetch one representative video's activation so the dashboard can
+    // show the animated brain (per-frame interpolation) alongside the
+    // static aggregate. "Representative" = the first video in catalogue
+    // order whose activation actually loads; if every fetch fails we
+    // just skip the animated mesh and render the static one alone.
+    const videosForAnim = await api.videos(opts).catch(() => []);
+    let animActivation: Awaited<ReturnType<typeof api.videoActivation>> | null = null;
+    let animDurationS = 0;
+    for (const v of videosForAnim.slice(0, 5)) {
+      try {
+        animActivation = await api.videoActivation(v.id, opts);
+        animDurationS = v.duration_s;
+        break;
+      } catch {
+        // Try the next one — purged activations, etc.
+      }
+    }
+
     return (
       <main className="mx-auto max-w-[1280px] px-8 pb-10 pt-12">
         {demo ? <DemoModeBanner /> : null}
+
+        <section className="motion-fade-in">
+          <p className="eyebrow">Brain mesh</p>
+          <h2 className="mt-2 font-serif text-[20px] tracking-tightish text-ink-50">
+            Predicted average BOLD on the fsaverage5 surface
+          </h2>
+          <div className="mt-6 grid gap-6 md:grid-cols-[1fr_1fr_auto] md:items-stretch">
+            <div>
+              <p className="eyebrow mb-2 text-ink-400">Over time · single video</p>
+              {animActivation ? (
+                <BrainDetailViewer
+                  activation={animActivation}
+                  meanActivation={meanActivation}
+                  durationS={animDurationS || animActivation.timestamps.at(-1) || 15}
+                />
+              ) : (
+                <BrainMeshSlot activation={meanActivation} />
+              )}
+            </div>
+            <div>
+              <p className="eyebrow mb-2 text-ink-400">Static · whole window</p>
+              <BrainMeshSlot activation={meanActivation} />
+            </div>
+            <ActivationScale orientation="vertical" />
+          </div>
+          <p className="mt-4 max-w-[70ch] text-[12px] leading-relaxed text-ink-300">
+            Left: predicted activation across one representative video,
+            interpolated per timepoint — drag the scrubber to step through.
+            Right: averaged across the entire window. Same colormap on both
+            so the comparison reads directly. Brighter regions are higher
+            predicted activation.{" "}
+            <span className="text-ink-400">
+              Predicted average — not your individual brain.
+            </span>
+          </p>
+        </section>
+
         <HeroFinding
           totalVideos={aggregate.total_videos}
           totalWatchTimeS={aggregate.total_watch_time_s}
@@ -132,27 +189,25 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
 
         <AuthorPlaceholder byAuthor={aggregate.by_author} />
 
-        <section className="motion-fade-in border-t border-line py-10">
-          <p className="eyebrow">Brain mesh</p>
-          <h2 className="mt-2 font-serif text-[20px] tracking-tightish text-ink-50">
-            Predicted average BOLD on the fsaverage5 surface
-          </h2>
-          <div className="mt-6 grid gap-8 md:grid-cols-[1.4fr_1fr] md:items-center">
-            <BrainMeshSlot activation={meanActivation} />
-            <p className="text-[12px] leading-relaxed text-ink-300">
-              The cortical mesh shows the predicted average BOLD response
-              across 20,484 vertices on the fsaverage5 surface, summarised
-              over your watch history.{" "}
-              <span className="text-ink-400">
-                Predicted average — not your individual brain.
-              </span>
+        {demo ? (
+          // Demo mode hides the raw watch-history list. The URLs in the
+          // baked dataset are real tiktokv.com/share/video/<id> links
+          // from someone else's session — surfacing them to public demo
+          // viewers would leak the source user's history. Aggregates are
+          // fine to show; per-row attribution is not.
+          <section className="motion-fade-in border-t border-line py-10">
+            <p className="eyebrow">Watch history</p>
+            <p className="mt-2 text-[12px] leading-relaxed text-ink-300">
+              Per-video URLs are hidden in demo mode — the underlying
+              videos belong to a real session and aren&apos;t ours to
+              redistribute. Aggregate metrics above cover the full set.
             </p>
-          </div>
-        </section>
-
-        <Suspense fallback={<WatchedVideosListSkeleton />}>
-          <WatchedVideosSection demo={demo} />
-        </Suspense>
+          </section>
+        ) : (
+          <Suspense fallback={<WatchedVideosListSkeleton />}>
+            <WatchedVideosSection demo={demo} />
+          </Suspense>
+        )}
       </main>
     );
   } catch (err) {

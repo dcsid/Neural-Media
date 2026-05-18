@@ -16,14 +16,22 @@ import { HeroFinding } from "@/components/HeroFinding";
 import { RegionLeaderboard } from "@/components/RegionLeaderboard";
 import { HourHistogramAnnotated } from "@/components/HourHistogramAnnotated";
 import { AuthorPlaceholder } from "@/components/AuthorPlaceholder";
+import { DemoModeBanner } from "@/components/DemoModeBanner";
 import { REGION_DESCRIPTIONS, type RegionDef } from "@shared/types";
 
 export const dynamic = "force-dynamic";
 
-export default async function DashboardPage() {
+interface DashboardPageProps {
+  searchParams: Promise<{ demo?: string }>;
+}
+
+export default async function DashboardPage({ searchParams }: DashboardPageProps) {
   const baseUrl = serverBaseUrl();
+  const params = await searchParams;
+  const demo = params.demo === "1" || params.demo === "true";
+  const opts = { baseUrl, demo };
   try {
-    const aggregate = await api.aggregate({ baseUrl });
+    const aggregate = await api.aggregate(opts);
 
     if (aggregate.total_videos === 0) {
       return <NoVideosState scope="dashboard" />;
@@ -40,7 +48,7 @@ export default async function DashboardPage() {
     );
     if (!hasAnyActivation) {
       const inferenceRuns = await api
-        .inferenceRuns({ baseUrl })
+        .inferenceRuns(opts)
         .catch(() => []);
       const processed = new Set(
         inferenceRuns
@@ -59,7 +67,7 @@ export default async function DashboardPage() {
     // so we render with the API's canonical text; if the call fails
     // we fall back to the contract's REGION_DESCRIPTIONS constant.
     const regionDefs: RegionDef[] = await api
-      .regions({ baseUrl })
+      .regions(opts)
       .catch(() => []);
     const descriptions: Record<string, string> = { ...REGION_DESCRIPTIONS };
     for (const def of regionDefs) {
@@ -74,6 +82,7 @@ export default async function DashboardPage() {
 
     return (
       <main className="mx-auto max-w-[1280px] px-8 pb-10 pt-12">
+        {demo ? <DemoModeBanner /> : null}
         <HeroFinding
           totalVideos={aggregate.total_videos}
           totalWatchTimeS={aggregate.total_watch_time_s}
@@ -142,7 +151,7 @@ export default async function DashboardPage() {
         </section>
 
         <Suspense fallback={<WatchedVideosListSkeleton />}>
-          <WatchedVideosSection />
+          <WatchedVideosSection demo={demo} />
         </Suspense>
       </main>
     );

@@ -48,10 +48,17 @@ export interface ApiFetchOptions {
   // dashboard always reflects the latest local API state.
   cache?: RequestCache;
   next?: { revalidate?: number | false; tags?: string[] };
+  // When true, append `?demo=1` to the URL so the API serves from the
+  // demo store rather than the live catalogue. Silently a no-op on the
+  // backend if no demo dataset is on disk (falls back to live store).
+  demo?: boolean;
 }
 
 async function apiFetch<T>(path: string, opts: ApiFetchOptions = {}): Promise<T> {
-  const url = opts.baseUrl ? `${opts.baseUrl.replace(/\/$/, "")}${path}` : path;
+  const withDemo = opts.demo
+    ? `${path}${path.includes("?") ? "&" : "?"}demo=1`
+    : path;
+  const url = opts.baseUrl ? `${opts.baseUrl.replace(/\/$/, "")}${withDemo}` : withDemo;
   let response: Response;
   try {
     response = await fetch(url, {

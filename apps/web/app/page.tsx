@@ -7,7 +7,7 @@ import {
 import { ApiOfflineState } from "@/components/ApiOfflineState";
 import { NoVideosState } from "@/components/NoVideosState";
 import { ImportInProgressState } from "@/components/ImportInProgressState";
-import { BrainDetailViewer } from "@/components/BrainDetailViewer";
+import { AutoPlayingBrain } from "@/components/AutoPlayingBrain";
 import { BrainMeshSlot } from "@/components/BrainMeshSlot";
 import { ActivationScale } from "@/components/brain";
 import { DayStrip } from "@/components/DayStrip";
@@ -89,16 +89,26 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
     // just skip the animated mesh and render the static one alone.
     const videosForAnim = await api.videos(opts).catch(() => []);
     let animActivation: Awaited<ReturnType<typeof api.videoActivation>> | null = null;
-    let animDurationS = 0;
     for (const v of videosForAnim.slice(0, 5)) {
       try {
         animActivation = await api.videoActivation(v.id, opts);
-        animDurationS = v.duration_s;
         break;
       } catch {
         // Try the next one — purged activations, etc.
       }
     }
+
+    // Mock-mode detection: the displayed predictions don't reflect what
+    // was IN any video — they're deterministic functions of the URL
+    // hash via MockBackend. In that case, surfacing the source URL adds
+    // noise (the URL doesn't explain the numbers next to it) and, on
+    // the demo dataset specifically, leaks someone else's history. Hide
+    // per-row URLs whenever every recent inference run is mock; the
+    // aggregates above still tell the story.
+    const runsForMockCheck = await api.inferenceRuns(opts).catch(() => []);
+    const allMock =
+      runsForMockCheck.length > 0 &&
+      runsForMockCheck.every((r) => r.model_id.startsWith("tribe-v2-mock"));
 
     return (
       <main className="mx-auto max-w-[1280px] px-8 pb-10 pt-12">
@@ -111,19 +121,18 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
           </h2>
           <div className="mt-6 grid gap-6 md:grid-cols-[1fr_1fr_auto] md:items-stretch">
             <div>
-              <p className="eyebrow mb-2 text-ink-400">Over time · single video</p>
+              <p className="eyebrow mb-2 text-ink-400">Over time · single video (auto-playing)</p>
               {animActivation ? (
-                <BrainDetailViewer
+                <AutoPlayingBrain
                   activation={animActivation}
                   meanActivation={meanActivation}
-                  durationS={animDurationS || animActivation.timestamps.at(-1) || 15}
                 />
               ) : (
                 <BrainMeshSlot activation={meanActivation} />
               )}
             </div>
             <div>
-              <p className="eyebrow mb-2 text-ink-400">Static · whole window</p>
+              <p className="eyebrow mb-2 text-ink-400">Static · averaged over the window</p>
               <BrainMeshSlot activation={meanActivation} />
             </div>
             <ActivationScale orientation="vertical" />
@@ -189,18 +198,30 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
 
         <AuthorPlaceholder byAuthor={aggregate.by_author} />
 
-        {demo ? (
-          // Demo mode hides the raw watch-history list. The URLs in the
-          // baked dataset are real tiktokv.com/share/video/<id> links
-          // from someone else's session — surfacing them to public demo
-          // viewers would leak the source user's history. Aggregates are
-          // fine to show; per-row attribution is not.
+        {allMock ? (
+          // Mock-mode hides the raw watch-history URLs everywhere
+          // (both the demo dataset and the user's own mock imports).
+          // Two reasons that compose: (1) the displayed predictions
+          // are SHA-256(URL)→sine-wave outputs, so the URL doesn't
+          // explain the colours next to it — surfacing it is noise;
+          // (2) on the baked demo dataset specifically, the URLs are
+          // someone else's history and shouldn't be redistributed.
+          // Real-mode runs (when they land) will show the URLs because
+          // the model actually reads each one's content.
           <section className="motion-fade-in border-t border-line py-10">
             <p className="eyebrow">Watch history</p>
             <p className="mt-2 text-[12px] leading-relaxed text-ink-300">
-              Per-video URLs are hidden in demo mode — the underlying
-              videos belong to a real session and aren&apos;t ours to
-              redistribute. Aggregate metrics above cover the full set.
+              Per-video URLs are hidden while predictions come from the
+              mock backend — the URL is the only thing the mock backend
+              reads (it hashes to a seed), so showing it next to the
+              numbers would be misleading. Aggregate metrics above
+              cover the full set.{" "}
+              {demo ? null : (
+                <span className="text-ink-400">
+                  Real-mode runs (which actually read the video frames
+                  + audio) will surface the URL alongside each row.
+                </span>
+              )}
             </p>
           </section>
         ) : (

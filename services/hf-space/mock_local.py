@@ -14,30 +14,27 @@ Contract
 
     POST /predict
       body: {
-        "jobId":      str,             # propagated back via callback
-        "url":        str,             # source video URL (TikTok, etc.)
-        "callbackUrl": str,            # AWS API Gateway URL for the callback
-        "callbackSecret": str | null,  # forwarded as X-Callback-Token header
+        "jobId":      str,                       # propagated back via callback
+        "source":     { "kind": "url"|"s3", "value": str },  # discriminated union
+        "callbackUrl": str,                      # AWS API Gateway URL for the callback
+        "callbackToken": str,                    # forwarded as X-NM-Token header
       }
       response: 202 { "jobId": str, "accepted": true }
 
 After a randomised 5-15s "inference" delay, the server POSTs to
-`callbackUrl` with the schema the real Space will use:
+`callbackUrl` with the same schema the real Space (T2) uses — the
+activation JSON is gzipped then base64-encoded into `activationsB64`
+so the AWS hf_callback Lambda's decode path runs in dev too:
 
     POST {callbackUrl}
-      headers: X-Callback-Token: {callbackSecret or "dev-mock"}
+      headers: X-NM-Token: {callbackToken}
       body: {
         "jobId": str,
-        "status": "done" | "failed_download",
-        "result": {                    # only when status == "done"
-            "videoDurationSec": float,
-            "timestamps":       [float, ...],          # length T
-            "byRegion": {                              # 8 regions × T
-                "v1": [float, ...], ..., "vwfa": [float, ...],
-            },
-            "modelVersion": str,
-        } | null,
-        "error": str | null,           # only when status == "failed_*"
+        "status": "done" | "failed_download" | "failed_inference" | "rejected_duration",
+        "activationsB64": str | null,  # base64(gzip(JSON.stringify(result))); required iff status=="done"
+        "durationSec": float | null,
+        "modelVersion": str | null,
+        "error": str | null,
       }
 
 Failure mode: 1 in 8 requests returns `status="failed_download"` with
@@ -65,11 +62,15 @@ jobs_worker code path runs end-to-end against the local mock.
 from __future__ import annotations
 
 import asyncio
+import base64
+import gzip
+import json
 import logging
 import os
 import random
 import sys
 from pathlib import Path
+from typing import Literal, Union
 
 import httpx
 import numpy as np
@@ -101,15 +102,30 @@ log = logging.getLogger("hf-mock")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
 
 
+class SourceUrl(BaseModel):
+    kind: Literal["url"]
+    value: str
+
+
+class SourceS3(BaseModel):
+    kind: Literal["s3"]
+    value: str
+
+
 class PredictRequest(BaseModel):
     jobId: str = Field(..., description="Caller-supplied job id, echoed back")
-    url: str = Field(..., description="Source video URL — unused by the mock")
+    source: Union[SourceUrl, SourceS3] = Field(
+        ...,
+        description="Where to fetch the video from — discriminated by `kind`",
+        discriminator="kind",
+    )
     callbackUrl: str = Field(
         ..., description="Where to POST the result when inference finishes"
     )
-    callbackSecret: str | None = Field(
-        default=None,
-        description="Sent back as X-Callback-Token so the AWS Lambda can authenticate",
+    callbackToken: str = Field(
+        ...,
+        min_length=1,
+        description="Sent back as X-NM-Token so the AWS hf_callback Lambda can authenticate",
     )
 
 
@@ -135,7 +151,7 @@ async def predict(req: PredictRequest) -> dict[str, object]:
             detail=f"callbackUrl must be http(s), got: {req.callbackUrl!r}",
         )
     asyncio.create_task(_run_and_callback(req))
-    log.info("accept jobId=%s url=%s", req.jobId, req.url)
+    log.info("accept jobId=%s source.kind=%s", req.jobId, req.source.kind)
     return {"jobId": req.jobId, "accepted": True}
 
 
@@ -150,30 +166,38 @@ async def _run_and_callback(req: PredictRequest) -> None:
     await asyncio.sleep(delay)
 
     if random.random() < FAILURE_RATE:
-        payload = {
+        payload: dict[str, object] = {
             "jobId": req.jobId,
             "status": "failed_download",
-            "result": None,
             "error": "tiktok_blocked",
         }
         log.info("jobId=%s simulated failure: tiktok_blocked", req.jobId)
     else:
         duration = random.uniform(DURATION_MIN_SEC, DURATION_MAX_SEC)
         result = _stub_activations(req.jobId, duration)
+        # The real Space ships activations as base64(gzip(JSON)) so the
+        # hf_callback Lambda can stream the bytes straight into S3 with
+        # ContentEncoding: gzip. Mirror that here so sam-local dev exercises
+        # the same decode path.
+        activations_b64 = base64.b64encode(
+            gzip.compress(json.dumps(result).encode("utf-8"))
+        ).decode("ascii")
         payload = {
             "jobId": req.jobId,
             "status": "done",
-            "result": result,
-            "error": None,
+            "activationsB64": activations_b64,
+            "durationSec": duration,
+            "modelVersion": str(result.get("modelVersion") or "mock-0.1.0"),
         }
         log.info(
-            "jobId=%s done duration=%.1fs T=%d",
+            "jobId=%s done duration=%.1fs T=%d b64len=%d",
             req.jobId,
             duration,
             len(result["timestamps"]),
+            len(activations_b64),
         )
 
-    headers = {"X-Callback-Token": req.callbackSecret or "dev-mock"}
+    headers = {"X-NM-Token": req.callbackToken}
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.post(req.callbackUrl, json=payload, headers=headers)

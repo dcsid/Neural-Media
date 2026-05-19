@@ -130,10 +130,17 @@ with the Space's build log attached.
 
 ---
 
-## Step 2 — Store secrets in AWS Systems Manager Parameter Store
+## Step 2 — Store the callback secret in AWS Systems Manager Parameter Store
 
-This keeps the HF Space URL and the callback secret out of the
-CloudFormation template. The Lambdas read them at cold-start.
+The SAM template resolves the callback secret from SSM at deploy time
+(via `{{resolve:ssm-secure:…}}`) so it never appears in the
+CloudFormation template body. The HF Space URL is different — it goes
+straight into `sam deploy` as a plain CloudFormation parameter in
+Step 3, no SSM round-trip — so this step only writes the secret.
+
+> The `Stage` parameter is a separate axis from the SSM path, so the
+> default SSM name has no `/dev/` segment. Keep one secret entry per
+> rotation generation, not per stage.
 
 ```bash
 # Pick a region and stick with it for the whole runbook. us-east-1 is
@@ -142,14 +149,7 @@ export AWS_REGION=us-east-1
 
 aws ssm put-parameter \
   --region "$AWS_REGION" \
-  --name /neural-media/dev/hf-space-url \
-  --type String \
-  --value "https://<your-user>-neural-media-tribe.hf.space/predict" \
-  --overwrite
-
-aws ssm put-parameter \
-  --region "$AWS_REGION" \
-  --name /neural-media/dev/hf-callback-secret \
+  --name /neural-media/hf-callback-secret \
   --type SecureString \
   --value "<the same value you set as CALLBACK_SHARED_SECRET in step 1>" \
   --overwrite
@@ -159,12 +159,14 @@ aws ssm put-parameter \
 Verify:
 
 ```bash
-aws ssm get-parameter --name /neural-media/dev/hf-space-url
-aws ssm get-parameter --name /neural-media/dev/hf-callback-secret --with-decryption
+aws ssm get-parameter --name /neural-media/hf-callback-secret --with-decryption
 ```
 
-The second call should return the secret in plaintext. If it does not,
-your IAM user is missing `ssm:GetParameter` + `kms:Decrypt` — add them.
+The call should return the secret in plaintext. If it does not, your IAM
+user is missing `ssm:GetParameter` + `kms:Decrypt` — add them.
+
+Note the HF Space URL from Step 1 — you'll paste it into
+`sam deploy --guided` as the `HFSpaceUrl` parameter in the next step.
 
 ---
 
@@ -185,8 +187,12 @@ The `--guided` flow asks a sequence of questions. Sensible answers:
 | Confirm changes before deploy                   | `y` (review each time)                  |
 | Allow SAM CLI IAM role creation                 | `y` (creates the Lambda execution role) |
 | Disable rollback                                | `n`                                     |
-| `HfSpaceUrl` parameter                          | reads from SSM — leave blank if T3 wired it that way, otherwise paste the URL from step 1 |
-| `CallbackSecret` parameter                      | reads from SSM — same as above           |
+| `Stage` parameter                               | `dev` (slug used in resource names)     |
+| `HFSpaceUrl` parameter                          | the `https://<user>-<space>.hf.space` URL from Step 1, no trailing path — `jobs_worker` appends `/predict` itself |
+| `FrontendOrigin` parameter                      | the deployed web app origin (e.g. `https://neural-media.vercel.app`); `http://localhost:3000` is always allowed in addition |
+| `HFCallbackSecretSsmName` parameter             | `/neural-media/hf-callback-secret` (the name you used in Step 2) |
+| `HFCallbackSecretSsmVersion` parameter          | `1` (bump on rotation; CFN requires an explicit version for `ssm-secure` refs) |
+| `BillingAlarmEmail` parameter                   | the email to subscribe to the $5 alarm — leave blank to skip, see Step 4 |
 | `JobsCreate` may not have authorization defined | `y` (intentional — public POST)         |
 | Save arguments to configuration file            | `y` → `samconfig.toml`                  |
 
@@ -216,29 +222,55 @@ If the deploy fails:
 
 ---
 
-## Step 4 — ⚠️ Set up the $5 billing alarm (do not skip)
+## Step 4 — ⚠️ Verify the $5 billing alarm (do not skip)
 
 A misconfigured Lambda or HF Space callback loop can rack up real money
-in real hours. This alarm tells you within ~6 hours.
+in real hours. The SAM template you deployed in Step 3 **already
+provisions** the alarm, an SNS topic, and (if you supplied
+`BillingAlarmEmail`) an email subscription:
 
-The alarm metric (`AWS/Billing > EstimatedCharges`) only emits in
-`us-east-1`, regardless of where your resources actually live. The
-alarm itself must therefore also live in `us-east-1`.
+- `BillingAlarm` (CloudWatch) — fires when `AWS/Billing > EstimatedCharges` exceeds `$5` for one 6-hour period
+- `BillingAlarmTopic` (SNS) — the notification fan-out
+- `BillingAlarmEmailSubscription` (SNS) — only created when you set the `BillingAlarmEmail` parameter; otherwise subscribe by hand below
+
+> The alarm metric only emits in `us-east-1` regardless of where your
+> resources actually live. If you deployed the stack to another region,
+> the template won't have an alarm — re-run `sam deploy` with
+> `--region us-east-1` (or live with manually creating the alarm there
+> using the recipe in this doc's git history).
 
 ### 4a — One-time: enable billing alerts on the account
 
-If you have never received an AWS billing alert before, you need to
-flip a top-level account switch first. AWS Console → Billing → Billing
-preferences → check **"Receive Billing Alerts"** → Save preferences.
-(There is no CLI for this — it's an account-wide toggle in Org Billing.)
+If you have never received an AWS billing alert before, flip the
+account-wide switch first: AWS Console → Billing → Billing preferences
+→ check **"Receive Billing Alerts"** → Save preferences. There is no
+CLI for this; it's an Org Billing toggle. Without it the alarm fires
+but the metric stays at `INSUFFICIENT_DATA` forever.
 
-### 4b — Create the SNS topic and subscribe your email
+### 4b — Verify the alarm exists
 
 ```bash
-TOPIC_ARN=$(aws sns create-topic \
+aws cloudwatch describe-alarms \
   --region us-east-1 \
-  --name neural-media-billing-alerts \
-  --query TopicArn --output text)
+  --alarm-names "neural-media-${STAGE:-dev}-billing-over-5-usd" \
+  --query 'MetricAlarms[0].StateValue'
+```
+
+Expect `"INSUFFICIENT_DATA"` (no spend yet) or `"OK"`. If the call
+returns an empty result, the deploy didn't land the alarm — re-check
+the region and the stack output.
+
+### 4c — Subscribe an email if you skipped `BillingAlarmEmail`
+
+If you left the `BillingAlarmEmail` parameter blank in Step 3, the
+SNS topic exists but has no subscribers. Add one:
+
+```bash
+TOPIC_ARN=$(aws cloudformation describe-stacks \
+  --region us-east-1 \
+  --stack-name neural-media-dev \
+  --query "Stacks[0].Outputs[?OutputKey=='BillingAlarmTopicArn'].OutputValue" \
+  --output text)
 
 aws sns subscribe \
   --region us-east-1 \
@@ -250,48 +282,7 @@ aws sns subscribe \
 You'll get a confirmation email. **Click the "Confirm subscription"
 link** — without it the alarm fires but no email goes out.
 
-### 4c — Create the $5 alarm
-
-```bash
-aws cloudwatch put-metric-alarm \
-  --region us-east-1 \
-  --alarm-name neural-media-billing-over-5usd \
-  --alarm-description "Total AWS estimated charges exceed \$5 USD" \
-  --namespace AWS/Billing \
-  --metric-name EstimatedCharges \
-  --dimensions Name=Currency,Value=USD \
-  --statistic Maximum \
-  --period 21600 \
-  --evaluation-periods 1 \
-  --threshold 5 \
-  --comparison-operator GreaterThanOrEqualToThreshold \
-  --treat-missing-data notBreaching \
-  --alarm-actions "$TOPIC_ARN"
-```
-
-The metric updates every ~6 hours (`--period 21600`), so the alarm
-worst-case latency is ~6h. That's fine for a $5 ceiling; if you want
-$1 latency, use Cost Anomaly Detection (free, but harder to script).
-
-**Verify the alarm exists:**
-
-```bash
-aws cloudwatch describe-alarms \
-  --region us-east-1 \
-  --alarm-names neural-media-billing-over-5usd \
-  --query 'MetricAlarms[0].StateValue'
-```
-
-It should print `"INSUFFICIENT_DATA"` (no spend yet) or `"OK"`. If it
-prints `"ALARM"` immediately, your account is already past $5 — investigate
-*before* deploying anything else.
-
-### 4d — Console alternative (if you prefer clicks)
-
-CloudWatch → Alarms → Create alarm → "Browse metrics" → Billing →
-"Total Estimated Charge" → USD → Conditions: `>= 5` → Notification:
-the SNS topic from 4b → Name: `neural-media-billing-over-5usd` →
-Create.
+Alternatively, re-run `sam deploy --parameter-overrides BillingAlarmEmail=<your-email@example.com>` and CFN will create the subscription for you.
 
 ---
 
@@ -319,12 +310,26 @@ URL into the single-video page.
 
 ### Option B — S3 + CloudFront (AWS-only)
 
+Next.js 15 removed the standalone `next export` command. Static export
+is now produced by `next build` when `output: 'export'` is set in
+`next.config.ts`:
+
+```ts
+// apps/web/next.config.ts
+const config: NextConfig = {
+  output: 'export',
+  // images.unoptimized = true if you use next/image, otherwise omit
+};
+```
+
+Then:
+
 ```bash
 cd apps/web
 pnpm install
 NEXT_PUBLIC_API_BASE_V2=https://abc123xyz.execute-api.us-east-1.amazonaws.com/dev \
   pnpm next build
-pnpm next export        # if T4 enabled static export; otherwise next.config.js needs adjustment
+# next build now writes the static site to apps/web/out/
 aws s3 sync out/ s3://neural-media-web-<your-suffix>/ --delete
 ```
 
@@ -334,8 +339,12 @@ root object `index.html`, with an Origin Access Identity. There is no
 <https://docs.aws.amazon.com/AmazonS3/latest/userguide/website-hosting-cloudfront-walkthrough.html>
 end to end. Budget 30 minutes the first time.
 
-If T4 hasn't enabled static export, you cannot use S3 — the app needs a
-server runtime. Stick with Option A or run on Lambda@Edge.
+`output: 'export'` disables every server-side Next.js feature (route
+handlers, server actions, ISR, on-demand revalidation). The
+single-video flow itself works because every API call goes to
+`NEXT_PUBLIC_API_BASE_V2` (the AWS HTTP API) and not to a Next
+server route. If a future route adds server-only behaviour, switch
+back to Option A or host on Lambda@Edge.
 
 ---
 
@@ -394,15 +403,16 @@ sam delete --stack-name neural-media-dev          # destroys API GW, Lambdas, Dy
 aws s3 rm s3://<results-bucket-name> --recursive
 sam delete --stack-name neural-media-dev
 
-# 2. SSM parameters
-aws ssm delete-parameter --name /neural-media/dev/hf-space-url
-aws ssm delete-parameter --name /neural-media/dev/hf-callback-secret
+# 2. SSM parameter (only the secret — the Space URL was never written to SSM)
+aws ssm delete-parameter --name /neural-media/hf-callback-secret
 
-# 3. Billing alarm + SNS topic (only if you don't want them around)
-aws cloudwatch delete-alarms \
-  --region us-east-1 --alarm-names neural-media-billing-over-5usd
-aws sns delete-topic \
-  --region us-east-1 --topic-arn "$TOPIC_ARN"
+# 3. Billing alarm + SNS topic — already gone if `sam delete` succeeded
+#    above (they're part of the stack). The block below is only for the
+#    legacy case where you created the alarm by hand from an older
+#    version of this runbook.
+# aws cloudwatch delete-alarms --region us-east-1 \
+#   --alarm-names neural-media-billing-over-5usd
+# aws sns delete-topic --region us-east-1 --topic-arn "$TOPIC_ARN"
 ```
 
 Hand-cleanup the following (no CLI for them):

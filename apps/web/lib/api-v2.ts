@@ -49,12 +49,35 @@ export function isFailureStatus(s: JobStatus): s is TerminalFailureStatus {
 
 // Common envelope returned by GET /v2/jobs/{id}. Optional fields fill in
 // depending on status — `resultUrl` only on done, `error` only on failures.
+//
+// Field shapes must stay in lockstep with what jobs_status Lambda emits
+// (infra/aws/lambdas/jobs_status/handler.py). Source of truth is the
+// Lambda — this is the TypeScript projection of that JSON body.
+//
+// Coordination note: worker T3 is landing `durationSec?: number;` here
+// in a separate change (the callback contract carries it from T2's
+// HF Space but jobs_status was not yet persisting/returning it). If
+// their branch lands first this comment can go; if this one lands
+// first, T3 should add the field below `modelVersion?` and update the
+// jobs_status handler so it actually returns the value.
 export interface JobStatusResponse {
   jobId: string;
   status: JobStatus;
-  createdAt: string;
-  elapsedSec: number;
+  // Epoch seconds, as written by jobs_create when the job row was
+  // inserted (see lambdas/jobs_status/handler.py). The /single page
+  // does not use this field for display — it tracks elapsed time
+  // against its own startedAtMs wall clock — but downstream consumers
+  // can convert with `new Date(createdAt * 1000)` (seconds → ms).
+  createdAt: number;
+  // jobs_status returns null when createdAt is missing/zero, otherwise
+  // a non-negative integer. The page guards with `?? 0` so a null
+  // doesn't propagate into the elapsed-time display.
+  elapsedSec: number | null;
   resultUrl?: string;
+  // jobs_status echoes this from the DDB row when the HF Space sent
+  // it on the done callback. Diagnostic only — not all responses
+  // include it (failure/intermediate statuses won't).
+  modelVersion?: string;
   // Short machine-readable error code. The frontend special-cases
   // "tiktok_blocked" on failed_download to surface the upload fallback.
   error?: string;

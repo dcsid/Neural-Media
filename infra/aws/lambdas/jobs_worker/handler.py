@@ -16,6 +16,7 @@ import urllib.request
 from shared import (
     STATUS_DOWNLOADING,
     STATUS_FAILED_DOWNLOAD,
+    get_callback_secret,
     get_job,
     now_epoch,
     presigned_get,
@@ -23,7 +24,6 @@ from shared import (
 )
 
 HF_SPACE_URL = os.environ["HF_SPACE_URL"].rstrip("/")
-HF_CALLBACK_SECRET = os.environ["HF_CALLBACK_SECRET"]
 CALLBACK_URL = os.environ["CALLBACK_URL"]
 
 # The HF Space's /predict acks immediately, so 10s is plenty for the round-trip
@@ -36,7 +36,9 @@ def _kick_hf_space(job_id: str, source_payload: dict) -> None:
         {
             "jobId": job_id,
             "callbackUrl": CALLBACK_URL,
-            "callbackToken": HF_CALLBACK_SECRET,
+            # Resolved at cold start from SSM SecureString; memoised
+            # for the warm container's lifetime (see shared/).
+            "callbackToken": get_callback_secret(),
             **source_payload,
         }
     ).encode("utf-8")

@@ -53,13 +53,6 @@ export function isFailureStatus(s: JobStatus): s is TerminalFailureStatus {
 // Field shapes must stay in lockstep with what jobs_status Lambda emits
 // (infra/aws/lambdas/jobs_status/handler.py). Source of truth is the
 // Lambda — this is the TypeScript projection of that JSON body.
-//
-// Coordination note: worker T3 is landing `durationSec?: number;` here
-// in a separate change (the callback contract carries it from T2's
-// HF Space but jobs_status was not yet persisting/returning it). If
-// their branch lands first this comment can go; if this one lands
-// first, T3 should add the field below `modelVersion?` and update the
-// jobs_status handler so it actually returns the value.
 export interface JobStatusResponse {
   jobId: string;
   status: JobStatus;

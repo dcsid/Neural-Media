@@ -1,0 +1,20 @@
+# Runtime deps for `python services/hf-space/mock_local.py`.
+#
+# The real HF Space (T2) ships its own requirements.txt with TRIBE +
+# yt-dlp + ffmpeg-python; that file is shaped by the Space's Dockerfile
+# and is not appropriate for local dev. This file is the *mock* runtime
+# only: a small FastAPI app that returns canned activations.
+#
+# Install:
+#
+#     python3 -m pip install -r services/hf-space/requirements-mock.txt
+#
+# (`make install-python` does not install these because we don't want
+# every contributor to pull a separate FastAPI install just to run the
+# inference unit tests.)
+
+fastapi>=0.110
+uvicorn>=0.29
+httpx>=0.27
+numpy>=1.26
+pydantic>=2.6

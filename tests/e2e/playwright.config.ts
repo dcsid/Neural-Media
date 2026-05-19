@@ -13,12 +13,16 @@ export default defineConfig({
   retries: 0,
   workers: 1,
   reporter: [["list"]],
-  timeout: 30_000,
+  timeout: 45_000,
   expect: { timeout: 10_000 },
   use: {
     baseURL: `http://localhost:${WEB_PORT}`,
     actionTimeout: 10_000,
-    navigationTimeout: 15_000,
+    // 30s rather than 15s — Next dev's first compile of /single can land
+    // close to 13s on a cold cache (BrainMesh + GLB + r3f) and a tight
+    // budget here flakes on slower machines. Tests still finish well
+    // under the per-test timeout above.
+    navigationTimeout: 30_000,
     trace: "retain-on-failure",
   },
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],

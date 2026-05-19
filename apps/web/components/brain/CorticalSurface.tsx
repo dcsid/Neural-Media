@@ -1,8 +1,8 @@
 "use client";
 
-import { useLoader, useFrame, useThree, type ThreeEvent } from "@react-three/fiber";
+import { useFrame, useThree, type ThreeEvent } from "@react-three/fiber";
 import { GLTFLoader, type GLTF } from "three/examples/jsm/loaders/GLTFLoader.js";
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { NUM_VERTICES, type RegionId } from "@shared/types";
 import { cividisFill } from "./lut";
@@ -72,20 +72,50 @@ export function CorticalSurface({
   onReady,
   onHover,
 }: CorticalSurfaceProps) {
-  // Use R3F's useLoader with three.js's vanilla GLTFLoader directly,
-  // bypassing drei's useGLTF. drei v10's useGLTF was loading
-  // fsaverage5.glb as an empty Group (no descendants) — likely a
-  // regression in how it handles unnamed nodes — making mesh
-  // traversal find nothing. Vanilla GLTFLoader has been stable since
-  // R3F v5 and reliably populates `gltf.scene` with the full node
-  // tree. The GLB is uncompressed (no Draco / Meshopt extensions per
-  // its JSON chunk), so no extra loader plugins are needed.
-  const gltf = useLoader(GLTFLoader, url) as GLTF;
+  // Own the GLB lifecycle ourselves instead of going through R3F's
+  // useLoader. R3F's loader cache hands the SAME `gltf` object to every
+  // mount of this component, but the `<primitive object={mesh} />` in
+  // the render output reparents the mesh from `gltf.scene` into the
+  // surrounding `<group>` on first mount — and three.js's
+  // `Object3D.add()` implicitly removes the child from its previous
+  // parent. Under React StrictMode (or BrainMeshCompare's two
+  // side-by-side surfaces, or any HMR re-mount), the second mount then
+  // re-runs the mesh-finder useMemo against a `gltf.scene` that's been
+  // emptied by the first mount and throws "did not contain a mesh".
+  // Fetching + GLTFLoader.parse() into per-instance state gives each
+  // component its own fresh scene, so reparenting one doesn't strip
+  // mesh out of any other. Suspense isn't doing anything useful here
+  // once we own the lifecycle.
+  const [gltf, setGltf] = useState<GLTF | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const loader = new GLTFLoader();
+    fetch(url, { cache: "force-cache" })
+      .then((r) => r.arrayBuffer())
+      .then(
+        (buf) =>
+          new Promise<GLTF>((resolve, reject) => {
+            loader.parse(buf, "/brain/", resolve, reject);
+          }),
+      )
+      .then((parsed) => {
+        if (!cancelled) setGltf(parsed);
+      })
+      .catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error("[brain-viz] failed to load cortical surface", err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [url]);
+
   const reduceMotion = useReducedMotion();
   const groupRef = useRef<THREE.Group>(null);
   const invalidate = useThree((s) => s.invalidate);
 
-  const { mesh, colorAttr, scratch } = useMemo(() => {
+  const built = useMemo(() => {
+    if (!gltf) return null;
     // Search for any descendant carrying a BufferGeometry with a
     // position attribute. Duck-typed (isBufferGeometry sentinel +
     // getAttribute method) so multiple hoisted three.js copies in
@@ -138,9 +168,14 @@ export function CorticalSurface({
     return { mesh: m, colorAttr: attr, scratch: new Float32Array(count) };
   }, [gltf, url]);
 
+  const mesh = built?.mesh;
+  const colorAttr = built?.colorAttr;
+  const scratch = built?.scratch;
+
   useEffect(() => {
+    if (!built) return;
     onReady?.();
-  }, [onReady]);
+  }, [onReady, built]);
 
   // When rotation is frozen externally (tour mode drives the camera),
   // reset the surface group's accumulated y-rotation to 0 so the tour
@@ -203,6 +238,7 @@ export function CorticalSurface({
   // matters most under prefers-reduced-motion (frameloop=demand), where
   // the next frame may not run until the user actually interacts.
   useEffect(() => {
+    if (!scratch || !colorAttr) return;
     const count = scratch.length;
     if (perVertex && perVertex.length === count) {
       cividisFill(perVertex, colorAttr.array as Float32Array);
@@ -232,8 +268,10 @@ export function CorticalSurface({
     invalidate();
     // Intentional dep set: we only want this on mount and when the region
     // mask becomes available. Per-frame updates flow through useFrame.
+    // `built` is in the deps so the first-paint fill runs once the GLB
+    // finishes parsing (the effect was a no-op on the initial null pass).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [vertexRegions, regionOrder, perVertex]);
+  }, [vertexRegions, regionOrder, perVertex, built]);
 
   // Highlight boost / dim factors. Damped variant is used for prefers-
   // reduced-motion: the spotlight still happens (so the user can see
@@ -255,6 +293,7 @@ export function CorticalSurface({
   const PULSE_FALL_RATE = 2.5; // ≈ 400ms to mostly off
 
   useFrame((_, delta) => {
+    if (!scratch || !colorAttr) return;
     const count = scratch.length;
     const ease = reduceMotion ? 1 : 1 - Math.exp(-delta * 6);
 
@@ -420,7 +459,7 @@ export function CorticalSurface({
 
   const handlePointerMove = useCallback(
     (e: ThreeEvent<PointerEvent>) => {
-      if (!onHover || !vertexRegions || !regionOrder || !e.face) return;
+      if (!onHover || !vertexRegions || !regionOrder || !e.face || !mesh) return;
       e.stopPropagation();
       const { a, b, c } = e.face;
       tmpPoint.copy(e.point);
@@ -490,6 +529,12 @@ export function CorticalSurface({
     [onHover],
   );
 
+  // GLB still parsing on this render — BrainMesh.tsx wraps us in Suspense
+  // + SurfaceErrorBoundary with a PlaceholderMesh fallback, so a brief
+  // null-return frame here is fine and the placeholder paints in the
+  // meantime. Once setGltf fires we re-render with a real mesh.
+  if (!mesh) return null;
+
   return (
     <group ref={groupRef}>
       <primitive
@@ -502,9 +547,11 @@ export function CorticalSurface({
 }
 
 export function preloadCorticalSurface(url: string) {
-  // Match the loader the component itself uses (useLoader+GLTFLoader,
-  // not drei's useGLTF — see the loader comment in CorticalSurface).
-  useLoader.preload(GLTFLoader, url);
+  // Component now owns its own fetch+parse (see CorticalSurface) and
+  // doesn't go through the suspend-react cache that `useLoader.preload`
+  // primes. Warm the browser's HTTP cache instead so the in-component
+  // fetch hits a 200 from cache on first mount.
+  void fetch(url, { cache: "force-cache" }).catch(() => {});
 }
 
 export const EXPECTED_VERTEX_COUNT = NUM_VERTICES;

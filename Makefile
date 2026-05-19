@@ -138,6 +138,10 @@ typecheck-web:
 e2e:
 	$(PNPM) -C tests/e2e exec playwright test
 
+# -----------------------------------------------------------------------------
+# Clean
+# -----------------------------------------------------------------------------
+
 clean:
 	rm -rf data/videos/* data/activations/* data/sqlite/*
 	@echo "Cleared user data. (Sample fixtures under data/sample/ are kept.)"

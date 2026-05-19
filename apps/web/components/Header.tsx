@@ -2,6 +2,7 @@ import Link from "next/link";
 
 const NAV = [
   { href: "/", label: "Dashboard" },
+  { href: "/single", label: "Single video" },
   { href: "/compare", label: "Compare" },
 ] as const;
 

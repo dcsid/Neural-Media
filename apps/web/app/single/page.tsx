@@ -1,6 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
+import Link from "next/link";
 import {
   useCallback,
   useEffect,
@@ -475,6 +476,16 @@ function IdlePanel({
               upload an MP4 directly
             </button>{" "}
             — useful when TikTok blocks the fetch.
+          </div>
+          <div className="text-[12px] leading-relaxed text-ink-300">
+            No clip handy?{" "}
+            <Link
+              href="/single/gallery"
+              className="underline-offset-2 hover:text-accent hover:underline focus-visible:text-accent focus-visible:underline"
+            >
+              Try a demo
+            </Link>{" "}
+            from the precomputed gallery.
           </div>
         </>
       ) : (

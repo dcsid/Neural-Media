@@ -24,10 +24,21 @@ RESULTS_BUCKET: str = os.environ["RESULTS_BUCKET"]
 FRONTEND_ORIGIN: str = os.environ.get("FRONTEND_ORIGIN", "*")
 
 # Lazy boto3 clients. Initialised at import to share a single connection
-# pool across warm invocations.
-_dynamodb = boto3.resource("dynamodb")
+# pool across warm invocations. The DYNAMODB_ENDPOINT_URL / S3_ENDPOINT_URL
+# env vars let `sam local` redirect to DynamoDB Local / moto / minio
+# without changing application code; in deployed Lambdas they are unset
+# and boto3 picks the real AWS endpoints.
+_ddb_kwargs: dict[str, Any] = {}
+if _ddb_endpoint := os.environ.get("DYNAMODB_ENDPOINT_URL"):
+    _ddb_kwargs["endpoint_url"] = _ddb_endpoint
+_dynamodb = boto3.resource("dynamodb", **_ddb_kwargs)
 _table = _dynamodb.Table(JOBS_TABLE)
-_s3 = boto3.client("s3")
+
+_s3_kwargs: dict[str, Any] = {}
+if _s3_endpoint := os.environ.get("S3_ENDPOINT_URL"):
+    _s3_kwargs["endpoint_url"] = _s3_endpoint
+_s3 = boto3.client("s3", **_s3_kwargs)
+
 _lambda = boto3.client("lambda")
 _ssm = boto3.client("ssm")
 

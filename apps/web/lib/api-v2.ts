@@ -58,6 +58,10 @@ export interface JobStatusResponse {
   // Short machine-readable error code. The frontend special-cases
   // "tiktok_blocked" on failed_download to surface the upload fallback.
   error?: string;
+  // Actual decoded video duration as measured by ffprobe on the HF Space.
+  // Reported through the hf-callback once inference completes; absent on
+  // pre-callback statuses.
+  durationSec?: number;
 }
 
 export interface CreateUrlJobResponse {

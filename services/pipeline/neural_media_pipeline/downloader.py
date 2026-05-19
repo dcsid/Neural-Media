@@ -138,12 +138,47 @@ def yt_dlp_available() -> bool:
     return shutil.which("yt-dlp") is not None
 
 
-def _yt_dlp_fetch(url: str, dest: Path, user_agent: str) -> None:
+class _NullYtdlLogger:
+    """yt-dlp logger that drops every message on the floor.
+
+    Even with ``quiet=True`` and ``no_warnings=True``, yt-dlp writes
+    ``ERROR: ...`` lines directly to stderr when a fetch fails. Passing
+    a logger= into ydl_opts is the only documented way to fully redirect
+    that output. The logger protocol yt-dlp expects is just the four
+    methods below.
+    """
+
+    def debug(self, _msg: str) -> None:  # noqa: D401 — yt-dlp protocol
+        pass
+
+    def info(self, _msg: str) -> None:
+        pass
+
+    def warning(self, _msg: str) -> None:
+        pass
+
+    def error(self, _msg: str) -> None:
+        pass
+
+
+def _yt_dlp_fetch(
+    url: str,
+    dest: Path,
+    user_agent: str,
+    *,
+    silent: bool = False,
+) -> None:
     """Single network seam. Lazily imports yt-dlp so test environments
     that monkeypatch this never need yt-dlp installed at all.
 
     On success ``dest`` exists as an .mp4 file. yt-dlp's own retry is
     disabled — we own retries at the call site.
+
+    ``silent`` is an opt-in escape valve for wrappers (notably
+    ``scripts/predict_one_url.py``) that scrape stderr and don't want
+    yt-dlp's ERROR lines mixed in with their own rephrased failure
+    messages. The pipeline orchestrator never sets it, so the
+    long-standing batch-ingest log output is preserved.
     """
     import yt_dlp  # type: ignore[import-not-found]  # lazy, optional dep
 
@@ -152,7 +187,7 @@ def _yt_dlp_fetch(url: str, dest: Path, user_agent: str) -> None:
     # for mp4 via format selection + merge container, then normalize the
     # filename below if it differs.
     out_template = str(dest.with_suffix("")) + ".%(ext)s"
-    ydl_opts = {
+    ydl_opts: dict[str, object] = {
         "outtmpl": out_template,
         "format": "mp4/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best",
         "merge_output_format": "mp4",
@@ -163,6 +198,8 @@ def _yt_dlp_fetch(url: str, dest: Path, user_agent: str) -> None:
         "http_headers": {"User-Agent": user_agent},
         "concurrent_fragment_downloads": 1,
     }
+    if silent:
+        ydl_opts["logger"] = _NullYtdlLogger()
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 

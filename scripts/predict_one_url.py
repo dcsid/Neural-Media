@@ -65,9 +65,12 @@ from shared.schemas import VideoMetadata  # noqa: E402
 
 from neural_media_inference.aggregate import aggregate_region_metrics  # noqa: E402
 from neural_media_inference.backend import MockBackend  # noqa: E402
+from functools import partial  # noqa: E402
+
 from neural_media_pipeline.downloader import (  # noqa: E402
     DownloadConfig,
     DownloadError,
+    _yt_dlp_fetch,
     download_video,
 )
 from neural_media_pipeline.preprocess import (  # noqa: E402
@@ -217,7 +220,14 @@ def _run_pipeline(
         #    each invocation gets its own tempdir.
         video = VideoMetadata(id=video_id, source_url=url)
         dl_cfg = DownloadConfig(videos_dir=raw_dir)
-        result = download_video(video, dl_cfg)
+        # silent=True routes yt-dlp's own ERROR lines into a null logger so
+        # wrappers that scrape this script's stderr only see the rephrased
+        # "download failed: ..." line emitted by the CLI itself.
+        result = download_video(
+            video,
+            dl_cfg,
+            fetch=partial(_yt_dlp_fetch, silent=True),
+        )
         if not result.ok or result.local_path is None:
             raise DownloadError(result.error or "download_video returned no path")
 

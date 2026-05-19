@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import os
 
 from shared import (
     STATUS_DONE,
@@ -31,8 +30,6 @@ from shared import (
     write_result_gzip,
 )
 
-HF_CALLBACK_SECRET = os.environ["HF_CALLBACK_SECRET"]
-
 _ACCEPTED_STATUSES = frozenset(
     {
         STATUS_INFERRING,
@@ -49,7 +46,7 @@ def _headers_lower(event: dict) -> dict:
 
 
 def lambda_handler(event: dict, _context) -> dict:
-    if not verify_callback_token(_headers_lower(event), HF_CALLBACK_SECRET):
+    if not verify_callback_token(_headers_lower(event)):
         return json_response(401, {"error": "unauthorized"})
 
     body = parse_body(event)

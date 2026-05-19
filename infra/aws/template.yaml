@@ -17,7 +17,7 @@ Parameters:
     Type: String
     Description: >
       Base URL of the Hugging Face Space, no trailing slash. The worker
-      Lambda POSTs `${HFSpaceUrl}/predict` with the job payload.
+      Lambda POSTs `<this-value>/predict` with the job payload.
     AllowedPattern: "^https?://.+$"
 
   FrontendOrigin:
@@ -32,18 +32,20 @@ Parameters:
     Default: /neural-media/hf-callback-secret
     Description: >
       Name of the SSM SecureString parameter holding the shared callback
-      secret. Resolved at deploy time via the {{resolve:ssm-secure:...}}
-      dynamic reference and injected as the HF_CALLBACK_SECRET env var.
-      Create the parameter once out-of-band (see README).
+      secret. The HF callback and worker Lambdas fetch it at cold start
+      via ssm:GetParameter (the resolve:ssm-secure dynamic reference is
+      NOT supported in Lambda env vars; see lambdas/shared/__init__.py
+      → get_callback_secret()). Create the parameter once out-of-band
+      (see README).
 
   HFCallbackSecretSsmVersion:
-    Type: Number
-    Default: 1
-    MinValue: 1
+    Type: String
+    Default: ""
     Description: >
-      Version of the SSM SecureString to resolve. CFN requires an explicit
-      version for ssm-secure dynamic references. Bump this when rotating
-      the secret and redeploy.
+      Optional pinned version of the SSM SecureString (numeric, as a
+      string). Empty means "latest" — the Lambda code passes
+      Name:Version when this is set. Bump-and-redeploy to rotate
+      without recreating the parameter.
 
   BillingAlarmEmail:
     Type: String
@@ -68,11 +70,15 @@ Globals:
         RESULTS_BUCKET: !Ref ResultsBucket
         FRONTEND_ORIGIN: !Ref FrontendOrigin
         HF_SPACE_URL: !Ref HFSpaceUrl
-        # Resolved at deploy time from SSM SecureString. The decrypted
-        # value lives in the Lambda env var; anyone with
-        # lambda:GetFunctionConfiguration can read it. Acceptable for
-        # this scope; see README for the trade-off and rotation steps.
-        HF_CALLBACK_SECRET: !Sub "{{resolve:ssm-secure:${HFCallbackSecretSsmName}:${HFCallbackSecretSsmVersion}}}"
+        # The decrypted shared secret is NEVER put in a Lambda env var
+        # — CFN's resolve:ssm-secure dynamic reference is not on the
+        # whitelist for Lambda env vars (it would land as the literal
+        # "{{resolve:...}}" string). Lambdas fetch it at cold start via
+        # ssm:GetParameter; only the name (and optional pinned version)
+        # is propagated as plain text. See
+        # lambdas/shared/__init__.py → get_callback_secret().
+        HF_CALLBACK_SECRET_SSM_NAME: !Ref HFCallbackSecretSsmName
+        HF_CALLBACK_SECRET_SSM_VERSION: !Ref HFCallbackSecretSsmVersion
         STAGE: !Ref Stage
 
 Resources:
@@ -102,7 +108,7 @@ Resources:
               - "http://localhost:3000"
             AllowedHeaders: ["*"]
             ExposedHeaders: [ETag]
-            MaxAgeSeconds: 3600
+            MaxAge: 3600
       LifecycleConfiguration:
         Rules:
           - Id: ExpireUploadsAfter1Day
@@ -159,6 +165,13 @@ Resources:
   # Layer-based split for a stack this small.
   # ---------------------------------------------------------------------------
 
+  # Functions declared WITHOUT Events.HttpApi so they don't auto-create
+  # Lambda::Permission resources whose API-gateway dependency closes a
+  # JobsWorker → HttpApi cycle (JobsWorker reads the API URL via Sub).
+  # Routing/integration/permission resources are declared standalone
+  # below (see "API Gateway wiring"). This is the cleanest SAM +
+  # HttpApi pattern for 2024+.
+
   JobsCreateFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -173,13 +186,6 @@ Resources:
             TableName: !Ref JobsTable
         - LambdaInvokePolicy:
             FunctionName: !Ref JobsWorkerFunction
-      Events:
-        Create:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref HttpApi
-            Method: POST
-            Path: /v2/jobs
 
   JobsUploadFunction:
     Type: AWS::Serverless::Function
@@ -200,19 +206,6 @@ Resources:
               Effect: Allow
               Action: s3:PutObject
               Resource: !Sub "${ResultsBucket.Arn}/uploads/*"
-      Events:
-        CreateUpload:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref HttpApi
-            Method: POST
-            Path: /v2/jobs/upload
-        ConfirmUpload:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref HttpApi
-            Method: POST
-            Path: /v2/jobs/upload/{jobId}/confirm
 
   JobsWorkerFunction:
     Type: AWS::Serverless::Function
@@ -225,6 +218,7 @@ Resources:
         Variables:
           # The HF Space POSTs results back here. Built at deploy time so
           # the worker doesn't need to discover its own API Gateway URL.
+          # Safe to Sub now that HttpApi has no incoming function deps.
           CALLBACK_URL: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/v2/internal/hf-callback"
       Policies:
         - DynamoDBCrudPolicy:
@@ -234,6 +228,21 @@ Resources:
               Effect: Allow
               Action: s3:GetObject
               Resource: !Sub "${ResultsBucket.Arn}/uploads/*"
+        # Cold-start fetch of HF_CALLBACK_SECRET from SSM SecureString.
+        # KMS:Decrypt is scoped by ViaService so we can only decrypt
+        # CMKs that SSM is calling through, not arbitrary keys.
+        - Statement:
+            - Sid: ReadCallbackSecretFromSsm
+              Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/neural-media/*"
+            - Sid: DecryptCallbackSecretViaSsm
+              Effect: Allow
+              Action: kms:Decrypt
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
       # No HttpApi event — invoked asynchronously via lambda:InvokeFunction
       # (InvocationType=Event) by jobs_create and jobs_upload.
 
@@ -251,13 +260,6 @@ Resources:
               Effect: Allow
               Action: s3:GetObject
               Resource: !Sub "${ResultsBucket.Arn}/results/*"
-      Events:
-        Get:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref HttpApi
-            Method: GET
-            Path: /v2/jobs/{jobId}
 
   HfCallbackFunction:
     Type: AWS::Serverless::Function
@@ -274,13 +276,134 @@ Resources:
               Effect: Allow
               Action: s3:PutObject
               Resource: !Sub "${ResultsBucket.Arn}/results/*"
-      Events:
-        Callback:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref HttpApi
-            Method: POST
-            Path: /v2/internal/hf-callback
+        # Same SSM SecureString fetch as JobsWorker — see the comment
+        # there for the KMS:Decrypt scope rationale.
+        - Statement:
+            - Sid: ReadCallbackSecretFromSsm
+              Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/neural-media/*"
+            - Sid: DecryptCallbackSecretViaSsm
+              Effect: Allow
+              Action: kms:Decrypt
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+
+  # ---------------------------------------------------------------------------
+  # API Gateway wiring — standalone Integrations / Routes / Permissions.
+  # Declared at the top level (not via SAM's Function.Events.HttpApi) so
+  # no function depends on HttpApi via its Permission resource. JobsWorker
+  # still depends on HttpApi (one-way) through its CALLBACK_URL env var;
+  # without function-side Permissions, HttpApi does not depend back, so
+  # the deploy-time cycle is broken.
+  #
+  # Each integration is AWS_PROXY (Lambda proxy) with payload format 2.0
+  # — the format the existing handlers already parse via the shared
+  # helpers (event["headers"] lowercase, event["body"] str/JSON).
+  # ---------------------------------------------------------------------------
+
+  JobsCreateIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${JobsCreateFunction.Arn}/invocations"
+      PayloadFormatVersion: "2.0"
+
+  JobsCreatePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref JobsCreateFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/v2/jobs"
+
+  JobsCreateRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /v2/jobs"
+      Target: !Sub "integrations/${JobsCreateIntegration}"
+
+  JobsUploadIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${JobsUploadFunction.Arn}/invocations"
+      PayloadFormatVersion: "2.0"
+
+  # Single permission covers both upload routes — wildcarded on path
+  # under /v2/jobs/upload so we don't need one Permission per route.
+  JobsUploadPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref JobsUploadFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/v2/jobs/upload*"
+
+  JobsUploadCreateRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /v2/jobs/upload"
+      Target: !Sub "integrations/${JobsUploadIntegration}"
+
+  JobsUploadConfirmRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /v2/jobs/upload/{jobId}/confirm"
+      Target: !Sub "integrations/${JobsUploadIntegration}"
+
+  JobsStatusIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${JobsStatusFunction.Arn}/invocations"
+      PayloadFormatVersion: "2.0"
+
+  JobsStatusPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref JobsStatusFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/v2/jobs/*"
+
+  JobsStatusRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /v2/jobs/{jobId}"
+      Target: !Sub "integrations/${JobsStatusIntegration}"
+
+  HfCallbackIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HfCallbackFunction.Arn}/invocations"
+      PayloadFormatVersion: "2.0"
+
+  HfCallbackPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref HfCallbackFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/v2/internal/hf-callback"
+
+  HfCallbackRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /v2/internal/hf-callback"
+      Target: !Sub "integrations/${HfCallbackIntegration}"
 
   # ---------------------------------------------------------------------------
   # CloudWatch billing alarm — the non-negotiable safety net. Fires when

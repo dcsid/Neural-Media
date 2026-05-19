@@ -1,0 +1,3 @@
+# `sam build` writes the packaged Lambda bundles + a flattened template
+# here. Reproducible from source; never commit.
+.aws-sam/

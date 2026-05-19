@@ -27,7 +27,11 @@ permissions:
 # The actual `uses:` clauses still reference @vN majors directly (Actions
 # discourages env-templated `uses:` strings).
 env:
-  NODE_VERSION: "20"
+  # Node 22 because pnpm 11.x requires Node >= 22.13 (the lockfile in
+  # this repo was written by pnpm 11.0.8; the lockfile itself is v9.0).
+  # Downgrading to pnpm 9 would let us stay on Node 20 but would risk
+  # re-writing the lockfile on the contributor's next local `pnpm install`.
+  NODE_VERSION: "22"
   PNPM_VERSION: "11.0.8"
   PYTHON_VERSION: "3.11"
   SAM_CLI_TELEMETRY: "0"
@@ -114,7 +118,11 @@ jobs:
           python -m pip install -e services/inference
           python -m pip install -e services/pipeline
           python -m pip install -e services/api
-          python -m pip install pytest
+          # httpx is required by Starlette's TestClient, which the
+          # services/api test suite uses. It's not declared as a runtime
+          # dep of the api package (FastAPI doesn't require httpx in
+          # production), so we install it explicitly here.
+          python -m pip install pytest httpx
 
       - name: pytest services
         run: |
@@ -151,14 +159,22 @@ jobs:
           # the sam install since pip's resolver is cached.
           cache: pip
 
-      - name: install AWS SAM CLI
+      - name: locate / install AWS SAM CLI
+        # GitHub-hosted Ubuntu runners ship AWS SAM CLI preinstalled
+        # (under /usr/local/aws-sam-cli/). Use it if it's there;
+        # otherwise fetch the latest release. Either way, `sam --version`
+        # is the success signal.
         run: |
           set -euo pipefail
-          curl -fsSL -o /tmp/sam.zip \
-            https://github.com/aws/aws-sam-cli/releases/latest/download/aws-sam-cli-linux-x86_64.zip
-          unzip -q /tmp/sam.zip -d /tmp/sam-install
-          sudo /tmp/sam-install/install
-          sam --version
+          if command -v sam >/dev/null 2>&1; then
+            echo "sam already installed: $(sam --version)"
+          else
+            curl -fsSL -o /tmp/sam.zip \
+              https://github.com/aws/aws-sam-cli/releases/latest/download/aws-sam-cli-linux-x86_64.zip
+            unzip -q /tmp/sam.zip -d /tmp/sam-install
+            sudo /tmp/sam-install/install
+            sam --version
+          fi
 
       - name: sam validate --lint
         working-directory: infra/aws

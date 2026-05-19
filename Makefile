@@ -19,7 +19,7 @@ DB_PATH ?= $(REPO_ROOT)/data/sqlite/neural_media.db
 # for the cases where you're invoking python directly without `make`.
 export PYTHONPATH := $(REPO_ROOT)/services/pipeline:$(REPO_ROOT)/services/api:$(REPO_ROOT)/services/inference
 
-.PHONY: help install install-python install-web sample ingest init-db \
+.PHONY: help install install-system install-python install-web sample ingest init-db \
         dev dev-api dev-api-mock dev-web test test-python test-web \
         typecheck-web clean unhide-pth bench-ingest e2e
 
@@ -27,6 +27,7 @@ help:
 	@echo "Neural Media — make targets"
 	@echo ""
 	@echo "  make install         install all services and the web app"
+	@echo "  make install-system  brew install ffmpeg + other non-Python deps"
 	@echo "  make sample          regenerate mock inference outputs (SampleStore)"
 	@echo "  make ingest EXPORT=… ingest a real TikTok export through the CLI"
 	@echo "  make init-db         create the SQLite catalog (idempotent)"
@@ -45,6 +46,16 @@ help:
 # -----------------------------------------------------------------------------
 
 install: install-python install-web
+
+# install-system: non-Python system deps (ffmpeg + ffprobe) via Homebrew.
+# Required by services/pipeline (preprocess) and scripts/predict_one_url.py.
+# yt-dlp itself ships via the [dev] pip extra and doesn't need brew.
+install-system:
+	@if ! command -v brew >/dev/null 2>&1; then \
+	  echo "Homebrew not found. Install from https://brew.sh first."; exit 1; \
+	fi
+	brew install ffmpeg
+	@echo "Done. yt-dlp installs via pip (already in the venv via the [dev] extras)."
 
 install-python:
 	$(PYTHON) -m pip install -e services/inference

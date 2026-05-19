@@ -5,6 +5,7 @@ Body schema (from the HF Space):
     jobId: str,
     status: "inferring" | "done" | "failed_download" | "failed_inference" | "rejected_duration",
     modelVersion?: str,
+    durationSec?: float,    # video duration as measured by ffprobe on the Space
     activationsB64?: str,   # base64 of the gzip'd activation JSON; required iff status=="done"
     error?: str,
   }
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from decimal import Decimal
 
 from shared import (
     STATUS_DONE,
@@ -73,6 +75,14 @@ def lambda_handler(event: dict, _context) -> dict:
         updates["modelVersion"] = body["modelVersion"]
     if body.get("error"):
         updates["error"] = body["error"]
+    # The HF Space measures the actual decoded video duration with ffprobe
+    # and reports it back so the frontend can render exact-length context
+    # ("a 7.3-second clip") instead of guessing from the keyframe stride.
+    # DynamoDB's resource layer rejects raw float — convert via Decimal(str(...))
+    # to preserve the source decimal representation exactly.
+    duration_sec = body.get("durationSec")
+    if isinstance(duration_sec, (int, float)) and not isinstance(duration_sec, bool):
+        updates["durationSec"] = Decimal(str(duration_sec))
 
     if new_status == STATUS_DONE:
         activations_b64 = body.get("activationsB64")

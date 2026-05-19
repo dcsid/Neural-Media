@@ -32,6 +32,11 @@ def lambda_handler(event: dict, _context) -> dict:
         body["error"] = job["error"]
     if job.get("modelVersion"):
         body["modelVersion"] = job["modelVersion"]
+    # hf_callback writes durationSec as a DynamoDB Decimal; cast back to
+    # float so json.dumps() in json_response handles it natively (Decimal
+    # is not JSON-serializable by default).
+    if job.get("durationSec") is not None:
+        body["durationSec"] = float(job["durationSec"])
     if job.get("status") == STATUS_DONE and job.get("resultS3Key"):
         body["resultUrl"] = presigned_get(job["resultS3Key"], expires_in=3600)
     return json_response(200, body)

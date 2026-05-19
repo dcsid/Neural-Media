@@ -1,0 +1,353 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Neural Media — single-video control plane.
+  API Gateway HTTP API + DynamoDB + S3 + 5 Lambdas + $5 billing alarm.
+  Sized to stay inside the AWS free tier; expected cost at ~1k jobs/month
+  is $0. See infra/aws/README.md for deploy instructions.
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedPattern: "^[a-z0-9]{1,16}$"
+    Description: Short stage slug (e.g., dev, prod). Used in resource names.
+
+  HFSpaceUrl:
+    Type: String
+    Description: >
+      Base URL of the Hugging Face Space, no trailing slash. The worker
+      Lambda POSTs `${HFSpaceUrl}/predict` with the job payload.
+    AllowedPattern: "^https?://.+$"
+
+  FrontendOrigin:
+    Type: String
+    Default: http://localhost:3000
+    Description: >
+      Production frontend origin allowed by CORS. localhost:3000 is always
+      allowed in addition.
+
+  HFCallbackSecretSsmName:
+    Type: String
+    Default: /neural-media/hf-callback-secret
+    Description: >
+      Name of the SSM SecureString parameter holding the shared callback
+      secret. Resolved at deploy time via the {{resolve:ssm-secure:...}}
+      dynamic reference and injected as the HF_CALLBACK_SECRET env var.
+      Create the parameter once out-of-band (see README).
+
+  HFCallbackSecretSsmVersion:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: >
+      Version of the SSM SecureString to resolve. CFN requires an explicit
+      version for ssm-secure dynamic references. Bump this when rotating
+      the secret and redeploy.
+
+  BillingAlarmEmail:
+    Type: String
+    Default: ""
+    Description: >
+      Optional email to subscribe to the $5/month billing alarm SNS topic.
+      Leave blank to skip subscription — the alarm still fires, you just
+      won't receive an email until you subscribe manually.
+
+Conditions:
+  HasBillingEmail: !Not [!Equals [!Ref BillingAlarmEmail, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.11
+    MemorySize: 128
+    Timeout: 30
+    Architectures: [arm64]
+    Environment:
+      Variables:
+        JOBS_TABLE: !Ref JobsTable
+        RESULTS_BUCKET: !Ref ResultsBucket
+        FRONTEND_ORIGIN: !Ref FrontendOrigin
+        HF_SPACE_URL: !Ref HFSpaceUrl
+        # Resolved at deploy time from SSM SecureString. The decrypted
+        # value lives in the Lambda env var; anyone with
+        # lambda:GetFunctionConfiguration can read it. Acceptable for
+        # this scope; see README for the trade-off and rotation steps.
+        HF_CALLBACK_SECRET: !Sub "{{resolve:ssm-secure:${HFCallbackSecretSsmName}:${HFCallbackSecretSsmVersion}}}"
+        STAGE: !Ref Stage
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # S3 — uploads/{jobId}.mp4 (browser presigned PUT)
+  #      results/{jobId}.json.gz (written by hf_callback)
+  # Block all public access, SSE on, CORS PUT/GET, lifecycle clean-up.
+  # ---------------------------------------------------------------------------
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "neural-media-${Stage}-results-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [PUT, GET]
+            AllowedOrigins:
+              - !Ref FrontendOrigin
+              - "http://localhost:3000"
+            AllowedHeaders: ["*"]
+            ExposedHeaders: [ETag]
+            MaxAgeSeconds: 3600
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireUploadsAfter1Day
+            Status: Enabled
+            Prefix: uploads/
+            ExpirationInDays: 1
+          - Id: ExpireResultsAfter30Days
+            Status: Enabled
+            Prefix: results/
+            ExpirationInDays: 30
+
+  # ---------------------------------------------------------------------------
+  # DynamoDB — one row per job. PAY_PER_REQUEST (no provisioned capacity),
+  # TTL on `expiresAt` so old jobs evaporate for free.
+  # ---------------------------------------------------------------------------
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "neural-media-${Stage}-jobs"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: jobId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: jobId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false
+
+  # ---------------------------------------------------------------------------
+  # HTTP API v2 — cheaper + simpler than REST API. Native CORS support.
+  # ---------------------------------------------------------------------------
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Stage
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref FrontendOrigin
+          - "http://localhost:3000"
+        AllowMethods: [GET, POST, OPTIONS]
+        AllowHeaders: [content-type, x-nm-token]
+        MaxAge: 3600
+
+  # ---------------------------------------------------------------------------
+  # Lambda × 5. All share `CodeUri: lambdas/` so `from shared import ...`
+  # resolves cleanly inside each function. The unused-handler files in each
+  # zip add ~10 KB — well below the 50 MB Lambda limit and not worth a
+  # Layer-based split for a stack this small.
+  # ---------------------------------------------------------------------------
+
+  JobsCreateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "neural-media-${Stage}-jobs-create"
+      CodeUri: lambdas/
+      Handler: jobs_create.handler.lambda_handler
+      Environment:
+        Variables:
+          WORKER_FUNCTION_NAME: !Ref JobsWorkerFunction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobsTable
+        - LambdaInvokePolicy:
+            FunctionName: !Ref JobsWorkerFunction
+      Events:
+        Create:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: POST
+            Path: /v2/jobs
+
+  JobsUploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "neural-media-${Stage}-jobs-upload"
+      CodeUri: lambdas/
+      Handler: jobs_upload.handler.lambda_handler
+      Environment:
+        Variables:
+          WORKER_FUNCTION_NAME: !Ref JobsWorkerFunction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobsTable
+        - LambdaInvokePolicy:
+            FunctionName: !Ref JobsWorkerFunction
+        - Statement:
+            - Sid: PresignUploadsPrefix
+              Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${ResultsBucket.Arn}/uploads/*"
+      Events:
+        CreateUpload:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: POST
+            Path: /v2/jobs/upload
+        ConfirmUpload:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: POST
+            Path: /v2/jobs/upload/{jobId}/confirm
+
+  JobsWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "neural-media-${Stage}-jobs-worker"
+      CodeUri: lambdas/
+      Handler: jobs_worker.handler.lambda_handler
+      Timeout: 30
+      Environment:
+        Variables:
+          # The HF Space POSTs results back here. Built at deploy time so
+          # the worker doesn't need to discover its own API Gateway URL.
+          CALLBACK_URL: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/v2/internal/hf-callback"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobsTable
+        - Statement:
+            - Sid: ReadUploadsForPresigning
+              Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${ResultsBucket.Arn}/uploads/*"
+      # No HttpApi event — invoked asynchronously via lambda:InvokeFunction
+      # (InvocationType=Event) by jobs_create and jobs_upload.
+
+  JobsStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "neural-media-${Stage}-jobs-status"
+      CodeUri: lambdas/
+      Handler: jobs_status.handler.lambda_handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref JobsTable
+        - Statement:
+            - Sid: ReadResultsForPresigning
+              Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${ResultsBucket.Arn}/results/*"
+      Events:
+        Get:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /v2/jobs/{jobId}
+
+  HfCallbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "neural-media-${Stage}-hf-callback"
+      CodeUri: lambdas/
+      Handler: hf_callback.handler.lambda_handler
+      Timeout: 30
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobsTable
+        - Statement:
+            - Sid: WriteResultsPrefix
+              Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${ResultsBucket.Arn}/results/*"
+      Events:
+        Callback:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: POST
+            Path: /v2/internal/hf-callback
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch billing alarm — the non-negotiable safety net. Fires when
+  # estimated monthly USD spend exceeds $5. Must be in us-east-1; billing
+  # metrics are only published there regardless of stack region.
+  # ---------------------------------------------------------------------------
+  BillingAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "neural-media-${Stage}-billing-alarm"
+      DisplayName: Neural Media billing alarm
+
+  BillingAlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasBillingEmail
+    Properties:
+      Protocol: email
+      Endpoint: !Ref BillingAlarmEmail
+      TopicArn: !Ref BillingAlarmTopic
+
+  BillingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "neural-media-${Stage}-billing-over-5-usd"
+      AlarmDescription: Estimated monthly AWS spend exceeded $5 USD.
+      Namespace: AWS/Billing
+      MetricName: EstimatedCharges
+      Dimensions:
+        - Name: Currency
+          Value: USD
+      Statistic: Maximum
+      Period: 21600 # 6 hours — billing metric only updates a few times/day
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref BillingAlarmTopic
+
+Outputs:
+  ApiEndpoint:
+    Description: HTTP API base URL. Frontend POSTs /v2/jobs here.
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiEndpoint"
+
+  HfCallbackUrl:
+    Description: Full URL the HF Space POSTs to with completed inference.
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/v2/internal/hf-callback"
+    Export:
+      Name: !Sub "${AWS::StackName}-HfCallbackUrl"
+
+  ResultsBucketName:
+    Description: S3 bucket holding uploads/ + results/.
+    Value: !Ref ResultsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-ResultsBucket"
+
+  JobsTableName:
+    Description: DynamoDB table name (matches the JOBS_TABLE env var).
+    Value: !Ref JobsTable
+    Export:
+      Name: !Sub "${AWS::StackName}-JobsTable"
+
+  BillingAlarmTopicArn:
+    Description: SNS topic ARN for the $5 billing alarm. Subscribe manually
+                 if you didn't supply BillingAlarmEmail at deploy time.
+    Value: !Ref BillingAlarmTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-BillingAlarmTopic"

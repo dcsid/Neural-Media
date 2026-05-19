@@ -21,7 +21,7 @@ export PYTHONPATH := $(REPO_ROOT)/services/pipeline:$(REPO_ROOT)/services/api:$(
 
 .PHONY: help install install-python install-web sample ingest init-db \
         dev dev-api dev-api-mock dev-web test test-python test-web \
-        typecheck-web clean unhide-pth bench-ingest
+        typecheck-web clean unhide-pth bench-ingest e2e
 
 help:
 	@echo "Neural Media — make targets"
@@ -125,8 +125,18 @@ typecheck-web:
 	cd apps/web && $(PNPM) typecheck
 
 # -----------------------------------------------------------------------------
-# Clean
+# End-to-end (Playwright)
+#
+# Walks the full /single → brain user journey against a fully mocked /v2/jobs*
+# backend (see tests/e2e/mock-server.ts). Playwright's webServer config boots
+# both apps/web (:3000) and the mock (:3001) before the suite runs.
+#
+# First run requires the chromium browser:
+#   $(PNPM) -C tests/e2e exec playwright install chromium
 # -----------------------------------------------------------------------------
+
+e2e:
+	$(PNPM) -C tests/e2e exec playwright test
 
 clean:
 	rm -rf data/videos/* data/activations/* data/sqlite/*
@@ -182,3 +192,74 @@ bench-ingest:
 	  echo "  make bench-ingest EXPORT=/path/to/Watch\\ History.txt"; \
 	  exit 1; \
 	fi
+
+# =============================================================================
+# Single-video pipeline (v2 cloud architecture).
+#
+# These targets compose the cloud-mode demo: an HF Space (TRIBE + yt-dlp +
+# ffmpeg) does real inference on demand, an AWS API Gateway + Lambda + S3
+# stack accepts jobs and serves results, and the Next.js dashboard
+# (NEXT_PUBLIC_API_BASE_V2) talks to the gateway. None of this is wired
+# into the existing `dev` / `dev-api` flow — those still run the local
+# SQLite + SampleStore demo path.
+#
+# Run `make help-single` for the discovery surface.
+# =============================================================================
+
+.PHONY: help-single dev-single dev-single-mock dev-single-api dev-single-web \
+        deploy-aws deploy-hf-space smoke-single
+
+help-single:
+	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) \
+	  | awk -F':.*## ' '{printf "  %-20s %s\n", $$1, $$2}'
+
+dev-single: ## print the three terminal commands for the local single-video loop
+	@echo "Three-terminal local dev loop for the single-video pipeline:"
+	@echo ""
+	@echo "  TERM 1  mock HF Space  (port 8001)"
+	@echo "    python services/hf-space/mock_local.py"
+	@echo ""
+	@echo "  TERM 2  AWS SAM local  (port 3001)"
+	@echo "    cd infra/aws && sam local start-api --port 3001 \\"
+	@echo "      --parameter-overrides HfSpaceUrl=http://host.docker.internal:8001/predict \\"
+	@echo "                            CallbackSecret=dev-mock \\"
+	@echo "                            ResultsBucket=neural-media-dev-results"
+	@echo ""
+	@echo "  TERM 3  Next.js web    (port 3000)"
+	@echo "    NEXT_PUBLIC_API_BASE_V2=http://127.0.0.1:3001 $(PNPM) --filter @neural-media/web dev"
+	@echo ""
+	@echo "Then smoke-test: API_BASE=http://127.0.0.1:3001 make smoke-single"
+	@echo ""
+	@echo "See infra/aws/sam-local.md for the DynamoDB-local / S3-local prereqs."
+
+deploy-aws: ## sam build && sam deploy from infra/aws/
+	cd infra/aws && sam build && sam deploy
+
+deploy-hf-space: ## print the recipe to push services/hf-space/ to the HuggingFace remote
+	@echo "Deploy the real HF Space (T2's app, not the mock):"
+	@echo ""
+	@echo "  1. Create a Space on huggingface.co (Docker SDK, GPU/A10G or CPU)."
+	@echo "  2. In the Space settings, set environment variables:"
+	@echo "       CALLBACK_SHARED_SECRET = <same value you store in SSM at"
+	@echo "                                 /neural-media/dev/hf-callback-secret>"
+	@echo "  3. From repo root:"
+	@echo "       cd services/hf-space"
+	@echo "       hf auth login                          # if not already"
+	@echo "       git init -b main                       # if not already a repo"
+	@echo "       git remote add hf https://huggingface.co/spaces/<user>/<space>"
+	@echo "       git add -A && git commit -m 'Deploy single-video Space'"
+	@echo "       git push hf main"
+	@echo ""
+	@echo "  4. The Space rebuilds automatically. Note the public URL"
+	@echo "     (e.g. https://<user>-<space>.hf.space) — that's what you"
+	@echo "     write to SSM /neural-media/dev/hf-space-url."
+	@echo ""
+	@echo "See docs/single-video-deploy.md for the full runbook."
+
+smoke-single: ## run scripts/smoke-test-single.sh against $$API_BASE
+	@if [ -z "$$API_BASE" ]; then \
+	  echo "ERROR: API_BASE is required. e.g.:"; \
+	  echo "  API_BASE=http://127.0.0.1:3001 make smoke-single"; \
+	  exit 1; \
+	fi
+	bash scripts/smoke-test-single.sh

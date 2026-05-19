@@ -5,11 +5,27 @@ It explains how to run T3's API Gateway + Lambda template on your laptop,
 pointed at the mock HF Space (`services/hf-space/mock_local.py`) instead
 of the real one, with no AWS spend.
 
-T3 owns the actual SAM template at `infra/aws/template.yaml`. The commands
-below assume that file exists and exposes the parameters the brief lists
-(`HfSpaceUrl`, `CallbackSecret`, `ResultsBucket`, `JobsTable`). If T3
-renames a parameter, the value of the env var changes — the structure
-of this doc does not.
+T3 owns the actual SAM template at `infra/aws/template.yaml`. As of
+current `main` it exposes these CloudFormation parameters:
+
+| Parameter                    | Default                              | Purpose                                                  |
+|------------------------------|--------------------------------------|----------------------------------------------------------|
+| `Stage`                      | `dev`                                | Slug used in resource names (e.g. `…-${Stage}-jobs`).    |
+| `HFSpaceUrl`                 | —                                    | Base URL of the HF Space; `jobs_worker` appends `/predict`. |
+| `FrontendOrigin`             | `http://localhost:3000`              | Production frontend origin allowed by CORS.              |
+| `HFCallbackSecretSsmName`    | `/neural-media/hf-callback-secret`   | SSM SecureString name that holds the shared callback secret. |
+| `HFCallbackSecretSsmVersion` | `1`                                  | SSM parameter version (bump on rotation).                |
+| `BillingAlarmEmail`          | empty                                | Optional email to subscribe to the $5 alarm SNS topic.   |
+
+Lambda env vars (set via `Globals.Function.Environment` plus per-function
+overrides) come from those parameters: `JOBS_TABLE`, `RESULTS_BUCKET`,
+`FRONTEND_ORIGIN`, `HF_SPACE_URL`, `HF_CALLBACK_SECRET`, `STAGE`,
+`WORKER_FUNCTION_NAME` (jobs_create, jobs_upload), `CALLBACK_URL`
+(jobs_worker). The `sam-env.json` template in §4 lists the values
+`sam local start-api` needs for each.
+
+If the template renames anything, only the right-hand side of
+`sam-env.json` changes — the structure of this doc does not.
 
 ---
 
@@ -56,6 +72,21 @@ moto, etc.).
 `sam local start-api` runs each Lambda inside a Docker container, so
 Docker Desktop must be running. SAM downloads `public.ecr.aws/sam/...`
 images on first invocation — count on ~500 MB the first time.
+
+> **macOS + Colima users.** If you swapped Docker Desktop for Colima,
+> SAM still calls the docker CLI but won't find the Colima socket and
+> will balk at a missing `~/.docker/config.json`. Before
+> `sam local start-api`, point both at Colima in the same shell:
+>
+> ```bash
+> export DOCKER_HOST=unix:///Users/$(whoami)/.colima/default/docker.sock
+> export DOCKER_CONFIG=/tmp/docker-cfg-sam
+> mkdir -p "$DOCKER_CONFIG"
+> echo '{}' > "$DOCKER_CONFIG/config.json"
+> ```
+>
+> The throwaway config dir avoids polluting `~/.docker` and means you
+> can blow it away (`rm -rf /tmp/docker-cfg-sam`) between runs.
 
 You do **not** need real AWS credentials for `sam local`. The Lambda
 containers see fake `AWS_ACCESS_KEY_ID=testing` values; they only matter
@@ -182,34 +213,63 @@ DynamoDB local section above.
 
 ## 4. `sam-env.json` — env vars for each Lambda
 
-Create `infra/aws/sam-env.json` (gitignored — it lists per-user values):
+Create `infra/aws/sam-env.json` (gitignored — it lists per-user values).
+The Lambdas pull env-var names directly from `os.environ[...]` at import
+time, so any missing key in this file will `KeyError` before the handler
+runs:
 
 ```jsonc
 {
-  "JobsCreate": {
+  "JobsCreateFunction": {
     "JOBS_TABLE": "jobs",
-    "DYNAMODB_ENDPOINT_URL": "http://host.docker.internal:8000",
-    "HF_SPACE_URL": "http://host.docker.internal:8001/predict",
-    "CALLBACK_BASE_URL": "http://host.docker.internal:3001/v2/internal/hf-callback",
-    "CALLBACK_SECRET": "dev-mock"
-  },
-  "JobsStatus": {
-    "JOBS_TABLE": "jobs",
-    "DYNAMODB_ENDPOINT_URL": "http://host.docker.internal:8000",
-    "RESULTS_BUCKET": "neural-media-dev-results-${USER}"
-  },
-  "HfCallback": {
-    "JOBS_TABLE": "jobs",
-    "DYNAMODB_ENDPOINT_URL": "http://host.docker.internal:8000",
     "RESULTS_BUCKET": "neural-media-dev-results-${USER}",
-    "CALLBACK_SECRET": "dev-mock"
+    "WORKER_FUNCTION_NAME": "neural-media-dev-jobs-worker",
+    "DYNAMODB_ENDPOINT_URL": "http://host.docker.internal:8000"
+  },
+  "JobsUploadFunction": {
+    "JOBS_TABLE": "jobs",
+    "RESULTS_BUCKET": "neural-media-dev-results-${USER}",
+    "WORKER_FUNCTION_NAME": "neural-media-dev-jobs-worker",
+    "DYNAMODB_ENDPOINT_URL": "http://host.docker.internal:8000"
+  },
+  "JobsWorkerFunction": {
+    "JOBS_TABLE": "jobs",
+    "RESULTS_BUCKET": "neural-media-dev-results-${USER}",
+    "HF_SPACE_URL": "http://host.docker.internal:8001",
+    "HF_CALLBACK_SECRET": "dev-mock",
+    "CALLBACK_URL": "http://host.docker.internal:3001/v2/internal/hf-callback",
+    "DYNAMODB_ENDPOINT_URL": "http://host.docker.internal:8000"
+  },
+  "JobsStatusFunction": {
+    "JOBS_TABLE": "jobs",
+    "RESULTS_BUCKET": "neural-media-dev-results-${USER}",
+    "DYNAMODB_ENDPOINT_URL": "http://host.docker.internal:8000"
+  },
+  "HfCallbackFunction": {
+    "JOBS_TABLE": "jobs",
+    "RESULTS_BUCKET": "neural-media-dev-results-${USER}",
+    "HF_CALLBACK_SECRET": "dev-mock",
+    "DYNAMODB_ENDPOINT_URL": "http://host.docker.internal:8000"
   }
 }
 ```
 
-The keys (`JobsCreate`, etc.) must match the `LogicalId` of each Function
-resource in `template.yaml`. Ask T3 if the names don't match — those are
-T3's to set.
+Notes on the shape:
+
+- The top-level keys (`JobsCreateFunction`, etc.) must match the
+  `LogicalId` of each `AWS::Serverless::Function` in `template.yaml`.
+- `HF_SPACE_URL` is the base URL — `jobs_worker` appends `/predict`
+  itself. Don't include the path here.
+- `HF_CALLBACK_SECRET` must be the same string the mock receives via
+  the `X-NM-Token` header (the mock's `--callback-secret` flag, if you
+  pass one). `dev-mock` is the conventional value.
+- `WORKER_FUNCTION_NAME` is required at module import time on
+  `JobsCreate`/`JobsUpload`. The value here doesn't have to resolve to
+  a real Lambda — `sam local` is request/response only and never
+  performs the async invoke, so a string the right shape is enough to
+  keep imports happy (see Sharp edges below).
+- `DYNAMODB_ENDPOINT_URL` is consumed only if the Lambda code
+  routes boto3 through it (see §2 caveat).
 
 ---
 

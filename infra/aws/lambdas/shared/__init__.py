@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import functools
 import hmac
 import json
 import os
@@ -28,6 +29,7 @@ _dynamodb = boto3.resource("dynamodb")
 _table = _dynamodb.Table(JOBS_TABLE)
 _s3 = boto3.client("s3")
 _lambda = boto3.client("lambda")
+_ssm = boto3.client("ssm")
 
 # Job lifecycle. Matches the API contract in docs/single-video.md.
 STATUS_PENDING = "pending"
@@ -160,9 +162,33 @@ def write_result_gzip(key: str, gz_bytes: bytes) -> None:
 # ---------------------------------------------------------------------------
 # Callback auth.
 # ---------------------------------------------------------------------------
-def verify_callback_token(headers: dict, expected: str) -> bool:
-    """Constant-time compare. API Gateway HTTP API lowercases header keys,
-    but allow either form for tooling that doesn't."""
+# The shared callback secret lives in SSM SecureString (set
+# out-of-band; see infra/aws/README.md). We can't pass it via
+# resolve:ssm-secure in a Lambda env var because that dynamic
+# reference isn't on CFN's Lambda-env whitelist — it would land as
+# the literal "{{resolve:...}}" string. So fetch at cold start and
+# memoise for the lifetime of the warm container; the +1 SSM call
+# costs ~50 ms once per cold start.
+@functools.lru_cache(maxsize=1)
+def get_callback_secret() -> str:
+    name = os.environ["HF_CALLBACK_SECRET_SSM_NAME"]
+    version = os.environ.get("HF_CALLBACK_SECRET_SSM_VERSION") or ""
+    # SSM accepts "{name}:{version}" to pin a specific version. Empty
+    # / missing means "latest" — keep this default so deploys without
+    # an explicit version still work.
+    if version:
+        name = f"{name}:{version}"
+    return _ssm.get_parameter(Name=name, WithDecryption=True)["Parameter"]["Value"]
+
+
+def verify_callback_token(headers: dict) -> bool:
+    """Constant-time compare against the SSM-resolved shared secret.
+
+    API Gateway HTTP API lowercases header keys, but allow either
+    form for tooling that doesn't. Returns False on missing/empty
+    header rather than raising — handlers map to 401.
+    """
+    expected = get_callback_secret()
     if not expected:
         return False
     provided = headers.get("x-nm-token") or headers.get("X-NM-Token") or ""

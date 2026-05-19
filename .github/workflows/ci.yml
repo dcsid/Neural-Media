@@ -1,0 +1,243 @@
+name: ci
+
+# Triggers
+# --------
+# `push` to main covers the post-merge audit (catches anything the PR
+# workflow missed because of a stale base). `pull_request` against main
+# runs the same checks on every contributor PR. `workflow_dispatch` lets
+# the coordinator kick a run by hand from the Actions tab — useful when
+# debugging the workflow itself.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Cancel in-flight runs on the same ref when a newer commit lands. Saves
+# minutes on the free tier when someone force-pushes a series of fixes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# Pinned versions are listed once at the top so a bump touches one line.
+# The actual `uses:` clauses still reference @vN majors directly (Actions
+# discourages env-templated `uses:` strings).
+env:
+  # Node 22 because pnpm 11.x requires Node >= 22.13 (the lockfile in
+  # this repo was written by pnpm 11.0.8; the lockfile itself is v9.0).
+  # Downgrading to pnpm 9 would let us stay on Node 20 but would risk
+  # re-writing the lockfile on the contributor's next local `pnpm install`.
+  NODE_VERSION: "22"
+  PNPM_VERSION: "11.0.8"
+  PYTHON_VERSION: "3.11"
+  SAM_CLI_TELEMETRY: "0"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # frontend — typecheck + production build of the Next.js app.
+  #
+  # `pnpm build` runs Next's full production pipeline (server bundle,
+  # client bundle, page generation), which catches a different class of
+  # errors than `next dev` (e.g. type errors that the dev server papers
+  # over via lazy compilation, or missing dynamic-route exports).
+  # ---------------------------------------------------------------------------
+  frontend:
+    name: frontend (typecheck + build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: pnpm install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: typecheck (apps/web)
+        run: pnpm --filter @neural-media/web typecheck
+
+      - name: build (apps/web)
+        # `next build` needs at least one NEXT_PUBLIC_* var the page reads
+        # to avoid hard-failing the static analysis. Set a harmless
+        # placeholder; the real value is injected at deploy time. The
+        # build artefacts aren't uploaded — we only care that it compiles.
+        env:
+          NEXT_PUBLIC_API_BASE_V2: http://localhost:3001
+        run: pnpm --filter @neural-media/web build
+
+  # ---------------------------------------------------------------------------
+  # python — compile every Lambda handler and shared module, then run the
+  # services/* pytest suites that ship.
+  #
+  # py_compile catches the syntax-error class of bugs that don't show up
+  # until cold-start in Lambda (where the failure message is opaque and
+  # 502s the API). The pytest suites cover the inference contract.
+  # ---------------------------------------------------------------------------
+  python:
+    name: python (compile + pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: compile lambdas + services
+        # `compileall -q -j 0` walks each tree and aborts on the first
+        # syntax error. The -x pattern skips .venv* and build/dist dirs
+        # if any contributor leaves them behind locally.
+        run: |
+          python -m compileall -q -j 0 -x '(\.venv|\.aws-sam|build/|dist/|__pycache__)' \
+            infra/aws/lambdas \
+            services/inference/neural_media_inference \
+            services/pipeline/neural_media_pipeline \
+            services/api/neural_media_api \
+            services/hf-space
+
+      - name: pip install services (editable)
+        # Mock backend only — the [real] extras pull TRIBE + torch and
+        # blow past the free-tier disk + minute budget. The mock path
+        # is what the test suites and the deployed Lambdas exercise.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e services/inference
+          python -m pip install -e services/pipeline
+          python -m pip install -e services/api
+          # httpx is required by Starlette's TestClient, which the
+          # services/api test suite uses. It's not declared as a runtime
+          # dep of the api package (FastAPI doesn't require httpx in
+          # production), so we install it explicitly here.
+          python -m pip install pytest httpx
+
+      - name: pytest services
+        run: |
+          set -euo pipefail
+          for svc in services/inference services/pipeline services/api; do
+            if [ -d "$svc/tests" ]; then
+              echo "::group::pytest $svc"
+              ( cd "$svc" && python -m pytest -q )
+              echo "::endgroup::"
+            else
+              echo "skip $svc (no tests/ dir)"
+            fi
+          done
+
+  # ---------------------------------------------------------------------------
+  # cfn — validate + build the SAM template.
+  #
+  # `sam validate --lint` runs cfn-lint against template.yaml and fails
+  # on any rule violation — circular dependencies, invalid property
+  # names, dynamic-reference misuse, etc. `sam build` packages the
+  # Lambda artefacts (no deploy — no AWS credentials needed).
+  # ---------------------------------------------------------------------------
+  cfn:
+    name: cfn (sam validate + build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          # cache pip even though we install very little — saves ~10s on
+          # the sam install since pip's resolver is cached.
+          cache: pip
+
+      - name: locate / install AWS SAM CLI
+        # GitHub-hosted Ubuntu runners ship AWS SAM CLI preinstalled
+        # (under /usr/local/aws-sam-cli/). Use it if it's there;
+        # otherwise fetch the latest release. Either way, `sam --version`
+        # is the success signal.
+        run: |
+          set -euo pipefail
+          if command -v sam >/dev/null 2>&1; then
+            echo "sam already installed: $(sam --version)"
+          else
+            curl -fsSL -o /tmp/sam.zip \
+              https://github.com/aws/aws-sam-cli/releases/latest/download/aws-sam-cli-linux-x86_64.zip
+            unzip -q /tmp/sam.zip -d /tmp/sam-install
+            sudo /tmp/sam-install/install
+            sam --version
+          fi
+
+      - name: sam validate --lint
+        working-directory: infra/aws
+        run: sam validate --lint
+
+      - name: sam build
+        working-directory: infra/aws
+        # arm64 isn't available on Ubuntu x86_64 runners, so let SAM
+        # build with whatever Linux arch the runner is; the deployed
+        # Lambda Architectures: [arm64] in template.yaml still applies
+        # to deploys — `sam build` just produces architecture-agnostic
+        # source artefacts when no container build is requested.
+        run: sam build
+
+  # ---------------------------------------------------------------------------
+  # e2e — Playwright regression net against the mock backend.
+  #
+  # tests/e2e boots its own mock-server.ts on :3001 and a real Next.js
+  # dev server on :3000 via playwright.config.ts's `webServer:` block,
+  # so the only external dependency is Chromium.
+  # ---------------------------------------------------------------------------
+  e2e:
+    name: e2e (Playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: pnpm install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: cache Playwright browsers
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          # Bump the cache version when the Playwright dep changes. Pinned
+          # to the lockfile so a `pnpm update @playwright/test` cache-busts.
+          key: pw-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: install Playwright (chromium + system deps)
+        # --with-deps installs the apt packages Chromium needs on Ubuntu.
+        # If the browser binary is already cached we still need the apt
+        # deps; this command is idempotent so it's safe either way.
+        run: pnpm -C tests/e2e exec playwright install --with-deps chromium
+
+      - name: run e2e
+        run: make e2e
+
+      - name: upload Playwright report (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: tests/e2e/playwright-report/
+          retention-days: 7

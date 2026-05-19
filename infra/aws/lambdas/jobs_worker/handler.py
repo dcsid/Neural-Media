@@ -61,16 +61,22 @@ def lambda_handler(event: dict, _context):
     if not job:
         return {"ok": False, "error": "job_not_found"}
 
-    # Translate the stored source into something the HF Space can fetch.
-    # For S3 uploads we hand the Space a presigned GET, so the Space never
-    # needs AWS credentials.
+    # Translate the stored source into the discriminated-union shape the
+    # HF Space's pydantic PredictRequest expects:
+    #   { "source": { "kind": "url" | "s3", "value": "<url>" } }
+    # We always tag kind="url" because S3 paths get presigned to URLs above,
+    # and the Space's url and s3 source handlers do the same thing once given
+    # an HTTP URL. Keeping the discriminator field around leaves room to
+    # eventually let the Space differentiate (e.g., to skip the redownload).
     source = job.get("source")
     if source == "url":
-        source_payload = {"source": "url", "url": job["sourceUrl"]}
+        source_payload = {"source": {"kind": "url", "value": job["sourceUrl"]}}
     elif source == "s3":
         source_payload = {
-            "source": "url",
-            "url": presigned_get(job["uploadKey"], expires_in=3600),
+            "source": {
+                "kind": "url",
+                "value": presigned_get(job["uploadKey"], expires_in=3600),
+            }
         }
     else:
         update_job(

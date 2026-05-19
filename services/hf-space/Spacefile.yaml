@@ -1,0 +1,17 @@
+# HuggingFace Space config for the neural-media TRIBE inference Space.
+#
+# HF Spaces actually reads its config from the YAML frontmatter of
+# README.md (the file `README.md` at the Space repo root).  We mirror
+# the same values here as the canonical record of what the Space wants
+# from HF, and the deploy script (see README §Deploy) syncs them into
+# the README frontmatter before pushing.
+
+sdk: docker
+hardware: zero-a10g      # ZeroGPU free tier (A10G allocated per-call)
+suggested_storage: small # we cache HF weights under /data/hf-cache
+app_port: 7860           # uvicorn listens here; HF maps the public port
+short_description: TRIBE v2 inference for single-video brain-prediction requests
+license: cc-by-nc-4.0    # matches services/inference and TRIBE upstream
+pinned: false
+secrets:
+  - CALLBACK_SHARED_SECRET   # must match the AWS Lambda's NM_CALLBACK_TOKEN

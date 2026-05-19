@@ -1,0 +1,32 @@
+version = 0.1
+
+# Default deploy profile. Override per-invocation with
+#   sam deploy --config-env <profile> --parameter-overrides Key=Value...
+#
+# First-time deploy: `sam deploy --guided` walks the prompts and persists
+# answers here. After that, plain `sam deploy` re-uses these settings.
+
+[default]
+[default.global.parameters]
+stack_name = "neural-media-aws"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+stack_name = "neural-media-aws"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true
+s3_prefix = "neural-media-aws"
+# Replace the HFSpaceUrl placeholder before the first deploy. The HF
+# callback secret is fetched from SSM SecureString (see README).
+parameter_overrides = "Stage=\"dev\" HFSpaceUrl=\"https://REPLACE-ME.hf.space\" FrontendOrigin=\"http://localhost:3000\" HFCallbackSecretSsmName=\"/neural-media/hf-callback-secret\" HFCallbackSecretSsmVersion=\"1\""
+
+[default.validate.parameters]
+lint = true
+
+[default.local_start_api.parameters]
+warm_containers = "EAGER"

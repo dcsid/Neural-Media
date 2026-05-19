@@ -1,0 +1,23 @@
+# HuggingFace Space — TRIBE inference (single-video product).
+#
+# Editable install of services/inference picks up the wrapper code
+# (TribeBackend, aggregate_region_metrics) and the [real] extra
+# which pulls torch + tribev2 + transitive HF-hub deps.  The Dockerfile
+# COPYs services/inference into the build context so this relative path
+# resolves at install time.
+
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.29,<1.0
+httpx>=0.27,<1.0
+pydantic>=2.6,<3.0
+
+# Video acquisition.  yt-dlp updates often; pin a recent minimum.
+yt-dlp>=2024.10.7
+
+# numpy floor matches what services/inference declares; pinning here
+# guards against pip resolving an older wheel for the Space image.
+numpy>=1.26,<3.0
+
+# TRIBE wrapper + its real-mode extras (torch, tribev2, etc).
+# The COPY in the Dockerfile lands the package at /app/services/inference.
+-e ./services/inference[real]

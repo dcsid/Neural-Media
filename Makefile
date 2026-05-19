@@ -21,7 +21,7 @@ export PYTHONPATH := $(REPO_ROOT)/services/pipeline:$(REPO_ROOT)/services/api:$(
 
 .PHONY: help install install-python install-web sample ingest init-db \
         dev dev-api dev-api-mock dev-web test test-python test-web \
-        typecheck-web clean unhide-pth bench-ingest
+        typecheck-web clean unhide-pth bench-ingest e2e
 
 help:
 	@echo "Neural Media — make targets"
@@ -123,6 +123,20 @@ test-python:
 
 typecheck-web:
 	cd apps/web && $(PNPM) typecheck
+
+# -----------------------------------------------------------------------------
+# End-to-end (Playwright)
+#
+# Walks the full /single → brain user journey against a fully mocked /v2/jobs*
+# backend (see tests/e2e/mock-server.ts). Playwright's webServer config boots
+# both apps/web (:3000) and the mock (:3001) before the suite runs.
+#
+# First run requires the chromium browser:
+#   $(PNPM) -C tests/e2e exec playwright install chromium
+# -----------------------------------------------------------------------------
+
+e2e:
+	$(PNPM) -C tests/e2e exec playwright test
 
 # -----------------------------------------------------------------------------
 # Clean

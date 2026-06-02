@@ -1,6 +1,10 @@
 import { Suspense } from "react";
 import { api, ApiError, serverBaseUrl } from "@/lib/api";
 import {
+  isAllMockRuns,
+  meanActivationAcrossRegions,
+} from "@/lib/dashboard-metrics";
+import {
   formatDateRange,
   formatWatchTimeHuman,
 } from "@/lib/format";
@@ -76,11 +80,7 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
       descriptions[def.region_id] = def.description;
     }
 
-    const meanActivation =
-      Object.values(aggregate.by_region).reduce(
-        (acc, b) => acc + (b?.mean ?? 0),
-        0,
-      ) / Math.max(1, Object.keys(aggregate.by_region).length);
+    const meanActivation = meanActivationAcrossRegions(aggregate.by_region);
 
     // Fetch one representative video's activation so the dashboard can
     // show the animated brain (per-frame interpolation) alongside the
@@ -106,9 +106,7 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
     // per-row URLs whenever every recent inference run is mock; the
     // aggregates above still tell the story.
     const runsForMockCheck = await api.inferenceRuns(opts).catch(() => []);
-    const allMock =
-      runsForMockCheck.length > 0 &&
-      runsForMockCheck.every((r) => r.model_id.startsWith("tribe-v2-mock"));
+    const allMock = isAllMockRuns(runsForMockCheck);
 
     return (
       <main className="mx-auto max-w-[1280px] px-8 pb-10 pt-12">

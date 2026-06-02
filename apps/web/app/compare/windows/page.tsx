@@ -9,6 +9,7 @@ import { api, ApiError, serverBaseUrl } from "@/lib/api";
 import { accumulateRegionMetrics, type RegionStat } from "@/lib/window-metrics";
 import { ApiOfflineState } from "@/components/ApiOfflineState";
 import { NoVideosState } from "@/components/NoVideosState";
+import { DemoModeBanner } from "@/components/DemoModeBanner";
 import { formatWatchTimeHuman, regionShortLabel } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
@@ -23,7 +24,7 @@ type Preset =
   | "month";        // last 30d vs previous 30d
 
 interface PageProps {
-  searchParams: Promise<{ p?: string }>;
+  searchParams: Promise<{ p?: string; demo?: string }>;
 }
 
 interface WindowRange {
@@ -42,14 +43,16 @@ interface WindowAggregate {
 const SAFE_METRICS_FETCH_CAP = 500; // Don't fire 10k parallel requests on huge histories.
 
 export default async function CompareWindowsPage({ searchParams }: PageProps) {
-  const { p } = await searchParams;
+  const { p, demo: demoParam } = await searchParams;
   const preset: Preset = isPreset(p) ? p : "week";
+  const demo = demoParam === "1" || demoParam === "true";
   const baseUrl = serverBaseUrl();
+  const opts = { baseUrl, demo };
 
   try {
     const [videos, watchEvents] = await Promise.all([
-      api.videos({ baseUrl }),
-      api.watchEvents({ baseUrl }),
+      api.videos(opts),
+      api.watchEvents(opts),
     ]);
 
     if (videos.length === 0) {
@@ -61,8 +64,8 @@ export default async function CompareWindowsPage({ searchParams }: PageProps) {
 
     const [rangeA, rangeB] = computeRanges(preset);
 
-    const aggA = await aggregateWindow(rangeA, watchEvents, durationByVideo, baseUrl);
-    const aggB = await aggregateWindow(rangeB, watchEvents, durationByVideo, baseUrl);
+    const aggA = await aggregateWindow(rangeA, watchEvents, durationByVideo, opts);
+    const aggB = await aggregateWindow(rangeB, watchEvents, durationByVideo, opts);
 
     const domainMax = Math.max(
       1e-6,
@@ -74,6 +77,7 @@ export default async function CompareWindowsPage({ searchParams }: PageProps) {
 
     return (
       <main className="mx-auto max-w-[1280px] px-8 pb-10 pt-12">
+        {demo ? <DemoModeBanner /> : null}
         <p className="eyebrow mb-4">Compare · windows</p>
         <h1 className="font-serif text-[32px] tracking-tightish text-ink-50">
           Two windows of your watch history, side by side.
@@ -84,7 +88,7 @@ export default async function CompareWindowsPage({ searchParams }: PageProps) {
           meaningful, absolutes are not.
         </p>
 
-        <PresetTabs current={preset} />
+        <PresetTabs current={preset} demo={demo} />
 
         <section className="mt-8 grid gap-x-8 gap-y-3 sm:grid-cols-2">
           <WindowSummary label="Window A" agg={aggA} highlight="a" />
@@ -157,7 +161,7 @@ async function aggregateWindow(
   range: WindowRange,
   watchEvents: WatchEvent[],
   durationByVideo: Map<string, number>,
-  baseUrl: string,
+  opts: { baseUrl: string; demo: boolean },
 ): Promise<WindowAggregate> {
   const inRange = watchEvents.filter((ev) => {
     const t = Date.parse(ev.watched_at);
@@ -181,7 +185,7 @@ async function aggregateWindow(
   const metricsLists = await Promise.all(
     idsToFetch.map((id) =>
       api
-        .videoMetrics(id, { baseUrl })
+        .videoMetrics(id, opts)
         .catch((err) => {
           // A 404 means the video has no completed inference yet — skip
           // it silently rather than failing the whole comparison.
@@ -204,12 +208,13 @@ async function aggregateWindow(
   };
 }
 
-function PresetTabs({ current }: { current: Preset }) {
+function PresetTabs({ current, demo }: { current: Preset; demo: boolean }) {
   const tabs: { value: Preset; label: string }[] = [
     { value: "day", label: "24 hours" },
     { value: "week", label: "7 days" },
     { value: "month", label: "30 days" },
   ];
+  const demoSuffix = demo ? "&demo=1" : "";
   return (
     <nav className="mt-8 flex items-center gap-1 border-b border-line text-[12px]">
       {tabs.map((t) => {
@@ -217,7 +222,7 @@ function PresetTabs({ current }: { current: Preset }) {
         return (
           <Link
             key={t.value}
-            href={`/compare/windows?p=${t.value}`}
+            href={`/compare/windows?p=${t.value}${demoSuffix}`}
             className={clsx(
               "px-3 py-2 -mb-px border-b-2 transition-colors",
               active

@@ -3,6 +3,11 @@ packages:
   - "shared"
   - "tests/*"
 allowBuilds:
+  # esbuild ships its platform binary via an optional dependency
+  # (@esbuild/<platform>), so its postinstall is a no-op for us — the
+  # Vitest harness in apps/web runs fine without it. Pulled in by the
+  # web test runner; declared here so pnpm stops flagging it as pending.
+  esbuild: false
   sharp: true
   unrs-resolver: true
 onlyBuiltDependencies:

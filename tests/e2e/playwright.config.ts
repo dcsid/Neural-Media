@@ -38,13 +38,14 @@ export default defineConfig({
     },
     {
       command: "pnpm --filter @neural-media/web dev",
-      // Gate readiness on /single — the page this suite actually exercises.
-      // The dashboard at `/` is a `force-dynamic` server component that
-      // awaits the v1 FastAPI (:8000) during SSR; the e2e harness only boots
-      // the mock (:3001), so probing `/` never returned healthy and the job
-      // sat until the start budget elapsed. /single is a client component
-      // ("use client") and returns its 200 shell with no backend.
-      url: `http://localhost:${WEB_PORT}/single`,
+      // Gate readiness on the PORT being open, not an HTTP status. Next dev
+      // binds :3000 in ~1.5s but compiles each route lazily on first request
+      // (/single is ~14s cold — r3f + the GLB). A `url:` probe holds that
+      // first compile's connection open and never settled in CI (the job sat
+      // until the start budget elapsed). A `port:` check is a TCP connect, so
+      // it's ready the moment the server listens; the first test's navigation
+      // (navigationTimeout: 30s) then absorbs the one-time compile.
+      port: WEB_PORT,
       reuseExistingServer: !process.env.CI,
       stdout: "pipe",
       stderr: "pipe",

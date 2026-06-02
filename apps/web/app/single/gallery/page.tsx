@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ActivationPayload } from "@/lib/api-v2";
 import type { RegionId } from "@shared/types";
+import { DemoModeBanner } from "@/components/DemoModeBanner";
 
 // Same dynamic import pattern as /single — R3F touches browser globals
 // during mount, so SSR has to be off. The placeholder mirrors the colour
@@ -164,6 +165,11 @@ export default function DemoGalleryPage() {
 
   return (
     <main className="mx-auto max-w-[1280px] px-8 pb-16 pt-12">
+      <DemoModeBanner cta={{ href: "/single", label: "Predict your own clip →" }}>
+        These predictions are precomputed and ship with the build — curated
+        short clips run through the pipeline in mock mode. Nothing is fetched
+        or inferred live.
+      </DemoModeBanner>
       <header className="motion-fade-in flex items-baseline justify-between gap-6">
         <div>
           <p className="eyebrow">Demo gallery</p>
@@ -269,7 +275,10 @@ function GalleryCard({
   entry: GalleryEntry;
   onOpen: (entry: GalleryEntry) => void;
 }) {
-  const isMock = entry.modelVersion.includes("mock");
+  // Contract check, matching MockModeBadge + InferenceRun.model_id: a mock
+  // backend stamps modelVersion with the "tribe-v2-mock" prefix. (.includes
+  // would also match an unrelated substring.)
+  const isMock = entry.modelVersion.startsWith("tribe-v2-mock");
   return (
     <button
       type="button"

@@ -230,13 +230,24 @@ export default function SingleVideoPage() {
 
   // ----- TRACKING: polling -----------------------------------------------
 
+  // Hoisted, referentially-stable primitives so the polling effect depends
+  // on exactly the job identity (jobId + startedAtMs). The per-tick status /
+  // elapsed updates keep the same identity, so they must NOT re-run the
+  // effect and restart polling; pulling these out of the dependency array
+  // (rather than inlining ternaries) also keeps the deps statically
+  // verifiable by react-hooks/exhaustive-deps.
+  const trackingJobId = phase.kind === "tracking" ? phase.jobId : null;
+  const trackingStartedAtMs =
+    phase.kind === "tracking" ? phase.startedAtMs : null;
+
   useEffect(() => {
-    if (phase.kind !== "tracking") return;
+    if (trackingJobId === null || trackingStartedAtMs === null) return;
+    const jobId = trackingJobId;
+    const startedAtMs = trackingStartedAtMs;
     const controller = new AbortController();
     abortRef.current = controller;
 
     let cancelled = false;
-    const { jobId, startedAtMs } = phase;
 
     async function poll() {
       let res: JobStatusResponse;
@@ -327,7 +338,7 @@ export default function SingleVideoPage() {
       controller.abort();
       window.clearInterval(interval);
     };
-  }, [phase.kind, phase.kind === "tracking" ? phase.jobId : null, phase.kind === "tracking" ? phase.startedAtMs : null]);
+  }, [trackingJobId, trackingStartedAtMs]);
 
   // ----- Render -----------------------------------------------------------
 
@@ -336,11 +347,14 @@ export default function SingleVideoPage() {
       <header className="motion-fade-in">
         <p className="eyebrow">Single video</p>
         <h1 className="mt-2 font-serif text-[28px] leading-tight tracking-tightish text-ink-50">
-          See your brain on a TikTok
+          {phase.kind === "result"
+            ? "Your brain on that TikTok"
+            : "See your brain on a TikTok"}
         </h1>
         <p className="mt-3 max-w-[64ch] text-[14px] leading-relaxed text-ink-200">
-          Paste a TikTok URL. Watch your brain predict its way through the
-          video.
+          {phase.kind === "result"
+            ? "Predicted average cortical response for your clip, rendered on the fsaverage5 surface below."
+            : "Paste a TikTok URL. Watch your brain predict its way through the video."}
         </p>
       </header>
 
@@ -435,6 +449,8 @@ function IdlePanel({
               inputMode="url"
               autoComplete="off"
               spellCheck={false}
+              required
+              aria-required="true"
               placeholder="https://www.tiktok.com/@user/video/..."
               value={state.url}
               onChange={onUrlChange}
@@ -449,12 +465,11 @@ function IdlePanel({
               type="submit"
               disabled={!valid || state.submitting}
               className={[
-                "w-full border border-line px-4 py-2 font-mono text-[12px]",
+                "w-full border px-4 py-2 font-mono text-[12px]",
                 "uppercase tracking-[0.08em] transition-colors",
                 valid && !state.submitting
                   ? "border-accent bg-accent/10 text-accent hover:bg-accent/20"
-                  : "text-ink-400",
-                "disabled:cursor-not-allowed disabled:opacity-50",
+                  : "cursor-not-allowed border-line bg-surface/40 text-ink-500",
               ].join(" ")}
             >
               {state.submitting ? "Submitting..." : "Predict"}
@@ -716,6 +731,9 @@ function UploadDropzone({ disabled, onFile, prominent }: UploadDropzoneProps) {
         hover
           ? "border-accent bg-accent/5 text-accent"
           : "border-line text-ink-200 hover:border-accent hover:text-accent",
+        // The real <input> is visually hidden (sr-only), so surface keyboard
+        // focus on the label itself.
+        "focus-within:border-accent focus-within:text-accent",
         disabled ? "cursor-not-allowed opacity-50" : "",
       ].join(" ")}
     >
@@ -723,6 +741,7 @@ function UploadDropzone({ disabled, onFile, prominent }: UploadDropzoneProps) {
         ref={inputRef}
         type="file"
         accept="video/mp4,video/*"
+        aria-label="Upload an MP4 video file"
         disabled={disabled}
         onChange={(e) => handleFile(e.target.files?.[0] ?? undefined)}
         className="sr-only"

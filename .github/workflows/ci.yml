@@ -68,6 +68,16 @@ jobs:
       - name: typecheck (apps/web)
         run: pnpm --filter @neural-media/web typecheck
 
+      - name: unit tests (apps/web — Vitest)
+        run: pnpm --filter @neural-media/web test:run
+
+      - name: brain-viz scrubber math (node:test)
+        # Pure scrubber-math suite: uses node:test and imports a .ts module.
+        # Node 22 only strips those types with this flag (it's the default
+        # from Node 23.6+, but the runner is pinned to 22 for the pnpm 11
+        # lockfile). Drop the flag once NODE_VERSION moves to >= 24.
+        run: node --experimental-strip-types --test apps/web/components/brain/scrubberMath.test.mjs
+
       - name: build (apps/web)
         # `next build` needs at least one NEXT_PUBLIC_* var the page reads
         # to avoid hard-failing the static analysis. Set a harmless

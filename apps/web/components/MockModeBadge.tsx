@@ -9,16 +9,28 @@ import { api, serverBaseUrl } from "@/lib/api";
 // Read the badge copy literally as "this is synthetic output, treat the
 // numbers below as a demo, not a reading of your brain." See
 // docs/scientific-framing.md (mirrored in-app at /about).
+
+// This badge lives in the root layout, so its fetch runs during EVERY
+// route's server-render. Bound it with a short timeout: if the API is slow
+// or unreachable (e.g. during e2e, or before the local API has started) the
+// fetch must never stall the page's SSR — on timeout we simply hide the
+// badge. Without this, an offline API blocks the server-render of every
+// route (the fetch hangs rather than failing fast, so the catch never runs).
+const BADGE_API_TIMEOUT_MS = 2_000;
+
 export async function MockModeBadge() {
   let hasMock = false;
   try {
-    const runs = await api.inferenceRuns({ baseUrl: serverBaseUrl() });
+    const runs = await api.inferenceRuns({
+      baseUrl: serverBaseUrl(),
+      signal: AbortSignal.timeout(BADGE_API_TIMEOUT_MS),
+    });
     hasMock = runs.some(
       (r) => r.status === "complete" && r.model_id.startsWith("tribe-v2-mock"),
     );
   } catch {
-    // API unreachable — let the page render its own offline state. The
-    // badge has no useful signal to add here.
+    // API unreachable, slow, or timed out — render nothing. The badge has
+    // no useful signal to add, and must never stall SSR.
     return null;
   }
   if (!hasMock) return null;

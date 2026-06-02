@@ -9,6 +9,9 @@ installed; they're skipped otherwise.
 from __future__ import annotations
 
 import importlib.util
+import os
+import shutil
+from pathlib import Path
 
 import pytest
 
@@ -36,15 +39,29 @@ def test_construction_without_license_accept_rejects(tmp_path):
         backend_tribe.TribeBackend(videos_dir=tmp_path)
 
 
-@pytest.mark.skipif(not _TRIBE_INSTALLED, reason="[real] extra not installed")
-def test_tribe_forward_smoke(tmp_path):  # pragma: no cover - manual
-    """Skipped unless `pip install '.[real]'`. Validates the real path
-    against a tiny fixture video. Run manually with a GPU."""
+@pytest.mark.integration
+@pytest.mark.skipif(not _TRIBE_INSTALLED, reason="[real] extra (tribev2) not installed")
+def test_tribe_forward_smoke(tmp_path):
+    """Real TRIBE v2 forward pass against a small fixture clip.
+
+    Skipped by default — it needs both the `[real]` extra
+    (`pip install '.[real]'`) and a fixture video, and realistically a GPU
+    host. Point it at a clip and run on demand::
+
+        NEURAL_MEDIA_TRIBE_FIXTURE=/path/to/clip.mp4 \\
+            pytest -m integration services/inference
+
+    Validates the wire contract the rest of the system depends on: a
+    ``(T, 20484)`` float32 tensor in ``[0, 1]`` plus a populated
+    reproducibility envelope (weights hash + torch version).
+    """
     from neural_media_inference import TribeBackend
 
-    fixture = tmp_path / "vid-test.mp4"
-    if not fixture.exists():
-        pytest.skip("no fixture video available")
+    fixture_src = os.environ.get("NEURAL_MEDIA_TRIBE_FIXTURE")
+    if not fixture_src or not Path(fixture_src).is_file():
+        pytest.skip("set NEURAL_MEDIA_TRIBE_FIXTURE=/path/to/clip.mp4 to run")
+    # TribeBackend resolves {videos_dir}/{video_id}.mp4, so stage the clip there.
+    shutil.copy(fixture_src, tmp_path / "vid-test.mp4")
 
     backend = TribeBackend(videos_dir=tmp_path, accept_licenses=True)
     out = backend.infer(

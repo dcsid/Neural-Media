@@ -44,6 +44,11 @@ dev = [
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+[tool.pytest.ini_options]
+markers = [
+  "integration: real-mode tests that need the [real] extra (torch + tribev2) and a fixture video, typically on a GPU host. Skipped by default; run on demand with `pytest -m integration`.",
+]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["neural_media_inference*"]

@@ -44,6 +44,19 @@ def test_default_test_client_host_testserver_is_rejected() -> None:
     assert r.status_code == 400
 
 
+def test_empty_host_header_is_rejected() -> None:
+    """A missing/empty Host must be refused, not silently allowed.
+
+    HTTP/1.1 clients always send a Host; an empty one is anomalous, and a
+    DNS-rebinding probe could omit it to slip past an allowlist that only
+    screens known-bad non-empty values. The guard returns 400.
+    """
+    client = TestClient(create_app(), base_url="http://localhost")
+    r = client.get("/api/v1/health", headers={"host": ""})
+    assert r.status_code == 400
+    assert "host" in r.json()["detail"].lower()
+
+
 def test_dev_runner_binds_loopback_only() -> None:
     """Source-level invariant: uvicorn.run is called with host='127.0.0.1'."""
     main_path = Path(__file__).resolve().parents[1] / "neural_media_api" / "main.py"

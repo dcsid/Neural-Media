@@ -427,6 +427,20 @@ class ImportRunner:
     ) -> ImportJob:
         """Atomically reserve the singleton slot, create the row, return it."""
         with self._lock:
+            # Race-free by construction: `_running_job_id` is read and
+            # written ONLY under `self._lock` — here, and in `_run`'s
+            # finally block when a finishing job releases the slot. The lock
+            # serializes the whole get()+status-check+create as one atomic
+            # step, so two concurrent claimers can never both pass the gate.
+            # There is no TOCTOU window between `jobs.get()` and the status
+            # check either: both read the single snapshot taken here.
+            #
+            # Consulting the DB row (not just `_running_job_id`) is a
+            # deliberate refinement: a worker stamps its terminal status
+            # into SQLite a beat before it reacquires the lock to clear the
+            # slot. Treating an already-terminal row as a stale slot lets a
+            # fresh claim proceed in that window instead of returning a
+            # spurious 409.
             if self._running_job_id is not None:
                 running = self._jobs.get(self._running_job_id)
                 if running and running.status not in _TERMINAL_STATUSES:
@@ -551,12 +565,27 @@ class ImportRunner:
 # ---------------------------------------------------------------------------
 
 def _progress_callback(jobs: ImportJobsStore, job_id: str) -> ProgressCallback:
-    """Build the on_progress callback we hand to the Orchestrator.
+    """Build the ``on_progress`` callback we hand to the Orchestrator.
 
-    Accepts a free-form dict so we don't fail on schema drift. Recognised
-    keys: ``phase`` / ``stage`` (either spelling), ``videos_total``,
-    ``videos_processed``, plus an optional ``current``/``total``/``phase``
-    cluster for callers that already speak the canonical shape.
+    The returned callable takes a single free-form ``dict`` event and
+    patches the import_jobs row. It tolerates schema drift: unrecognised
+    keys are ignored and a failed DB write is logged, never raised, so a
+    progress hiccup can't crash the orchestrator thread.
+
+    Recognised keys (all optional):
+
+    - ``phase`` or ``stage`` (str) → ``progress_phase``. Callers should use
+      the ``ImportPhase`` vocabulary from ``shared.schemas``
+      (``parsing | downloading | preprocessing | inferring``); the value is
+      stored verbatim and not validated here.
+    - ``videos_total`` or ``total`` (int) → ``progress_total``.
+    - ``videos_processed`` or ``current`` (int) → ``progress_current``.
+    - ``error`` (str, when non-None) → ``error``.
+
+    Flat (``videos_*``) and canonical (``current``/``total``) spellings are
+    both accepted; the flat names win when both appear. None of these
+    touch the top-level job ``status`` — that only flips at submission and
+    at terminal (see ``ImportRunner._run``).
     """
     def _cb(event: dict) -> None:
         fields: dict[str, Any] = {}

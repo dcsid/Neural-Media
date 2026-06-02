@@ -156,7 +156,6 @@ def _compute_aggregate(store: Store) -> AggregateReport:
     # tiktokv.com/share/video/<id>/ share-shortlinks). Surfaced as a real
     # row so the user can see the bucket size; suppressed from the
     # frontend's leaderboard view if the placeholder UX prefers.
-    rewatch_count: dict[str | None, int] = {}  # noqa: F841 (tracks rewatches only)
     author_videos: dict[str | None, set[str]] = {}
     author_watch_s: dict[str | None, float] = {}
     author_video_means: dict[str | None, list[float]] = {}

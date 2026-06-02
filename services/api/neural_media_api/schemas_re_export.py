@@ -1,8 +1,12 @@
-"""Re-export of shared contracts so routes don't import across services.
+"""Single local import surface for the shared contracts.
 
-The canonical shared module lives at `/shared/schemas.py` (repo-root). For
-the scaffold we import from a sibling path. The api-orchestrator worker
-should replace this with a proper `pip install -e ./shared` package layout.
+The canonical schemas live at ``/shared/schemas.py`` (repo root) so every
+service speaks one wire format. The API re-exports them through this module
+so route code imports from one local place instead of reaching across
+service boundaries. The ``sys.path`` shim below adds the repo root so
+``shared`` resolves as a plain top-level package: in this local-first
+monorepo that keeps a single source of truth (no build step, no vendored
+copy that could drift from the contract).
 """
 
 from __future__ import annotations
@@ -10,9 +14,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-_SHARED = Path(__file__).resolve().parents[3] / "shared"
-if str(_SHARED) not in sys.path:
-    sys.path.insert(0, str(_SHARED.parent))
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from shared.schemas import (  # noqa: E402,F401
     NUM_VERTICES,

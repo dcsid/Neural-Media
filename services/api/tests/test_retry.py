@@ -16,7 +16,12 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from neural_media_api.import_jobs import ImportRunner
+from neural_media_api.import_jobs import (
+    ImportJob,
+    ImportJobsStore,
+    ImportRunner,
+    JobAlreadyRunning,
+)
 from neural_media_api.main import create_app
 from neural_media_api.sqlite_store import init_db
 
@@ -276,7 +281,7 @@ def test_retry_on_complete_job_returns_409(
     resp = client.post("/api/v1/import/prev-complete/retry")
     assert resp.status_code == 409, resp.text
     body = resp.json()
-    assert body["error_code"] == "retry_not_retryable"
+    assert body["error_code"] == "job_not_retryable"
     assert "complete" in body["detail"]
 
 
@@ -398,3 +403,111 @@ def test_post_import_real_mode_blocker_codes(
         assert resp.status_code == 400, (blockers, resp.text)
         body = resp.json()
         assert body["error_code"] == expected_code, (blockers, body)
+
+
+# --- singleton-gate concurrency --------------------------------------------
+
+
+def test_concurrent_submit_and_retry_admits_exactly_one(
+    import_db: Path, imports_dir: Path, tmp_path: Path, small_export_bytes: bytes,
+) -> None:
+    """A POST (submit) and a retry (submit_retry) racing for the slot must
+    yield exactly one running job.
+
+    Both paths funnel through ``ImportRunner._claim_slot`` under one lock,
+    so no interleaving can let two orchestrators run at once. The two
+    callers sync on a barrier to maximise contention; whichever wins blocks
+    on ``release`` (the stub blocks both ingest_export and run_pending), so
+    the loser deterministically hits the gate. We assert exactly one wins,
+    the other raises ``JobAlreadyRunning`` pointing at the winner, and the
+    catalog holds a single in-flight row.
+    """
+    import sqlite3
+
+    # Seed a retryable 'partial' job for the retry path to target.
+    conn = sqlite3.connect(import_db)
+    try:
+        conn.execute(
+            "INSERT INTO import_jobs "
+            "(id, status, mode, created_at, updated_at, completed_at, "
+            " progress_current, progress_total, progress_phase, "
+            " error, source_filename) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "prev-partial", "partial", "mock",
+                "2026-05-16T00:00:00+00:00",
+                "2026-05-16T00:00:01+00:00",
+                "2026-05-16T00:00:01+00:00",
+                1, 2, None,
+                "one failed", "a.json",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    release = threading.Event()
+    runner = ImportRunner(
+        db_path=import_db,
+        activations_dir=tmp_path / "act",
+        videos_dir=tmp_path / "vid",
+        processed_dir=tmp_path / "proc",
+        orchestrator_factory=_factory(release=release),
+    )
+
+    export_path = tmp_path / "user_data.json"
+    export_path.write_bytes(small_export_bytes)
+
+    barrier = threading.Barrier(2)
+    results: dict[str, Any] = {}
+
+    def _submit() -> None:
+        barrier.wait()
+        try:
+            results["submit"] = runner.submit(export_path, "mock")
+        except JobAlreadyRunning as exc:
+            results["submit"] = exc
+
+    def _retry() -> None:
+        barrier.wait()
+        try:
+            results["retry"] = runner.submit_retry("prev-partial")
+        except JobAlreadyRunning as exc:
+            results["retry"] = exc
+
+    threads = [threading.Thread(target=_submit), threading.Thread(target=_retry)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+    assert all(not t.is_alive() for t in threads), "a caller deadlocked"
+
+    outcomes = [results["submit"], results["retry"]]
+    winners = [o for o in outcomes if isinstance(o, ImportJob)]
+    losers = [o for o in outcomes if isinstance(o, JobAlreadyRunning)]
+    assert len(winners) == 1 and len(losers) == 1, outcomes
+    # The 409 carries the job that actually holds the slot.
+    assert losers[0].running_job.id == winners[0].id
+
+    # The whole catalog holds exactly one in-flight row — proof the loser
+    # never created a second job.
+    conn = sqlite3.connect(import_db)
+    try:
+        (live,) = conn.execute(
+            "SELECT COUNT(*) FROM import_jobs "
+            "WHERE status NOT IN ('complete', 'partial', 'failed')"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert live == 1, f"expected 1 in-flight job, found {live}"
+
+    # Release the winner so its daemon thread + slot tear down cleanly.
+    release.set()
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        won = ImportJobsStore(import_db).get(winners[0].id)
+        if won is not None and won.status in {"complete", "partial", "failed"}:
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("winner never reached a terminal state after release")

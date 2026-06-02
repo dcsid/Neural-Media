@@ -160,3 +160,59 @@ def test_schema_statements_are_all_idempotent_create_statements() -> None:
     for stmt in SCHEMA_STATEMENTS:
         normalized = " ".join(stmt.split()).upper()
         assert "IF NOT EXISTS" in normalized, stmt
+
+
+def test_get_activation_wire_invariant_when_downsampled(tmp_path: Path) -> None:
+    """Regression: when T exceeds the wire cap, `timestamps` must be pooled to the
+    same length as every `region_means` series — the invariant api-v2.ts enforces.
+
+    The slow-path recompute previously emitted full-length timestamps alongside
+    downsampled region_means, so any video longer than the cap shipped a payload
+    the frontend rejects. (Same bug class T2 fixed in runner.run_inference.)
+    """
+    import json
+
+    import numpy as np
+    from shared.schemas import NUM_VERTICES
+
+    db = tmp_path / "neural_media.db"
+    init_db(db)
+    acts = tmp_path / "activations"
+    acts.mkdir()
+
+    T = 130  # > _WIRE_MAX_TIMEPOINTS (120) so the mean-pool path runs
+    rng = np.random.default_rng(7)
+    arr = rng.random(size=(T, NUM_VERTICES), dtype=np.float32)
+    npz = acts / "run-long.npz"
+    np.savez_compressed(npz, activations=arr)
+
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "INSERT INTO videos (id, source_url, title, author, duration_s, "
+            " downloaded, local_path, tags_json, first_seen_idx) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            ("vid-long", "https://www.tiktok.com/@u/video/1", None, "u",
+             86.7, 0, None, "[]", 0),
+        )
+        conn.execute(
+            "INSERT INTO inference_runs (id, video_id, model_id, model_version, "
+            " seed, params_json, created_at, activation_path, status) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            ("run-long", "vid-long", "tribe-v2-mock", "0.0.0-mock", 7,
+             json.dumps({"sample_rate_hz": 1.5}), "2026-06-02T00:00:00+00:00",
+             str(npz), "complete"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    activation = SqliteStore(db).get_activation("vid-long")
+    assert activation is not None
+    # num_timepoints keeps the true inference length...
+    assert activation.num_timepoints == T
+    # ...while the wire axis is pooled to the cap, matching every region series.
+    assert len(activation.timestamps) == 120
+    assert activation.region_means, "expected per-region series"
+    for region_id, series in activation.region_means.items():
+        assert len(series) == len(activation.timestamps), region_id

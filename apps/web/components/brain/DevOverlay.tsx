@@ -8,8 +8,15 @@ import { useEffect, useRef, useState } from "react";
 //
 // Tracked: instantaneous FPS, draw calls per frame, triangle count, and
 // JS-heap usage if the browser exposes `performance.memory` (Chromium only).
-// The brief budget is 60fps / <250MB / first paint <2s; this is the
-// instrument we use to verify it.
+//
+// Baseline (from the brain-viz brief): the performance budget is defined
+// against a **2021 MacBook Pro (Apple M1)** as the reference "mid-range
+// laptop" — 60fps sustained, JS heap < 250 MB, first mesh paint < 2s after
+// route navigation. The overlay turns a reading accent-coloured when it
+// breaches that budget: FPS below 45 (a 25% headroom margin under the 60fps
+// target, not the target itself — brief instabilities shouldn't read as
+// failures), heap above 250 MB, or first paint above 2000 ms. This HUD is
+// the instrument used to verify those numbers on the reference machine.
 
 export interface DevSample {
   fps: number;

@@ -37,19 +37,23 @@ export default defineConfig({
       timeout: 30_000,
     },
     {
-      command: "pnpm --filter @neural-media/web dev",
-      // Gate readiness on the PORT being open, not an HTTP status. Next dev
-      // binds :3000 in ~1.5s but compiles each route lazily on first request
-      // (/single is ~14s cold — r3f + the GLB). A `url:` probe holds that
-      // first compile's connection open and never settled in CI (the job sat
-      // until the start budget elapsed). A `port:` check is a TCP connect, so
-      // it's ready the moment the server listens; the first test's navigation
-      // (navigationTimeout: 30s) then absorbs the one-time compile.
+      // Run the e2e suite against a PRODUCTION build, not `next dev`. The
+      // /single route's dev-mode first compile is enormous (r3f + three + the
+      // fsaverage5 GLB — measured ~75s cold / ~10s warm locally), which blew
+      // past every per-navigation timeout and hung the job. A production build
+      // pre-compiles every route so serving is sub-second — and it's what
+      // actually ships. `next build` is already proven green by the `frontend`
+      // CI job.
+      command:
+        "pnpm --filter @neural-media/web build && pnpm --filter @neural-media/web start",
+      // TCP port check: `next start` binds :3000 as soon as it's up (after the
+      // build), with no HTTP-status dependency on a backend the harness omits.
       port: WEB_PORT,
       reuseExistingServer: !process.env.CI,
       stdout: "pipe",
       stderr: "pipe",
-      timeout: 180_000,
+      // Generous budget: covers `next build` (~1-2 min in CI) + `next start`.
+      timeout: 240_000,
       env: {
         // T4's api-v2 lib reads NEXT_PUBLIC_API_BASE_V2 at build time
         // (Next inlines NEXT_PUBLIC_* into the client bundle). It also

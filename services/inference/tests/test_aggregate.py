@@ -9,6 +9,7 @@ from neural_media_inference import (
     REGION_VERTEX_MASKS,
     aggregate_region_metrics,
     downsample_region_means,
+    downsample_timestamps,
     keyframe_vertex_snapshots,
 )
 from neural_media_inference._shared import NUM_VERTICES, REGION_IDS
@@ -104,3 +105,34 @@ def test_keyframe_keys_are_timestamps_when_supplied():
     parsed = sorted(float(k) for k in snaps)
     assert parsed[0] == pytest.approx(timestamps[0])
     assert parsed[-1] == pytest.approx(timestamps[-1])
+
+
+def test_downsample_timestamps_matches_region_means_length():
+    # The pooled time axis must be exactly as long as each pooled region
+    # series — both use the same np.linspace edges, so they can never disagree.
+    acts = _fake_activations(T=500)
+    timestamps = [i / 1.5 for i in range(500)]
+    pooled_ts = downsample_timestamps(timestamps, max_timepoints=50)
+    pooled_means = downsample_region_means(acts, max_timepoints=50)
+    assert len(pooled_ts) == 50
+    for series in pooled_means.values():
+        assert len(pooled_ts) == len(series)
+    # Monotonic, non-negative, and inside the original span.
+    assert pooled_ts == sorted(pooled_ts)
+    assert pooled_ts[0] >= 0.0
+    assert pooled_ts[-1] <= timestamps[-1]
+
+
+def test_downsample_timestamps_passthrough_when_short():
+    # T <= max_timepoints: returned unchanged (full precision, byte-stable),
+    # and still length-aligned with the region series for the same T.
+    timestamps = [i / 1.5 for i in range(10)]
+    out = downsample_timestamps(timestamps, max_timepoints=50)
+    assert out == timestamps
+    means = downsample_region_means(_fake_activations(T=10), max_timepoints=50)
+    assert all(len(out) == len(v) for v in means.values())
+
+
+def test_downsample_timestamps_rejects_nonpositive_cap():
+    with pytest.raises(ValueError):
+        downsample_timestamps([0.0, 1.0], max_timepoints=0)

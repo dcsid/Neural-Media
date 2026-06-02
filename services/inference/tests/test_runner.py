@@ -93,6 +93,19 @@ def test_activation_payload_has_keyframes_and_region_means(tmp_path):
     for vec in payload.keyframe_vertices.values():
         assert len(vec) == NUM_VERTICES
 
+    # Wire invariant (regression guard): the time axis must be the SAME length
+    # as every region series so a consumer can zip them. Here T=300 is
+    # downsampled to max_wire_timepoints=60, so `timestamps` must be 60 too —
+    # NOT the full 300. `num_timepoints` still records the native resolution.
+    assert payload.num_timepoints == 300
+    assert len(payload.timestamps) == 60
+    for region_id, series in payload.region_means.items():
+        assert len(payload.timestamps) == len(series), region_id
+    # Downsampled time axis still spans the clip and stays monotonic.
+    assert payload.timestamps == sorted(payload.timestamps)
+    assert payload.timestamps[0] >= 0.0
+    assert payload.timestamps[-1] < 200.0
+
 
 def test_compress_false_writes_uncompressed_and_round_trips(tmp_path):
     """`compress=False` is the demo/mock-mode escape hatch — must produce a

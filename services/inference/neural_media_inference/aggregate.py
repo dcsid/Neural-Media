@@ -35,6 +35,13 @@ from ._shared import NUM_VERTICES, REGION_IDS
 
 _MASKS_PATH = Path(__file__).resolve().parent / "data" / "region_masks.json"
 
+# Decimal places the standalone URL/gallery scripts round wire timestamps to.
+# `run_inference` emits full-precision timestamps (its committed fixtures are
+# byte-pinned, so changing precision there would silently diff `make sample`);
+# the offline scripts round their compact JSON to this so the two stay
+# identical to each other. Single source of truth so they can't drift apart.
+WIRE_TIMESTAMP_DECIMALS = 3
+
 
 def _load_region_masks(path: Path) -> tuple[dict[str, list[int]], dict[str, np.ndarray]]:
     """Load the committed HCP-MMP1 vertex masks. Validates against the
@@ -154,6 +161,36 @@ def downsample_region_means(
         )
         out[region_id] = pooled.tolist()
     return out
+
+
+def downsample_timestamps(
+    timestamps: Sequence[float] | np.ndarray,
+    *,
+    max_timepoints: int,
+) -> list[float]:
+    """Pool a per-timepoint time axis onto the same bins `downsample_region_means`
+    uses, so the wire payload's ``timestamps`` stays the same length as every
+    ``region_means`` series.
+
+    Each bin's representative time is the **mean** of the timestamps it covers
+    — the midpoint of the block whose activations were mean-pooled — so a chart
+    of ``(timestamp, region_mean)`` pairs lines up. Returns a list of length
+    ``min(len(timestamps), max_timepoints)``; a series already at or under the
+    cap is returned unchanged (full precision, byte-stable).
+
+    Mirrors the ``np.linspace(0, T, max_timepoints + 1)`` edges in
+    `downsample_region_means` exactly, so the two always agree on length.
+    """
+    if max_timepoints <= 0:
+        raise ValueError(f"max_timepoints must be positive, got {max_timepoints}")
+    ts = np.asarray(timestamps, dtype=np.float64)
+    if ts.ndim != 1:
+        raise ValueError(f"timestamps must be 1-D, got shape {ts.shape}")
+    T = ts.shape[0]
+    if T <= max_timepoints:
+        return ts.tolist()
+    edges = np.linspace(0, T, max_timepoints + 1, dtype=np.int64)
+    return [float(ts[edges[i]:edges[i + 1]].mean()) for i in range(max_timepoints)]
 
 
 def keyframe_vertex_snapshots(

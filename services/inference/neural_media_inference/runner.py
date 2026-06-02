@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -38,9 +39,12 @@ from ._shared import (
 from .aggregate import (
     aggregate_region_metrics,
     downsample_region_means,
+    downsample_timestamps,
     keyframe_vertex_snapshots,
 )
 from .backend import InferenceBackend, MockBackend
+
+_log = logging.getLogger(__name__)
 
 
 DEFAULT_PREPROCESSING_PARAMS: dict[str, Any] = {
@@ -104,6 +108,13 @@ def run_inference(
     run_id = run_id if run_id is not None else str(uuid.uuid4())
     created_at = created_at if created_at is not None else datetime.now(timezone.utc)
 
+    # INFO-level breadcrumbs so a real GPU run isn't silent for minutes while
+    # TRIBE chews through a clip (the heavy weight-load happens in the
+    # backend's constructor; this is the forward pass).
+    _log.info(
+        "event=infer-start video_id=%s model=%s duration_s=%.1f sample_rate_hz=%.3f",
+        video_id, backend.model_id, duration_s, sample_rate_hz,
+    )
     activations = backend.infer(
         video_id=video_id,
         duration_s=duration_s,
@@ -124,7 +135,10 @@ def run_inference(
         )
 
     num_timepoints = int(activations.shape[0])
-    timestamps = (np.arange(num_timepoints, dtype=np.float64) / sample_rate_hz).tolist()
+    # Full-resolution time axis (one entry per timepoint). Keyframe snapshots
+    # index into this at native resolution; the wire payload carries the
+    # downsampled axis below so it stays the same length as `region_means`.
+    full_timestamps = np.arange(num_timepoints, dtype=np.float64) / sample_rate_hz
 
     # Reproducibility envelope — CONTRACTS.md §8.
     preprocessing_params = {**DEFAULT_PREPROCESSING_PARAMS, **(extra_params or {})}
@@ -174,8 +188,12 @@ def run_inference(
     region_metrics = [RegionMetrics(**row) for row in metric_dicts]
 
     region_means = downsample_region_means(activations, max_timepoints=max_wire_timepoints)
+    # Pool the time axis onto the SAME bins as region_means so the wire payload
+    # honours len(timestamps) == len(region_means[region]) for every region —
+    # the invariant the frontend (apps/web/lib/api-v2.ts) enforces.
+    wire_timestamps = downsample_timestamps(full_timestamps, max_timepoints=max_wire_timepoints)
     keyframe_vertices = keyframe_vertex_snapshots(
-        activations, num_keyframes=num_keyframes, timestamps=timestamps
+        activations, num_keyframes=num_keyframes, timestamps=full_timestamps
     )
 
     activation_payload = ActivationOutput(
@@ -183,7 +201,7 @@ def run_inference(
         video_id=video_id,
         num_timepoints=num_timepoints,
         sample_rate_hz=sample_rate_hz,
-        timestamps=timestamps,
+        timestamps=wire_timestamps,
         keyframe_vertices=keyframe_vertices,
         region_means=region_means,
     )
@@ -198,6 +216,12 @@ def run_inference(
         created_at=created_at,
         activation_path=str(activation_path),
         status="complete",
+    )
+
+    _log.info(
+        "event=infer-complete video_id=%s run_id=%s num_timepoints=%d "
+        "wire_timepoints=%d activations=%s",
+        video_id, run_id, num_timepoints, len(wire_timestamps), activation_path.name,
     )
 
     return RunArtifacts(

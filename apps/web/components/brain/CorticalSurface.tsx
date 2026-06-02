@@ -158,6 +158,9 @@ export function CorticalSurface({
       geo.setAttribute("color", attr);
     }
 
+    // Capture the GLB's shipped material before we swap in our own so the
+    // disposal effect below can free it too (we orphan it here otherwise).
+    const originalMaterial = m.material;
     const mat = new THREE.MeshStandardMaterial({
       vertexColors: true,
       roughness: 0.55,
@@ -165,7 +168,13 @@ export function CorticalSurface({
     });
     m.material = mat;
 
-    return { mesh: m, colorAttr: attr, scratch: new Float32Array(count) };
+    return {
+      mesh: m,
+      colorAttr: attr,
+      scratch: new Float32Array(count),
+      material: mat,
+      originalMaterial,
+    };
   }, [gltf, url]);
 
   const mesh = built?.mesh;
@@ -176,6 +185,29 @@ export function CorticalSurface({
     if (!built) return;
     onReady?.();
   }, [onReady, built]);
+
+  // Free GPU resources when the surface is rebuilt (url/GLB change) or the
+  // component unmounts. three.js never auto-disposes geometry buffers or
+  // materials, so without this every HMR edit, StrictMode remount, or
+  // BrainMeshCompare side-swap would leak the cortical-surface geometry's
+  // GPU buffers (including the per-vertex colour attribute) and the
+  // MeshStandardMaterial. `built` is a fresh per-parse object (see the
+  // loader note above) and only ever becomes non-null after the async
+  // fetch resolves, so this cleanup always targets exactly the resources
+  // created here — never ones a later render of the same instance reuses.
+  useEffect(() => {
+    if (!built) return;
+    const { mesh, material, originalMaterial } = built;
+    return () => {
+      mesh.geometry.dispose();
+      material.dispose();
+      if (Array.isArray(originalMaterial)) {
+        for (const m of originalMaterial) m.dispose();
+      } else if (originalMaterial) {
+        originalMaterial.dispose();
+      }
+    };
+  }, [built]);
 
   // When rotation is frozen externally (tour mode drives the camera),
   // reset the surface group's accumulated y-rotation to 0 so the tour
@@ -231,6 +263,13 @@ export function CorticalSurface({
   // Smoothed pulse intensity in [0, 1] — eases up when playing, eases
   // down when paused. Avoids a hard on/off pop at the 500ms boundary.
   const pulseEnvelopeRef = useRef(0);
+
+  // Per-region pulse-multiplier scratch, sized to regionOrder and reused
+  // across frames. Allocating a fresh Float32Array inside useFrame every
+  // frame the pulse is active was measurable GC churn on the 60fps path;
+  // we mutate this in place instead and only ever reallocate if the region
+  // count itself changes (never, in practice).
+  const regionMultRef = useRef<Float32Array | null>(null);
 
   // First-paint colour fill. Without this, the useFrame dirty-check would
   // see displayed === target and skip the paint on frame 1, leaving the
@@ -414,7 +453,12 @@ export function CorticalSurface({
       // Precompute the per-region multiplier so the hot loop is just an
       // index lookup + three mults. Phase offsets pulled from a small
       // golden-ratio sequence so neighbouring regions never collide.
-      const regionMult = new Float32Array(regionOrder.length);
+      // Reuse the hoisted scratch buffer; every slot is overwritten below
+      // before it's read, so no stale-value clearing is needed.
+      let regionMult = regionMultRef.current;
+      if (!regionMult || regionMult.length !== regionOrder.length) {
+        regionMult = regionMultRef.current = new Float32Array(regionOrder.length);
+      }
       for (let r = 0; r < regionOrder.length; r++) {
         const region = regionOrder[r];
         const mean = displayed.current[region] ?? 0;

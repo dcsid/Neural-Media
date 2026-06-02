@@ -44,11 +44,15 @@ export function WatchedVideosList({
               <div className="min-w-0">
                 <Link
                   href={`/v/${video.id}${demoSuffix}`}
+                  title={videoTitle(video)}
                   className="block truncate text-ink-50 hover:text-accent"
                 >
                   {videoTitle(video)}
                 </Link>
-                <p className="mt-1 truncate text-[11px] text-ink-400">
+                <p
+                  className="mt-1 truncate text-[11px] text-ink-400"
+                  title={video.author ? `@${video.author}` : video.source_url}
+                >
                   {video.author ? `@${video.author}` : video.source_url}
                 </p>
               </div>

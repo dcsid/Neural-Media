@@ -22,9 +22,8 @@ export default function AboutPage() {
           predicted average cortical response
         </span>{" "}
         across the 720 subjects TRIBE was trained on. The four sections
-        below are the framing the rest of the app is built against. If a
-        chart label or tooltip drifts from this language, the chart is
-        wrong, not the page.
+        below spell out exactly what the numbers in this app mean — and,
+        just as importantly, what they don&apos;t.
       </p>
 
       <section className="mt-12 grid gap-x-12 gap-y-10 border-t border-line pt-10 md:grid-cols-2">

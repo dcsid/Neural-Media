@@ -153,6 +153,20 @@ interface RequestOpts {
   signal?: AbortSignal;
 }
 
+// True for the AbortError thrown when a request's AbortSignal fires. We
+// match on `name` rather than `instanceof DOMException` because aborts are
+// surfaced as plain Errors in some runtimes (undici, test fetch mocks), and
+// re-wrapping a deliberate abort as an "offline" ApiV2Error would mask it —
+// the /single polling loop relies on the abort propagating untouched.
+function isAbortError(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    "name" in err &&
+    (err as { name?: unknown }).name === "AbortError"
+  );
+}
+
 async function postJson<TBody, TResp>(
   path: string,
   body: TBody,
@@ -172,7 +186,7 @@ async function postJson<TBody, TResp>(
       cache: "no-store",
     });
   } catch (err) {
-    if (err instanceof DOMException && err.name === "AbortError") throw err;
+    if (isAbortError(err)) throw err;
     throw new ApiV2Error({
       kind: "offline",
       url,
@@ -196,7 +210,7 @@ async function getJson<TResp>(
       cache: "no-store",
     });
   } catch (err) {
-    if (err instanceof DOMException && err.name === "AbortError") throw err;
+    if (isAbortError(err)) throw err;
     throw new ApiV2Error({
       kind: "offline",
       url,
@@ -274,7 +288,7 @@ export async function confirmUpload(
       cache: "no-store",
     });
   } catch (err) {
-    if (err instanceof DOMException && err.name === "AbortError") throw err;
+    if (isAbortError(err)) throw err;
     throw new ApiV2Error({
       kind: "offline",
       url,
@@ -309,7 +323,7 @@ export async function putUpload(
       signal: opts.signal,
     });
   } catch (err) {
-    if (err instanceof DOMException && err.name === "AbortError") throw err;
+    if (isAbortError(err)) throw err;
     throw new ApiV2Error({
       kind: "offline",
       url: uploadUrl,
@@ -353,7 +367,7 @@ export async function fetchActivation(
       cache: "no-store",
     });
   } catch (err) {
-    if (err instanceof DOMException && err.name === "AbortError") throw err;
+    if (isAbortError(err)) throw err;
     throw new ApiV2Error({
       kind: "offline",
       url: resultUrl,

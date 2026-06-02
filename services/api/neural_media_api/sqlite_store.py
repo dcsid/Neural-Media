@@ -306,6 +306,7 @@ class SqliteStore:
         import numpy as np
         from neural_media_inference import (
             downsample_region_means,
+            downsample_timestamps,
             keyframe_vertex_snapshots,
         )
 
@@ -314,14 +315,20 @@ class SqliteStore:
 
         sample_rate_hz = float(run.params_json.get("sample_rate_hz", 1.0))
         num_timepoints = int(activations.shape[0])
-        timestamps = (
-            np.arange(num_timepoints, dtype=np.float64) / sample_rate_hz
-        ).tolist()
+        # Full-resolution axis drives keyframe selection; the wire payload must
+        # carry the *pooled* axis so len(timestamps) == len(region_means[region])
+        # for every region (the invariant api-v2.ts enforces). Mirrors
+        # runner.run_inference exactly, so this slow-path recompute produces the
+        # same wire shape as the fast-path `<run_id>.json` sidecar.
+        full_timestamps = np.arange(num_timepoints, dtype=np.float64) / sample_rate_hz
         region_means = downsample_region_means(
             activations, max_timepoints=_WIRE_MAX_TIMEPOINTS
         )
+        wire_timestamps = downsample_timestamps(
+            full_timestamps, max_timepoints=_WIRE_MAX_TIMEPOINTS
+        )
         keyframe_vertices = keyframe_vertex_snapshots(
-            activations, num_keyframes=_WIRE_NUM_KEYFRAMES, timestamps=timestamps
+            activations, num_keyframes=_WIRE_NUM_KEYFRAMES, timestamps=full_timestamps
         )
 
         return ActivationOutput(
@@ -329,7 +336,7 @@ class SqliteStore:
             video_id=video_id,
             num_timepoints=num_timepoints,
             sample_rate_hz=sample_rate_hz,
-            timestamps=timestamps,
+            timestamps=wire_timestamps,
             keyframe_vertices=keyframe_vertices,
             region_means=region_means,
         )

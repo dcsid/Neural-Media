@@ -214,9 +214,17 @@ class SqliteStore:
     # --- connection plumbing ---------------------------------------------
 
     def _connect(self) -> sqlite3.Connection:
-        # `uri=True` would let us open read-only via file:...?mode=ro, but
-        # that fails if the file does not exist yet. A normal connect on a
-        # missing path *creates* an empty file, so we guard explicitly.
+        # `sqlite3.connect()` *creates* an empty file when `db_path` is
+        # missing — even for what we intend as read-only access. A read must
+        # never materialise a stray empty DB (it would mask "no data yet" as
+        # a real-but-empty catalog), so every read first gates on
+        # `self.db_path.is_file()` in `_query`; by the time we get here the
+        # file is known to exist.
+        #
+        # `uri=True` + `?mode=ro` would refuse to create, but it *raises* on
+        # a missing file — exactly the 500 the is_file() guard spares us.
+        # Provisioning the file is the writer's job alone: `init_db()` is the
+        # one place that deliberately (and idempotently) creates the schema.
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn

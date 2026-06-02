@@ -2,6 +2,14 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useReducedMotion } from "./hooks/useReducedMotion";
+import {
+  clampSeconds,
+  isAtEnd,
+  resolveSnapTolerance,
+  secondsFromClientX,
+  shouldAutoPauseAtEnd,
+  snapToKeyframe,
+} from "./scrubberMath";
 
 // Scrubber for the Video Detail view. Owned by brain-viz because it is the
 // thing that drives the mesh's playhead — the <video> element itself (when
@@ -110,28 +118,9 @@ export function TimelineScrubber({
     return filtered.length > 0 ? filtered : null;
   }, [keyframeTimes, duration]);
 
-  const snapTol = useMemo(() => {
-    if (snapToleranceSec !== undefined) return Math.max(0, snapToleranceSec);
-    return duration > 0 ? duration * 0.04 : 0;
-  }, [snapToleranceSec, duration]);
-
-  // Pick the closest keyframe within `snapTol`. Returns the raw seek time
-  // unchanged when no keyframes are configured or none is in range.
-  const snapToKeyframe = useCallback(
-    (t: number): number => {
-      if (!sortedKeyframes || snapTol <= 0) return t;
-      let bestT = t;
-      let bestDelta = snapTol;
-      for (const k of sortedKeyframes) {
-        const d = Math.abs(k - t);
-        if (d <= bestDelta) {
-          bestDelta = d;
-          bestT = k;
-        }
-      }
-      return bestT;
-    },
-    [sortedKeyframes, snapTol],
+  const snapTol = useMemo(
+    () => resolveSnapTolerance(snapToleranceSec, duration),
+    [snapToleranceSec, duration],
   );
 
   const seekFromClientX = useCallback(
@@ -139,11 +128,10 @@ export function TimelineScrubber({
       const el = trackRef.current;
       if (!el || !duration || !onSeek) return;
       const rect = el.getBoundingClientRect();
-      const f = (clientX - rect.left) / rect.width;
-      const raw = Math.max(0, Math.min(duration, f * duration));
-      onSeek(snapToKeyframe(raw));
+      const raw = secondsFromClientX(clientX, rect.left, rect.width, duration);
+      onSeek(snapToKeyframe(raw, sortedKeyframes, snapTol));
     },
-    [duration, onSeek, snapToKeyframe],
+    [duration, onSeek, sortedKeyframes, snapTol],
   );
 
   const onPointerDown = useCallback(
@@ -200,7 +188,7 @@ export function TimelineScrubber({
       if (e.shiftKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
         step *= 5;
       }
-      onSeek(Math.max(0, Math.min(duration, playheadSec + step)));
+      onSeek(clampSeconds(playheadSec + step, duration));
     },
     [duration, onSeek, playheadSec],
   );
@@ -208,7 +196,7 @@ export function TimelineScrubber({
   // Auto-pause when we hit the end. Wrap-around would be confusing for a
   // predicted-activation scrub; the user can replay from the start manually.
   useEffect(() => {
-    if (playing && duration > 0 && playheadSec >= duration) {
+    if (shouldAutoPauseAtEnd(playing, playheadSec, duration)) {
       setPlaying(false);
     }
   }, [playing, playheadSec, duration]);
@@ -253,7 +241,7 @@ export function TimelineScrubber({
   }, []);
 
   const canPlay = !!onSeek && duration > 0;
-  const atEnd = duration > 0 && playheadSec >= duration - 1e-3;
+  const atEnd = isAtEnd(playheadSec, duration);
 
   return (
     <div

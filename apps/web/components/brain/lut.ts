@@ -33,9 +33,18 @@ const STOPS: ReadonlyArray<readonly [number, number, number]> = [
   [1.000, 0.960, 0.700],
 ];
 
-// Mild gamma toward the dark end so 0.2–0.4 values land in visibly
-// distinct red tones rather than collapsing toward black. 0.85 chosen
-// empirically against the mock activations. Set to 1.0 to disable.
+// Perceptual gamma applied as `pow(t, GAMMA)` before the LUT lookup (see
+// `cividis` below). With GAMMA < 1 the curve is concave: low inputs are
+// pushed UP the ramp, so the dim 0.2–0.4 activations that dominate the mock
+// predictions spread into visibly distinct reds instead of collapsing toward
+// the near-black dark end. GAMMA = 1.0 is linear (no remap); GAMMA > 1 would
+// do the opposite — crush low values toward black — which we don't want here.
+//
+// Meaningful range: (0, 1]. 0.85 is a deliberately mild correction chosen
+// empirically against the mock activations — enough to separate the low-mid
+// band without washing out the high end or distorting the relative ordering
+// of activations (the map stays monotonic for any GAMMA > 0). Set to 1.0 to
+// disable.
 const GAMMA = 0.85;
 
 export function cividis(t: number): [number, number, number] {

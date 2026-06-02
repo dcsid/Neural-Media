@@ -63,7 +63,10 @@ import numpy as np  # noqa: E402
 
 from shared.schemas import VideoMetadata  # noqa: E402
 
-from neural_media_inference.aggregate import aggregate_region_metrics  # noqa: E402
+from neural_media_inference.aggregate import (  # noqa: E402
+    WIRE_TIMESTAMP_DECIMALS,
+    aggregate_region_metrics,
+)
 from neural_media_inference.backend import MockBackend  # noqa: E402
 from functools import partial  # noqa: E402
 
@@ -129,15 +132,21 @@ def _ffprobe_duration(path: Path) -> float:
 
 
 def _build_timestamps(num_timepoints: int) -> list[float]:
-    """One timestamp per timepoint, in seconds.
+    """One timestamp per timepoint, in seconds — length ``num_timepoints``.
 
-    Mirror of services/hf-space/app.py:_build_timestamps — values
-    rounded to 6 decimals for byte-stable wire output.
+    Derived from the actual timepoint count the backend produced so this
+    array is always the same length as each ``byRegion`` series (the
+    invariant apps/web/lib/api-v2.ts enforces). Rounded to the shared
+    ``WIRE_TIMESTAMP_DECIMALS`` so the two offline scripts (this one and
+    build_demo_gallery.py) emit identical precision. The field *shape*
+    matches services/hf-space/app.py's callback payload; its deployed
+    counterpart happens to round wider, which is cosmetic — the frontend
+    validates lengths and types, not decimal places.
     """
     if num_timepoints <= 0:
         return []
     dt = 1.0 / SAMPLE_RATE_HZ
-    return [round(i * dt, 6) for i in range(num_timepoints)]
+    return [round(i * dt, WIRE_TIMESTAMP_DECIMALS) for i in range(num_timepoints)]
 
 
 def _seed_from_url(url: str) -> int:

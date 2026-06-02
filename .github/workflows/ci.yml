@@ -155,9 +155,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          # cache pip even though we install very little — saves ~10s on
-          # the sam install since pip's resolver is cached.
-          cache: pip
+          # No `cache: pip` here: this job installs no pip packages (SAM
+          # ships via the curl installer below), so enabling the cache makes
+          # setup-python's post-run step fail looking for a nonexistent
+          # ~/.cache/pip — which reds the whole job even though validate +
+          # build pass.
 
       - name: locate / install AWS SAM CLI
         # GitHub-hosted Ubuntu runners ship AWS SAM CLI preinstalled

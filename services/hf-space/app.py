@@ -370,7 +370,10 @@ def _build_timestamps(num_timepoints: int) -> list[float]:
     if num_timepoints <= 0:
         return []
     dt = 1.0 / 1.5
-    return [round(i * dt, 6) for i in range(num_timepoints)]
+    # 3dp matches the wire convention the local scripts use
+    # (neural_media_inference.WIRE_TIMESTAMP_DECIMALS), so every producer of an
+    # ActivationPayload rounds the time axis identically.
+    return [round(i * dt, 3) for i in range(num_timepoints)]
 
 
 @_gpu_decorator

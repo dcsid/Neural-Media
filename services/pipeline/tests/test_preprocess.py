@@ -152,6 +152,21 @@ def test_missing_source_raises(tmp_path: Path) -> None:
         preprocess_video(tmp_path / "nope.mp4", "vid", cfg, run=lambda args: None)
 
 
+def test_directory_source_raises(tmp_path: Path) -> None:
+    """A directory (exists() is True but is_file() is False) is rejected
+    clearly before ffmpeg is ever invoked, rather than being handed to
+    ffmpeg as an unreadable input."""
+    cfg = _cfg(tmp_path)
+    a_dir = tmp_path / "videos" / "looks-like.mp4"  # a dir named like a file
+    a_dir.mkdir(parents=True)
+
+    def boom(args: list[str]) -> None:  # pragma: no cover — must not run
+        raise AssertionError("ffmpeg must not run on a non-file source")
+
+    with pytest.raises(FileNotFoundError, match="not a regular file"):
+        preprocess_video(a_dir, "vid", cfg, run=boom)
+
+
 def test_ffmpeg_failure_propagates(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
     src = _make_src(tmp_path)
@@ -195,6 +210,21 @@ def test_invalid_config_rejected(tmp_path: Path) -> None:
 def test_resolution_wh_property(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path, video_resolution="640x360")
     assert cfg.resolution_wh == (640, 360)
+
+
+def test_resolution_with_three_dimensions_rejected(tmp_path: Path) -> None:
+    """'224x224x10' must fail with a clear 'WxH' message, not a cryptic
+    "too many values to unpack" error from the naive split('x')."""
+    with pytest.raises(ValueError, match="WxH"):
+        PreprocessConfig(processed_dir=tmp_path, video_resolution="224x224x10")
+
+
+def test_resolution_with_non_integer_dimension_rejected(tmp_path: Path) -> None:
+    """A non-numeric or missing dimension fails with a clear message."""
+    with pytest.raises(ValueError, match="integer"):
+        PreprocessConfig(processed_dir=tmp_path, video_resolution="224xtall")
+    with pytest.raises(ValueError, match="integer"):
+        PreprocessConfig(processed_dir=tmp_path, video_resolution="224x")
 
 
 # ---------------------------------------------------------------------------

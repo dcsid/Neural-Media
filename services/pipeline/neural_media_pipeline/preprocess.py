@@ -93,9 +93,7 @@ class PreprocessConfig:
     audio_bitrate: str = "128k"
 
     def __post_init__(self) -> None:
-        if "x" not in self.video_resolution.lower():
-            raise ValueError("video_resolution must be 'WxH', e.g. '224x224'")
-        w, h = self.resolution_wh
+        w, h = self.resolution_wh  # validates the 'WxH' shape with a clear message
         if w <= 0 or h <= 0:
             raise ValueError("video_resolution dimensions must be positive")
         if self.video_fps < 1:
@@ -107,8 +105,27 @@ class PreprocessConfig:
 
     @property
     def resolution_wh(self) -> tuple[int, int]:
-        w, h = self.video_resolution.lower().split("x")
-        return int(w), int(h)
+        """Parse ``video_resolution`` ('WxH') into integer (width, height).
+
+        Validates that the string is *exactly* two integer dimensions
+        joined by a single ``x`` and raises a clear ``ValueError``
+        otherwise — e.g. ``'224x224x10'`` (three dimensions) or ``'224x'``
+        (missing height) — instead of the cryptic "too many values to
+        unpack" / ``int()`` error the naive ``split('x')`` produced.
+        """
+        parts = self.video_resolution.lower().split("x")
+        if len(parts) != 2:
+            raise ValueError(
+                f"video_resolution must be 'WxH', e.g. '224x224'; "
+                f"got {self.video_resolution!r}"
+            )
+        try:
+            return int(parts[0]), int(parts[1])
+        except ValueError:
+            raise ValueError(
+                f"video_resolution dimensions must be integers, e.g. '224x224'; "
+                f"got {self.video_resolution!r}"
+            ) from None
 
     def extra_params(self) -> dict[str, Any]:
         """Payload for ``run_inference(extra_params=...)``.
@@ -179,8 +196,11 @@ def preprocess_video(
     Idempotent: if the processed output already exists with non-zero
     size, returns ``skipped=True`` and does not invoke ffmpeg.
     """
-    if not src.exists():
-        raise FileNotFoundError(f"source video missing: {src.name}")
+    # ``is_file`` (not ``exists``) so a directory or other non-regular path
+    # fails here with a clear message instead of handing ffmpeg an input it
+    # can't read and surfacing a cryptic non-zero-exit error.
+    if not src.is_file():
+        raise FileNotFoundError(f"source video missing or not a regular file: {src.name}")
 
     dest = _output_path(cfg, video_id)
     if dest.exists() and dest.stat().st_size > 0:

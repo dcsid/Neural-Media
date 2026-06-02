@@ -54,7 +54,6 @@ import os
 import shutil
 import sqlite3
 import subprocess
-import sys
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
@@ -153,9 +152,28 @@ def _chunks(seq: Sequence[Any], size: int) -> Iterable[Sequence[Any]]:
 # safe to ship across a process boundary — every test in this package
 # injects a closure-based fake, which is not pickleable. The fast path
 # (``_drive_mock_fast``) opts in only when the configured ``inference_fn``
-# is the module default; that keeps the existing 94 tests on the sequential
-# path while production CLI runs (``python -m neural_media_pipeline --mock
-# ...``) get the multi-core speed-up.
+# is the module default; that keeps every test in this package on the
+# sequential path while production CLI runs (``python -m
+# neural_media_pipeline --mock ...``) get the multi-core speed-up.
+#
+# There are two worker variants, selected by ``_drive_mock_fast`` via
+# ``worker_fn = _mock_worker_run_lean if purge_activations else
+# _mock_worker_run``:
+#
+#   * ``_mock_worker_run``      — full path. Calls ``run_inference``, which
+#                                 writes the per-vertex npz + meta.json
+#                                 sidecar so ``/v/[id]`` can replay the mesh.
+#                                 Used when activations are kept.
+#   * ``_mock_worker_run_lean`` — no-disk-I/O path. Produces byte-identical
+#                                 SQLite rows but skips the npz/sidecar
+#                                 writes that ``purge_activations=True`` would
+#                                 unlink moments later. Skipping them removes
+#                                 the activations-directory write contention
+#                                 that turned a CPU-bound run disk-bound under
+#                                 14 workers.
+#
+# The lean worker is the single biggest mock-mode win (1000 videos:
+# 11.85 s → 0.64 s). See ``docs/bench-results.md`` for the full profile.
 
 _WORKER_BACKEND: InferenceBackend | None = None
 
@@ -235,6 +253,10 @@ def _mock_worker_run_lean(
     seed it with the same conventional name (``<activations_dir>/{run_id}.npz``)
     so a downstream check that doesn't know the file was never written
     sees a consistent shape.
+
+    Counterpart to :func:`_mock_worker_run` (the full, disk-writing path
+    used when activations are kept). See ``docs/bench-results.md`` for the
+    profile that motivated this lean variant.
     """
     video_id = args["video_id"]
     try:
@@ -320,6 +342,11 @@ def _mock_worker_run(
     On failure: returns ``(video_id, error_string)``. The worker
     boundary must not leak exceptions — the parent aggregates failures
     into the IngestSummary exactly like the sequential path does.
+
+    Counterpart to :func:`_mock_worker_run_lean`, which replaces this path
+    when ``purge_activations`` is set (it skips the npz/sidecar writes this
+    function relies on ``run_inference`` to make). See
+    ``docs/bench-results.md``.
     """
     video_id = args["video_id"]
     try:
@@ -610,10 +637,22 @@ class Orchestrator:
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
         cfg.activations_dir.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(cfg.db_path)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.executescript(_SCHEMA_SQL)
-        self._conn.commit()
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._conn.executescript(_SCHEMA_SQL)
+            self._conn.commit()
+        except sqlite3.DatabaseError as exc:
+            # A pre-existing file that isn't a valid SQLite database — or is
+            # truncated/corrupt — raises here on the first read. Turn the
+            # cryptic "file is not a database" / "database disk image is
+            # malformed" into an actionable instruction.
+            self._conn.close()
+            raise RuntimeError(
+                f"SQLite catalog at {cfg.db_path} is corrupted or not a "
+                f"database ({exc}). Delete it and re-run to rebuild it from "
+                f"your export."
+            ) from exc
 
     # -- context manager support -----------------------------------------
     def __enter__(self) -> Orchestrator:
@@ -1504,7 +1543,12 @@ class Orchestrator:
             if processed_path:
                 try:
                     duration_s = self._probe(Path(processed_path))
-                except Exception as exc:  # noqa: BLE001
+                except (OSError, ValueError, RuntimeError) as exc:
+                    # The ffprobe seam raises RuntimeError (missing binary or
+                    # non-zero exit), ValueError (unparseable duration), or
+                    # OSError (spawn failure). Any of these falls through to
+                    # the synthetic/default duration below — a probe hiccup
+                    # must never fail the run.
                     _log.debug("ffprobe failed for %s: %s", video.id, exc)
                     duration_s = 0.0
         if duration_s <= 0.0 and self.cfg.skip_preprocess:

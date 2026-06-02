@@ -147,6 +147,55 @@ def test_cli_run_pending_uses_existing_db(monkeypatch: pytest.MonkeyPatch,
     assert "failed: 0" in out
 
 
+def test_cli_partial_failure_exits_nonzero(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A PARTIAL run (some videos completed AND some failed) exits non-zero.
+
+    Regression: the old ``failed and not completed`` guard returned 0 as
+    soon as a single video completed, hiding partial failures from CI and
+    shell scripts that gate on the exit status.
+    """
+
+    class _PartialOrch:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return None
+
+        def run(self, _export_path, *, since=None, until=None):
+            return cli.IngestSummary(
+                parsed_videos=8, parsed_events=8, queued=8,
+                completed=7, failed=1, errors=[("vid-x", "boom")],
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(cli, "Orchestrator", _PartialOrch)
+    rc = cli.main([str(FIXTURE), "--data-root", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "completed: 7; failed: 1" in out
+
+
+def test_cli_dry_run_without_export_errors(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """``--dry-run`` requires an export. Combined with ``--run-pending``
+    (which makes the export optional) it must error cleanly with exit 2
+    rather than crashing inside ``parse_export(None)``.
+    """
+    rc = cli.main(["--run-pending", "--dry-run", "--data-root", str(tmp_path)])
+    assert rc == 2
+    assert "--dry-run requires an export" in capsys.readouterr().err
+
+
 def test_cli_output_never_leaks_full_url(monkeypatch: pytest.MonkeyPatch,
                                          tmp_path: Path,
                                          capsys: pytest.CaptureFixture) -> None:

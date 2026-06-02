@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
@@ -21,7 +22,7 @@ _log = logging.getLogger(__name__)
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import JSONResponse, Response
 
 from .aggregate import compute_aggregate
@@ -61,17 +62,23 @@ _ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1"})
 
 
 class LoopbackOnlyMiddleware(BaseHTTPMiddleware):
-    """Reject requests whose `Host` header is not a loopback name.
+    """Reject requests whose `Host` header is missing or not a loopback name.
 
     The app also binds to 127.0.0.1 at the socket layer (see Makefile
     `dev-api` target / `if __name__ == "__main__"` block below), so this is
     defense-in-depth against DNS rebinding from a browser on the same host.
     """
 
-    async def dispatch(self, request: Request, call_next):
+    async def dispatch(
+        self, request: Request, call_next: RequestResponseEndpoint
+    ) -> Response:
         host_header = request.headers.get("host", "")
         host = host_header.split(":", 1)[0].strip().lower()
-        if host and host not in _ALLOWED_HOSTS:
+        # Reject a missing/empty Host outright: a loopback browser always
+        # sends one, so an absent Host is anomalous, and a rebinding probe
+        # could omit it to slip past an allowlist that only screens known-
+        # bad non-empty values.
+        if not host or host not in _ALLOWED_HOSTS:
             return Response(
                 content='{"detail":"Host header not permitted"}',
                 status_code=400,
@@ -189,7 +196,7 @@ ERR_REAL_EXTRA_MISSING = "real_extra_missing"
 ERR_REAL_NO_FFMPEG = "real_no_ffmpeg"
 ERR_REAL_NO_YT_DLP = "real_no_yt_dlp"
 ERR_REAL_NO_GPU = "real_no_gpu"
-ERR_RETRY_NOT_RETRYABLE = "retry_not_retryable"
+ERR_JOB_NOT_RETRYABLE = "job_not_retryable"
 
 # How each capability blocker token maps to the structured error_code.
 _BLOCKER_TO_ERROR_CODE: dict[str, str] = {
@@ -424,8 +431,7 @@ def create_app(
         # Stream to a temp path inside data/imports/ so an aborted upload
         # never collides with the orchestrator's read. The job_id prefix
         # makes the file traceable to the row it'll spawn.
-        import uuid as _uuid
-        staged_id = str(_uuid.uuid4())
+        staged_id = str(uuid.uuid4())
         safe_name = _safe_filename(filename)
         dest = imports_dir / f"{staged_id}__{safe_name}"
         with dest.open("wb") as out:
@@ -511,7 +517,7 @@ def create_app(
         except JobNotRetryable as exc:
             return _error_response(
                 status_code=409,
-                error_code=ERR_RETRY_NOT_RETRYABLE,
+                error_code=ERR_JOB_NOT_RETRYABLE,
                 detail=str(exc),
             )
         except JobAlreadyRunning as exc:

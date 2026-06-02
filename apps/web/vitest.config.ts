@@ -22,5 +22,6 @@ export default defineConfig({
     include: ["__tests__/**/*.test.{ts,tsx}", "lib/**/*.test.ts"],
     exclude: ["node_modules", ".next"],
     restoreMocks: true,
+    unstubGlobals: true,
   },
 });

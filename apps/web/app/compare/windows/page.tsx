@@ -3,10 +3,10 @@ import Link from "next/link";
 import {
   REGION_IDS,
   type RegionId,
-  type RegionMetrics,
   type WatchEvent,
 } from "@shared/types";
 import { api, ApiError, serverBaseUrl } from "@/lib/api";
+import { accumulateRegionMetrics, type RegionStat } from "@/lib/window-metrics";
 import { ApiOfflineState } from "@/components/ApiOfflineState";
 import { NoVideosState } from "@/components/NoVideosState";
 import { formatWatchTimeHuman, regionShortLabel } from "@/lib/format";
@@ -36,7 +36,7 @@ interface WindowAggregate {
   range: WindowRange;
   totalVideos: number;
   totalWatchTimeS: number;
-  byRegion: Record<RegionId, { mean: number; peak: number }>;
+  byRegion: Record<RegionId, RegionStat>;
 }
 
 const SAFE_METRICS_FETCH_CAP = 500; // Don't fire 10k parallel requests on huge histories.
@@ -173,17 +173,6 @@ async function aggregateWindow(
     watchTimeS += dur;
   }
 
-  const byRegion: Record<RegionId, { mean: number; peak: number }> = {
-    v1: { mean: 0, peak: 0 },
-    v2: { mean: 0, peak: 0 },
-    v3: { mean: 0, peak: 0 },
-    v4: { mean: 0, peak: 0 },
-    auditory: { mean: 0, peak: 0 },
-    language: { mean: 0, peak: 0 },
-    ffa: { mean: 0, peak: 0 },
-    vwfa: { mean: 0, peak: 0 },
-  };
-
   // Bail before issuing a metrics flood on very large windows. The cap
   // is high enough that local demo histories sail through; the safety
   // net is for the day someone points this at a 50k-video export.
@@ -202,28 +191,10 @@ async function aggregateWindow(
     ),
   );
 
-  // Accumulate per-region sums + peaks across every video in the window.
-  const sums: Record<RegionId, number> = {
-    v1: 0, v2: 0, v3: 0, v4: 0,
-    auditory: 0, language: 0, ffa: 0, vwfa: 0,
-  };
-  const counts: Record<RegionId, number> = {
-    v1: 0, v2: 0, v3: 0, v4: 0,
-    auditory: 0, language: 0, ffa: 0, vwfa: 0,
-  };
-  for (const metrics of metricsLists) {
-    if (!metrics) continue;
-    for (const m of metrics as RegionMetrics[]) {
-      const id = m.region_id;
-      if (!(id in sums)) continue;
-      sums[id] += m.mean;
-      counts[id] += 1;
-      if (m.peak > byRegion[id].peak) byRegion[id].peak = m.peak;
-    }
-  }
-  for (const id of REGION_IDS) {
-    if (counts[id] > 0) byRegion[id].mean = sums[id] / counts[id];
-  }
+  // Accumulate mean + peak per region across the window. Videos whose
+  // metrics failed to load arrive as null entries and are skipped — see
+  // accumulateRegionMetrics.
+  const byRegion = accumulateRegionMetrics(metricsLists);
 
   return {
     range,

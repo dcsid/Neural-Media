@@ -77,6 +77,13 @@ def _import_heavies() -> _LazyImports:
 # need it re-emitted on every video.
 _WARNED_WIDER_THAN_CORTEX = False
 
+# Same one-shot latch for the raw-output range diagnostic: the very first real
+# forward pass logs preds.min/mean/max at INFO so a GPU run immediately reveals
+# whether the raw output is z-scored (sigmoid is correct) or already in [0, 1]
+# (sigmoid would be a double-application). Brain owns the actual verification —
+# see docs/worker-briefs/ml-inference-status.md "Open items".
+_LOGGED_RAW_RANGE = False
+
 
 class TribeBackend:
     """Real TRIBE v2 forward pass.
@@ -214,6 +221,27 @@ class TribeBackend:
                 f"TRIBE returned unexpected shape {preds.shape}; "
                 f"expected (T, >={NUM_VERTICES})"
             )
+
+        # One-shot INFO diagnostic on the FIRST real inference. The sigmoid
+        # below assumes raw TRIBE output is z-scored BOLD (~[-3, 3]); that
+        # assumption is UNVERIFIED, so surface the true range immediately. If
+        # these values are already in [0, 1] the sigmoid is a double-application
+        # and should become a passthrough — brain owns that call.
+        global _LOGGED_RAW_RANGE
+        if not _LOGGED_RAW_RANGE:
+            _log.info(
+                "event=raw-output-range first real inference: preds.shape=%s "
+                "min=%.4f mean=%.4f max=%.4f. Wrapper assumes z-scored BOLD and "
+                "applies sigmoid; if this is already [0, 1] the transform "
+                "double-applies — see docs/worker-briefs/ml-inference-status.md "
+                "'Open items'.",
+                tuple(preds.shape),
+                float(preds.min()),
+                float(preds.mean()),
+                float(preds.max()),
+            )
+            _LOGGED_RAW_RANGE = True
+
         # If TRIBE emits more than the cortical vertices, we take the leading
         # NUM_VERTICES columns and assume lh[0:10242] then rh[10242:20484]
         # (the assumption region_masks.json was built against). The upstream
@@ -236,6 +264,10 @@ class TribeBackend:
         cortex = preds[:, :NUM_VERTICES].astype(np.float32, copy=False)
 
         # Z-scored BOLD → [0, 1] via logistic sigmoid (see module docstring).
-        np.clip(cortex, -30.0, 30.0, out=cortex)  # guard against inf in expm1 paths
+        # Clip is precautionary: np.exp(-cortex) overflows float32 once
+        # cortex < ~-88, and by |cortex|=30 the sigmoid has already saturated
+        # to ~0/1, so this only bounds pathological inputs — the transform is
+        # well-defined without it.
+        np.clip(cortex, -30.0, 30.0, out=cortex)
         out = 1.0 / (1.0 + np.exp(-cortex))
         return out.astype(np.float32, copy=False)

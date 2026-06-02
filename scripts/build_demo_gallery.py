@@ -170,7 +170,11 @@ def _mock_predict(entry: DemoEntry, output_path: Path) -> dict[str, Any]:
     """Run MockBackend + downsample_region_means + ActivationPayload-shape
     JSON write. Returns the payload dict for manifest assembly."""
     # Import here so a stripped-down environment can still print --help.
-    from neural_media_inference import MockBackend, downsample_region_means
+    from neural_media_inference import (
+        WIRE_TIMESTAMP_DECIMALS,
+        MockBackend,
+        downsample_region_means,
+    )
 
     backend = MockBackend()
     # 2 Hz native sample rate keeps the raw tensor small (~36 frames at 18s)
@@ -187,12 +191,13 @@ def _mock_predict(entry: DemoEntry, output_path: Path) -> dict[str, Any]:
 
     # Evenly-spaced timestamps over the clip. The api-v2 validator checks
     # len(timestamps) == len(byRegion[region]) for every region, so this
-    # must be exactly series_len long.
+    # must be exactly series_len long. Rounded to the shared
+    # WIRE_TIMESTAMP_DECIMALS so this matches predict_one_url.py's precision.
     if series_len == 1:
         timestamps = [0.0]
     else:
         step = entry.duration_sec / (series_len - 1)
-        timestamps = [round(i * step, 3) for i in range(series_len)]
+        timestamps = [round(i * step, WIRE_TIMESTAMP_DECIMALS) for i in range(series_len)]
 
     payload: dict[str, Any] = {
         "videoDurationSec": entry.duration_sec,

@@ -19,8 +19,10 @@ Do not remove or rename these names without a coordinated cross-team change.
 
 from .aggregate import (
     REGION_VERTEX_MASKS,
+    WIRE_TIMESTAMP_DECIMALS,
     aggregate_region_metrics,
     downsample_region_means,
+    downsample_timestamps,
     keyframe_vertex_snapshots,
 )
 from .backend import InferenceBackend, MockBackend
@@ -34,8 +36,10 @@ __all__ = [
     "REGION_VERTEX_MASKS",
     "RunArtifacts",
     "TribeBackend",
+    "WIRE_TIMESTAMP_DECIMALS",
     "aggregate_region_metrics",
     "downsample_region_means",
+    "downsample_timestamps",
     "keyframe_vertex_snapshots",
     "run_inference",
 ]

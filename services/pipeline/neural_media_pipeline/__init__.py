@@ -27,7 +27,12 @@ from .downloader import (  # noqa: E402
     download_batch,
     download_video,
 )
-from .importer import parse_export, stable_video_id, stable_watch_event_id  # noqa: E402
+from .importer import (  # noqa: E402
+    MalformedExportError,
+    parse_export,
+    stable_video_id,
+    stable_watch_event_id,
+)
 from .orchestrate import (  # noqa: E402
     IngestSummary,
     Orchestrator,
@@ -48,6 +53,7 @@ __all__ = [
     "DownloadError",
     "DownloadResult",
     "IngestSummary",
+    "MalformedExportError",
     "Orchestrator",
     "OrchestratorConfig",
     "Phase",

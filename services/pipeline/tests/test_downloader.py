@@ -97,6 +97,28 @@ def test_cache_hit_skips_network(tmp_path: Path) -> None:
     assert res.attempts == 0
 
 
+def test_zero_byte_cached_file_is_redownloaded(tmp_path: Path) -> None:
+    """A leftover zero-byte file (e.g. an interrupted prior download) is NOT
+    a valid cache hit — it must be re-fetched rather than skipped, otherwise
+    the pipeline would carry an empty mp4 forward forever."""
+    cfg = _cfg(tmp_path)
+    cfg.videos_dir.mkdir(parents=True, exist_ok=True)
+    dest = cfg.videos_dir / "abc-123.mp4"
+    dest.write_bytes(b"")  # zero bytes
+
+    def fake_fetch(url: str, dest: Path, ua: str) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"REAL_MP4_BYTES")
+
+    res = download_video(
+        _video(), cfg, fetch=fake_fetch, sleep=_Sleeps(), rng=random.Random(0),
+    )
+    assert res.skipped is False  # zero-byte file is not treated as cached
+    assert res.ok is True
+    assert res.attempts == 1
+    assert dest.read_bytes() == b"REAL_MP4_BYTES"
+
+
 # ---------------------------------------------------------------------------
 # Retry behavior
 # ---------------------------------------------------------------------------

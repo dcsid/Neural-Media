@@ -66,6 +66,19 @@ _TXT_RECORD_RE = re.compile(
 _log = logging.getLogger(__name__)
 
 
+class MalformedExportError(ValueError):
+    """A TikTok export could not be decoded as UTF-8 JSON.
+
+    Raised for a truncated/corrupt ``user_data.json`` or non-UTF-8 bytes —
+    i.e. the file is not a usable export at all. This is distinct from a
+    *valid* export that simply has no browsing history (which yields empty
+    lists, not an error). The orchestrator lets this propagate so the api
+    surfaces it as a ``failed`` import job per ``CONTRACTS.md §8`` — a
+    clear, typed error rather than a raw ``json``/``UnicodeDecodeError``
+    traceback.
+    """
+
+
 def stable_video_id(source_url: str) -> str:
     """Deterministic id for a video URL. Same URL → same id, forever."""
     return str(uuid.uuid5(_NAMESPACE_VIDEO, source_url))
@@ -145,24 +158,42 @@ def _load_raw_entries(path: Path) -> list[Any]:
         in-memory read of ``user_data.json`` at any depth, then JSON.
       * ``.txt`` extension → newer flat Date/Link text export.
       * everything else → JSON.
+
+    Raises :class:`MalformedExportError` if the payload can't be decoded
+    as UTF-8 JSON (truncated/corrupt content). A missing file or an
+    archive without ``user_data.json`` raises the underlying OS error.
     """
-    if zipfile.is_zipfile(path):
-        with zipfile.ZipFile(path) as zf:
-            member = _find_user_data_member(zf)
-            if member is None:
-                raise FileNotFoundError(
-                    f"no user_data.json found in archive: {path.name}"
-                )
-            with zf.open(member) as fh:
-                payload = json.loads(fh.read().decode("utf-8"))
+    try:
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as zf:
+                member = _find_user_data_member(zf)
+                if member is None:
+                    raise FileNotFoundError(
+                        f"no user_data.json found in archive: {path.name}"
+                    )
+                with zf.open(member) as fh:
+                    payload = json.loads(fh.read().decode("utf-8"))
+            return _entries_from_json(payload)
+
+        if path.suffix.lower() == ".txt":
+            return _parse_txt_export(path.read_text(encoding="utf-8"))
+
+        with path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
         return _entries_from_json(payload)
-
-    if path.suffix.lower() == ".txt":
-        return _parse_txt_export(path.read_text(encoding="utf-8"))
-
-    with path.open("r", encoding="utf-8") as f:
-        payload = json.load(f)
-    return _entries_from_json(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        # The parser tolerates per-entry drift, but a wholesale-undecodable
+        # payload is a hard failure. Emit a greppable event= line and raise
+        # a clear, typed error instead of leaking a raw json/UnicodeDecodeError
+        # traceback — the api turns this into a `failed` import job (§8).
+        _log.debug(
+            "event=export_parse_failed reason=%s file=%s",
+            type(exc).__name__, path.name,
+        )
+        raise MalformedExportError(
+            f"export {path.name!r} is not valid UTF-8 JSON "
+            f"({type(exc).__name__}: {exc})"
+        ) from exc
 
 
 def _find_user_data_member(zf: zipfile.ZipFile) -> str | None:
@@ -204,8 +235,10 @@ def parse_export(
       - Watch events preserve every in-window playback occurrence.
       - Order of videos follows first-seen order in the export; watch
         events follow source order.
-      - The function never raises on missing optional fields; only a
-        malformed JSON file or a file-system error will propagate.
+      - Missing optional fields and malformed *entries* never raise — they
+        are skipped. A wholesale-undecodable payload raises
+        :class:`MalformedExportError`; a missing file or an archive without
+        ``user_data.json`` raises the underlying OS error.
     """
     p = Path(path)
     raw_entries = _load_raw_entries(p)

@@ -245,7 +245,7 @@ def download_video(
     dest = _local_path(cfg, video.id)
 
     if dest.exists() and dest.stat().st_size > 0:
-        _log.debug("cache hit for %s", video.id)
+        _log.debug("event=download_cache_hit video_id=%s", video.id)
         return DownloadResult(video_id=video.id, local_path=dest, skipped=True, attempts=0)
 
     last_err: BaseException | None = None
@@ -255,13 +255,16 @@ def download_video(
             fetch(video.source_url, dest, ua)
         except Exception as exc:  # noqa: BLE001 — yt-dlp raises a wide variety
             last_err = exc
-            _log.debug("attempt %d/%d failed for %s", attempt, cfg.max_attempts, video.id)
+            _log.debug(
+                "event=download_attempt_failed video_id=%s attempt=%d max_attempts=%d",
+                video.id, attempt, cfg.max_attempts,
+            )
             if attempt == cfg.max_attempts:
                 break
             sleep(_backoff_seconds(attempt, cfg, rng))
             continue
 
-        _log.debug("downloaded %s in %d attempt(s)", video.id, attempt)
+        _log.debug("event=download_complete video_id=%s attempts=%d", video.id, attempt)
         return DownloadResult(
             video_id=video.id, local_path=dest, skipped=False, attempts=attempt,
         )
@@ -303,7 +306,11 @@ def download_batch(
         except DownloadError as exc:
             if stop_on_error:
                 raise
-            _log.warning("download failed for %s", video.id)  # no URL in log
+            # no URL in log — only the id (a hash of the URL) is safe to emit
+            _log.warning(
+                "event=download_failed video_id=%s attempts=%d",
+                video.id, cfg.max_attempts,
+            )
             results.append(
                 DownloadResult(
                     video_id=video.id,

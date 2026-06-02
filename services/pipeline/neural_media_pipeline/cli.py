@@ -19,6 +19,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .importer import MalformedExportError
 from .orchestrate import (
     IngestSummary,
     Orchestrator,
@@ -188,26 +189,40 @@ def main(argv: list[str] | None = None) -> int:
     if args.export and not args.export.is_file():
         print(f"error: export file not found: {args.export}", file=sys.stderr)
         return 2
+    if args.dry_run and args.export is None:
+        # --dry-run parses an export and prints counts; it has nothing to do
+        # without one (and would otherwise reach parse_export(None) below).
+        print("error: --dry-run requires an export path", file=sys.stderr)
+        return 2
 
     cfg = _resolve_paths(args)
     since = _resolve_since(args)
     until = args.until
 
-    if args.dry_run:
-        from .importer import parse_export
-        videos, events = parse_export(args.export, since=since, until=until)  # type: ignore[arg-type]
-        summary = IngestSummary(parsed_videos=len(videos), parsed_events=len(events))
-        _print_summary(summary)
-        return 0
+    try:
+        if args.dry_run:
+            from .importer import parse_export
+            assert args.export is not None  # guaranteed by the --dry-run guard above
+            videos, events = parse_export(args.export, since=since, until=until)
+            summary = IngestSummary(parsed_videos=len(videos), parsed_events=len(events))
+            _print_summary(summary)
+            return 0
 
-    with Orchestrator(cfg) as orch:
-        if args.run_pending:
-            summary = orch.run_pending()
-        else:
-            summary = orch.run(args.export, since=since, until=until)
+        with Orchestrator(cfg) as orch:
+            if args.run_pending:
+                summary = orch.run_pending()
+            else:
+                summary = orch.run(args.export, since=since, until=until)
+    except MalformedExportError as exc:
+        # A corrupt/undecodable export is a clean, expected failure — print
+        # the actionable message instead of a traceback.
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     _print_summary(summary)
-    return 1 if summary.failed and not summary.completed else 0
+    # Any failure is a non-zero exit — including a PARTIAL run (some videos
+    # completed, some failed). Only a clean run (zero failures) exits 0.
+    return 0 if summary.failed == 0 else 1
 
 
 if __name__ == "__main__":  # pragma: no cover

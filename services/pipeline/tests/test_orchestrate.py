@@ -9,6 +9,7 @@ later read.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -358,6 +359,62 @@ def test_seed_for_is_deterministic() -> None:
     s = _seed_for("abc-123")
     assert s == _seed_for("abc-123")
     assert 0 <= s < 2 ** 31
+
+
+# ---------------------------------------------------------------------------
+# Robustness: corrupted DB + ffprobe failure
+# ---------------------------------------------------------------------------
+
+def test_corrupt_sqlite_db_raises_clear_error(tmp_path: Path) -> None:
+    """A pre-existing file at db_path that isn't a SQLite database yields a
+    clear, actionable RuntimeError instead of the cryptic sqlite3
+    'file is not a database'."""
+    db_path = tmp_path / "sqlite" / "neural_media.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"NOT A SQLITE DATABASE -- just some garbage bytes\x00\x01" * 8)
+
+    cfg = OrchestratorConfig(
+        db_path=db_path,
+        videos_dir=tmp_path / "videos",
+        processed_dir=tmp_path / "videos_processed",
+        activations_dir=tmp_path / "activations",
+    )
+    with pytest.raises(RuntimeError, match="corrupted or not a database"):
+        Orchestrator(cfg)
+
+
+def test_ffprobe_failure_logs_debug_and_returns_fallback(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failing ffprobe is logged at DEBUG and falls back to the default
+    duration — it never propagates out of _resolve_duration_s."""
+
+    def boom_probe(_path: Path) -> float:
+        raise RuntimeError("ffprobe exited 1")
+
+    orch, _ = _make_orch(tmp_path, probe=boom_probe)
+    try:
+        video = VideoMetadata(
+            id="vid-x",
+            source_url="https://www.tiktok.com/@a/video/vid-x",
+            duration_s=0.0,
+        )
+        orch._upsert_videos([video])
+        orch._enqueue_pending([video])
+        # Pretend preprocessing produced a file so the probe branch is taken.
+        orch._update_job("vid-x", preprocessed_path=str(tmp_path / "p.mp4"))
+
+        with caplog.at_level(logging.DEBUG, logger="neural_media_pipeline.orchestrate"):
+            duration = orch._resolve_duration_s(video)
+    finally:
+        orch.close()
+
+    # Fell back to the configured default rather than raising.
+    assert duration == orch.cfg.default_duration_s
+    assert any(
+        "ffprobe failed" in rec.getMessage() and rec.levelno == logging.DEBUG
+        for rec in caplog.records
+    )
 
 
 # ---------------------------------------------------------------------------

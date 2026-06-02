@@ -8,12 +8,15 @@ same commit.
 from __future__ import annotations
 
 import json
+import logging
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from neural_media_pipeline.importer import (
+    MalformedExportError,
     parse_export,
     stable_video_id,
     stable_watch_event_id,
@@ -158,6 +161,52 @@ def test_empty_or_missing_browsing_history(tmp_path: Path) -> None:
 def test_missing_file_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         parse_export(tmp_path / "does_not_exist.json")
+
+
+# ---------------------------------------------------------------------------
+# Corrupt / undecodable payloads — tolerant of per-entry drift, but a
+# wholesale-undecodable file raises a clear, typed MalformedExportError
+# (not a raw json/UnicodeDecodeError) so the api can surface a `failed`
+# import job per CONTRACTS.md §8.
+# ---------------------------------------------------------------------------
+
+def test_zip_with_truncated_json_raises_malformed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    p = tmp_path / "export.zip"
+    with zipfile.ZipFile(p, "w") as zf:
+        zf.writestr("user_data.json", '{"Activity": {"Video Browsing Hist')  # truncated
+
+    caplog.set_level(logging.DEBUG, logger="neural_media_pipeline.importer")
+    with pytest.raises(MalformedExportError):
+        parse_export(p)
+    assert any("event=export_parse_failed" in r.getMessage() for r in caplog.records)
+
+
+def test_zip_with_invalid_utf8_raises_malformed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    p = tmp_path / "export.zip"
+    with zipfile.ZipFile(p, "w") as zf:
+        zf.writestr("user_data.json", b"\xff\xfe\x00 not valid utf-8 \xff")  # bad bytes
+
+    caplog.set_level(logging.DEBUG, logger="neural_media_pipeline.importer")
+    with pytest.raises(MalformedExportError):
+        parse_export(p)
+    assert any("event=export_parse_failed" in r.getMessage() for r in caplog.records)
+
+
+def test_plain_truncated_json_raises_malformed(tmp_path: Path) -> None:
+    p = tmp_path / "user_data.json"
+    p.write_text('{"Activity": {', encoding="utf-8")  # truncated, not a zip
+    with pytest.raises(MalformedExportError):
+        parse_export(p)
+
+
+def test_malformed_export_error_is_value_error() -> None:
+    """Subclassing ValueError keeps it catchable by callers that already
+    treat bad input as a ValueError."""
+    assert issubclass(MalformedExportError, ValueError)
 
 
 # ---------------------------------------------------------------------------

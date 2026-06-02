@@ -92,25 +92,23 @@ const INITIAL_SIDE: SideData = {
 
 function buildKeyframesFromMetrics(
   metrics: RegionMetrics[],
-  timestamps: number[],
 ): Record<string, number[]> {
   // When per-vertex .npz is gone we still want the scrubber to advance
-  // *something*. Reconstruct a thin keyframe_vertices map from the
-  // region timeseries — one entry per timestamp, ordered by region. The
-  // BrainMesh useActivationFrame hook reads these as if they came from
-  // the activation file. This is a fallback only — BrainMesh receives
-  // activationPurged=true so it still renders the placeholder, but the
-  // legend + region-level pulse stay live.
+  // *something*. Reconstruct a keyframe_vertices map from the region
+  // timeseries so BrainMesh's useActivationFrame hook can drive the
+  // legend + region-level pulse. activationPurged=true still forces the
+  // placeholder mesh; this only keeps the per-region readings live.
+  //
+  // Shape MUST be region-keyed (shape-a): keys are RegionIds, each value is
+  // that region's mean-activation timeseries, resolved against the separate
+  // `timestamps` array at render time. The earlier form keyed by timestamp
+  // with length-(#regions) value arrays, which useActivationFrame
+  // (reasonably) read as shape-b per-vertex slices — each "vertex" vector
+  // was 8 long, so it collapsed to a single global mean and painted the
+  // placeholder a flat uniform colour. Keying by region is what makes the
+  // regions read distinctly.
   const out: Record<string, number[]> = {};
-  if (metrics.length === 0 || timestamps.length === 0) return out;
-  const T = Math.min(
-    timestamps.length,
-    ...metrics.map((m) => m.timeseries.length),
-  );
-  for (let t = 0; t < T; t++) {
-    const key = String(timestamps[t]);
-    out[key] = metrics.map((m) => m.timeseries[t] ?? 0);
-  }
+  for (const m of metrics) out[m.region_id] = m.timeseries;
   return out;
 }
 
@@ -170,14 +168,12 @@ function ComparePane({
   const kv = useMemo(() => {
     if (data.activation) return data.activation.keyframe_vertices;
     if (data.purged && data.metrics && data.activation === null) {
-      // Synthesize timestamps from the longest metrics timeseries (sample
-      // them across the duration). This is intentionally crude — the
-      // exact x-positions don't matter for the placeholder pulse.
-      const T = Math.max(...data.metrics.map((m) => m.timeseries.length), 0);
-      if (T === 0 || data.durationS <= 0) return undefined;
-      const ts: number[] = new Array(T);
-      for (let i = 0; i < T; i++) ts[i] = (i / Math.max(T - 1, 1)) * data.durationS;
-      return buildKeyframesFromMetrics(data.metrics, ts);
+      // Region-keyed (shape-a) fallback. The time axis is the synthesized
+      // `ts` below; here we only need the per-region series. Bail when
+      // there's nothing to drive, matching the `ts` guard so we never hand
+      // BrainMesh a keyframe map with no timeline.
+      if (data.metrics.length === 0 || data.durationS <= 0) return undefined;
+      return buildKeyframesFromMetrics(data.metrics);
     }
     return undefined;
   }, [data.activation, data.purged, data.metrics, data.durationS]);

@@ -45,10 +45,12 @@ export interface BrainMeshProps {
   playheadSec?: number;
   // Set to true when /api/v1/videos/{id}/activation returned 404 because
   // the per-vertex .npz was purged after region_metrics were aggregated
-  // (a tier-b cleanup path). The component keeps rendering — the
-  // placeholder/cortical surface still shows, region readings still work
-  // upstream — and overlays a banner so the user knows why the
-  // per-vertex resolution is missing.
+  // (a tier-b cleanup path). Visual consequence: BrainMesh renders the
+  // low-poly **placeholder** mesh (coloured per-region from `byRegion`)
+  // INSTEAD of the per-vertex cortical surface — an honest signal that
+  // vertex resolution is gone — and overlays an "Aggregated only" banner
+  // explaining why. Region-level readings (legend, hover) keep working
+  // because they're driven by byRegion, not the purged per-vertex buffer.
   activationPurged?: boolean;
   // Hide the region legend overlay. Default false (legend shown). Set to
   // true on the Dashboard hero where the surrounding chrome already
@@ -147,8 +149,19 @@ export function BrainMesh({
   // anything meaningful. `totalDurationSec` falls back to a small
   // sentinel when timestamps aren't available; the tour still runs but
   // the playhead stays parked at 0 in that case.
-  const hasKeyframes =
-    keyframeVertices !== undefined && Object.keys(keyframeVertices).length > 0;
+  // Real keyframe data means at least one series with actual samples — not
+  // merely a non-empty object. A map of empty arrays (e.g. `{v1: [], …}`
+  // from a producer that emitted regions but no frames) would otherwise
+  // light up the Tour button, the scrubber-driven legend, and the camera
+  // presets with nothing behind them. Validate the series shape + a minimum
+  // length so those affordances only appear when they'd actually do
+  // something.
+  const hasKeyframes = useMemo(() => {
+    if (keyframeVertices === undefined) return false;
+    return Object.values(keyframeVertices).some(
+      (series) => Array.isArray(series) && series.length > 0,
+    );
+  }, [keyframeVertices]);
   const totalDurationSec = useMemo(() => {
     if (!timestamps || timestamps.length === 0) return 0;
     return timestamps[timestamps.length - 1] ?? 0;

@@ -38,11 +38,17 @@ export default defineConfig({
     },
     {
       command: "pnpm --filter @neural-media/web dev",
-      url: `http://localhost:${WEB_PORT}`,
+      // Gate readiness on /single — the page this suite actually exercises.
+      // The dashboard at `/` is a `force-dynamic` server component that
+      // awaits the v1 FastAPI (:8000) during SSR; the e2e harness only boots
+      // the mock (:3001), so probing `/` never returned healthy and the job
+      // sat until the start budget elapsed. /single is a client component
+      // ("use client") and returns its 200 shell with no backend.
+      url: `http://localhost:${WEB_PORT}/single`,
       reuseExistingServer: !process.env.CI,
       stdout: "pipe",
       stderr: "pipe",
-      timeout: 120_000,
+      timeout: 180_000,
       env: {
         // T4's api-v2 lib reads NEXT_PUBLIC_API_BASE_V2 at build time
         // (Next inlines NEXT_PUBLIC_* into the client bundle). It also

@@ -55,3 +55,6 @@ coverage/
 .env
 .env.local
 .env.*.local
+
+# --- Internal planning docs (kept locally; not for the public-facing repo) --
+neural_diet_tracker_build_plan*.pdf

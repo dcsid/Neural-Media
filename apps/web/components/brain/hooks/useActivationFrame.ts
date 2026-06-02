@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { NUM_VERTICES, REGION_IDS, type RegionId } from "@shared/types";
 
 // Resolves the per-region (and optionally per-vertex) activation values to
@@ -104,6 +104,60 @@ function sortKeyframes(
   };
 }
 
+// Dev-only diagnostics. These never run in a production build (the demo
+// ships via `next build`), so they cost nothing where it matters and stay
+// loud where a contract drift would otherwise corrupt the render silently.
+
+const warnedVertexLengths = new Set<string>();
+
+// Per-vertex keyframe slices must be full-resolution (NUM_VERTICES). When
+// they aren't, warn once per distinct mismatch shape so a drifting producer
+// surfaces in dev/CI logs instead of silently freezing the surface.
+function warnVertexLengthOnce(
+  len0: number,
+  len1: number,
+  expected: number,
+): void {
+  if (process.env.NODE_ENV === "production") return;
+  const key = `${len0}x${len1}`;
+  if (warnedVertexLengths.has(key)) return;
+  warnedVertexLengths.add(key);
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[brain-viz] useActivationFrame: per-vertex keyframe length mismatch ` +
+      `(got ${len0} & ${len1}, expected ${expected} = NUM_VERTICES). ` +
+      `Degrading to a uniform region fill for this frame rather than ` +
+      `truncating — truncation would pin the tail of the reused per-vertex ` +
+      `buffer at stale values and freeze those vertices. Check the ` +
+      `keyframe_vertices producer (CONTRACTS.md §4).`,
+  );
+}
+
+let warnedRegionOrder = false;
+
+// The region-mask bytes index into `regionOrder`, and the byRegion keys we
+// emit must line up with the canonical REGION_IDS the rest of the app reads.
+// A future contract reorder/resize would silently mismap every vertex to the
+// wrong region's colour, so fail loudly (dev only) the first time it drifts.
+function assertRegionOrderMatchesContract(
+  regionOrder: ReadonlyArray<RegionId>,
+): void {
+  if (process.env.NODE_ENV === "production" || warnedRegionOrder) return;
+  const matches =
+    regionOrder.length === REGION_IDS.length &&
+    regionOrder.every((r, i) => r === REGION_IDS[i]);
+  if (!matches) {
+    warnedRegionOrder = true;
+    // eslint-disable-next-line no-console
+    console.error(
+      `[brain-viz] useActivationFrame: regionOrder does not match the ` +
+        `canonical REGION_IDS contract. Got [${regionOrder.join(", ")}], ` +
+        `expected [${REGION_IDS.join(", ")}]. Re-sync with ` +
+        `shared/types.ts:REGION_IDS — the mask bytes index into this order.`,
+    );
+  }
+}
+
 export function useActivationFrame(
   activation: number,
   keyframeVertices: Record<string, number[]> | undefined,
@@ -117,6 +171,11 @@ export function useActivationFrame(
   if (!perVertexRef.current) {
     perVertexRef.current = new Float32Array(NUM_VERTICES);
   }
+
+  // Guard against a future contract reorder silently mismapping regions.
+  useEffect(() => {
+    assertRegionOrderMatchesContract(regionOrder);
+  }, [regionOrder]);
 
   // Pre-sort keyframes when keyframeVertices identity changes. Sort is
   // O(K log K) on 5 keyframes — cheap, but doing it once per video is
@@ -188,7 +247,25 @@ export function useActivationFrame(
     const k1 = values[hi];
 
     const perVertex = perVertexRef.current!;
-    const vertCount = Math.min(perVertex.length, k0.length, k1.length);
+    const expectedLen = perVertex.length; // === NUM_VERTICES
+
+    // Per-vertex keyframes must be full-resolution. The previous code took
+    // Math.min(perVertex.length, k0.length, k1.length) and only wrote that
+    // many vertices — so a short keyframe left the tail of this reused
+    // buffer pinned at the previous frame's values, freezing those vertices
+    // on screen. Validate instead: on a mismatch, warn (dev) and degrade to
+    // a uniform region fill from whatever values we got, which stays
+    // animated and honest rather than half-frozen.
+    if (k0.length !== expectedLen || k1.length !== expectedLen) {
+      warnVertexLengthOnce(k0.length, k1.length, expectedLen);
+      const n = Math.min(k0.length, k1.length);
+      let acc = 0;
+      for (let i = 0; i < n; i++) acc += clamp01(k0[i] + (k1[i] - k0[i]) * f);
+      const g = n > 0 ? acc / n : baseGlobal;
+      for (const r of REGION_IDS) byRegion[r] = g;
+      return { byRegion, global: g, perVertex: null };
+    }
+    const vertCount = expectedLen;
 
     // Per-vertex linear interpolation. If the mask is available, also
     // accumulate per-region sums for byRegion. Otherwise compute a global

@@ -11,6 +11,24 @@ Both are loaded at runtime by `apps/web/components/brain/BrainMesh.tsx`.
 The HEAD probe on `/brain/fsaverage5.glb` flips the renderer from the
 low-poly placeholder to the real cortical surface.
 
+## Render states
+
+`BrainMesh` shows the **low-poly placeholder mesh** (an icosphere coloured
+per-region, see `PlaceholderMesh.tsx`) instead of this surface in three
+cases, two transient and one persistent:
+
+- **Loading** — the GLB is still parsing. The placeholder renders in
+  *wireframe* so the swap-in reads as "the brain is on its way".
+- **Asset unavailable / render error** — the HEAD probe 404s or the surface
+  throws; the *solid* placeholder stands in so the hero is never a blank
+  rectangle.
+- **Activation purged** (`activationPurged` prop) — the per-vertex `.npz`
+  was deleted after region metrics were aggregated, so there is no
+  per-vertex resolution to paint. The solid placeholder renders **plus an
+  "Aggregated only" banner** along the bottom. Region-level readings (legend
+  and hover) still work — they come from the aggregated per-region means,
+  not the purged per-vertex buffer.
+
 ## Provenance
 
 ### Surface mesh

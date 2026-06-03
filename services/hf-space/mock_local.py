@@ -16,6 +16,8 @@ Contract
       body: {
         "jobId":      str,                       # propagated back via callback
         "source":     { "kind": "url"|"s3", "value": str },  # discriminated union
+        "startSec":   float,                     # segment start (YouTube url path; §13.5)
+        "endSec":     float,                     # segment end (ignored for kind=="s3")
         "callbackUrl": str,                      # AWS API Gateway URL for the callback
         "callbackToken": str,                    # forwarded as X-NM-Token header
       }
@@ -38,7 +40,7 @@ so the AWS hf_callback Lambda's decode path runs in dev too:
       }
 
 Failure mode: 1 in 8 requests returns `status="failed_download"` with
-`error="tiktok_blocked"`, so the frontend's error path can be exercised
+`error="download_blocked"`, so the frontend's error path can be exercised
 without ever hitting a real download.
 
 Why not Docker
@@ -127,6 +129,11 @@ class PredictRequest(BaseModel):
         min_length=1,
         description="Sent back as X-NM-Token so the AWS hf_callback Lambda can authenticate",
     )
+    # Segment window (§13.5). The mock ignores it — it always synthesises a
+    # full stub — but accepts the fields so a segment-bearing request from the
+    # frontend / worker doesn't look malformed in the dev loop.
+    startSec: float | None = None
+    endSec: float | None = None
 
 
 app = FastAPI(title="mock-hf-space", version="0.1.0")
@@ -169,9 +176,9 @@ async def _run_and_callback(req: PredictRequest) -> None:
         payload: dict[str, object] = {
             "jobId": req.jobId,
             "status": "failed_download",
-            "error": "tiktok_blocked",
+            "error": "download_blocked",
         }
-        log.info("jobId=%s simulated failure: tiktok_blocked", req.jobId)
+        log.info("jobId=%s simulated failure: download_blocked", req.jobId)
     else:
         duration = random.uniform(DURATION_MIN_SEC, DURATION_MAX_SEC)
         result = _stub_activations(req.jobId, duration)

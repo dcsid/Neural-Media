@@ -7,16 +7,22 @@ task, posting the result to a caller-supplied callback URL.
 Free tier only (ZeroGPU).  Per-call wall clock budget is ~120 s; we
 target <90 s end-to-end.
 
-Pipeline (see brief):
+Pipeline (CONTRACTS.md §13):
 
     1.  Acquire video.
-           kind=url : yt-dlp with rotating UA, plus a share-shortlink retry
-                     for hosts that block the canonical URL.  On block →
-                     failed_download / tiktok_blocked.
-           kind=s3  : plain HTTPS GET on the presigned URL.
-    2.  ffprobe duration.
-           > 90 s          : rejected_duration.
-           60 < d <= 90 s  : auto-trim to 60 s, error="auto_trimmed_to_60s".
+           kind=url : a YouTube URL analyzed over the [startSec, endSec)
+                     window only.  Read the real duration via yt-dlp metadata
+                     first; if endSec exceeds it → rejected_duration /
+                     segment_out_of_bounds.  Then download ONLY that window
+                     with `yt-dlp --download-sections "*startSec-endSec"` —
+                     never the whole video.  On a block → failed_download /
+                     download_blocked.
+           kind=s3  : plain HTTPS GET on the presigned URL (whole uploaded
+                     file; the segment is ignored).
+    2.  Duration.
+           url : the analyzed segment length is endSec - startSec (≤ 90 s,
+                 enforced up front as segment_too_long).
+           s3  : ffprobe the file; > 90 s → rejected_duration.  No auto-trim.
     3.  ffmpeg preprocess to 224x224 @ 8 fps / 16 kHz mono
         (DEFAULT_PREPROCESSING_PARAMS, mirrored from
         services/pipeline/.../preprocess.py:build_ffmpeg_args).
@@ -29,6 +35,11 @@ Pipeline (see brief):
         gzip + base64.
     7.  POST callback with X-NM-Token, three attempts on 5xx with
         exponential back-off (0.5, 1, 2 s).
+
+Segment validation (§13.2): invalid_url / bad_segment / segment_too_long are
+cheap, request-only checks rejected **synchronously** at POST /predict (HTTP
+400 + error_code).  segment_out_of_bounds needs the real video length, so it
+is checked inside the job and reported as a terminal failed callback.
 """
 
 from __future__ import annotations
@@ -39,7 +50,6 @@ import gzip
 import json
 import logging
 import os
-import re
 import shutil
 import subprocess
 import tempfile
@@ -47,6 +57,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Literal, Union
+from urllib.parse import urlparse
 
 import httpx
 import numpy as np
@@ -75,13 +86,11 @@ logging.basicConfig(
 # silently dropping callbacks.
 CALLBACK_SHARED_SECRET = os.environ.get("CALLBACK_SHARED_SECRET", "")
 
-# Duration policy.  Anything strictly longer than MAX_DURATION_SEC is
-# rejected outright; the middle band [TRIM_THRESHOLD_SEC, MAX_DURATION_SEC]
-# gets auto-trimmed so a 75 s video still produces a useful answer rather
-# than a 4xx surprise.  Defaults match the brief.
+# Duration ceiling (CONTRACTS.md §13).  Hard cap on the analyzed window:
+# YouTube segments longer than this are rejected up front as
+# `segment_too_long`; an uploaded file longer than this is rejected as
+# `rejected_duration`.  No auto-trim — the segment is taken verbatim.
 MAX_DURATION_SEC = float(os.environ.get("HF_MAX_DURATION_SEC", "90"))
-TRIM_THRESHOLD_SEC = float(os.environ.get("HF_TRIM_THRESHOLD_SEC", "60"))
-TRIM_TARGET_SEC = float(os.environ.get("HF_TRIM_TARGET_SEC", "60"))
 
 # TRIBE preprocessing target.  Hard-coded here to keep the Space self-
 # contained (we don't want to pull neural_media_pipeline just to read three
@@ -104,11 +113,16 @@ _USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
 ]
 
-# TikTok URL shapes we know how to rewrite.  The share-shortlink form
-# (tiktokv.com/share/video/{id}) is friendlier to yt-dlp than the public
-# /@user/video/{id} canonical when the canonical form gets blocked.
-_TIKTOK_VIDEO_ID_RE = re.compile(
-    r"tiktok\.com/(?:@[\w.\-]+/video|v|t)/(?P<id>\d{6,})"
+# Accepted YouTube hosts (CONTRACTS.md §13.5).  Anything else → invalid_url.
+_YOUTUBE_HOSTS = frozenset(
+    {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
+)
+
+# yt-dlp stderr fragments that signal an access block / removed video rather
+# than a transient failure.  Host-agnostic now the source is YouTube.
+_BLOCK_SIGNATURES = (
+    "blocked", "403", "captcha", "sign in", "login required", "rate-limit",
+    "rate limit", "private video", "video unavailable", "removed", "age-restricted",
 )
 
 
@@ -130,6 +144,60 @@ class PredictRequest(BaseModel):
     source: Union[SourceUrl, SourceS3] = Field(..., discriminator="kind")
     callbackUrl: str
     callbackToken: str = Field(..., min_length=1)
+    # Segment window (CONTRACTS.md §13.5). Required for source.kind=="url"
+    # (a YouTube URL); ignored for source.kind=="s3" (the whole upload is
+    # analyzed). Optional at the schema level so the upload path and any
+    # caller that has not yet adopted the segment fields don't 422 — the
+    # YouTube path enforces their presence as `bad_segment`.
+    startSec: float | None = None
+    endSec: float | None = None
+
+
+# ---------------------------------------------------------------------------
+# Request validation (CONTRACTS.md §13.2 — cheap, synchronous checks)
+# ---------------------------------------------------------------------------
+def _is_youtube_url(url: str) -> bool:
+    """True iff `url` is one of the accepted YouTube forms (§13.5):
+    youtube.com/watch?v=…, the www./m. variants, youtu.be/…, youtube.com/shorts/….
+    """
+    try:
+        parsed = urlparse(url)
+    except (ValueError, TypeError):
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower()
+    if host not in _YOUTUBE_HOSTS:
+        return False
+    if host == "youtu.be":
+        return len(parsed.path.strip("/")) > 0           # youtu.be/<id>
+    if parsed.path == "/watch":
+        return "v=" in (parsed.query or "")              # /watch?v=<id>
+    return parsed.path.startswith("/shorts/") and len(parsed.path) > len("/shorts/")
+
+
+def _segment_request_error(req: "PredictRequest") -> tuple[str, str] | None:
+    """Synchronous, request-only validation for the YouTube segment path.
+
+    Returns ``(error_code, message)`` for an HTTP 400 rejection, or ``None`` if
+    the request is acceptable. Only ``kind=="url"`` is segment-validated;
+    ``kind=="s3"`` (upload) ignores the segment entirely (§13.5). The in-bounds
+    check (``endSec`` vs the real video length) is NOT here — it needs yt-dlp
+    metadata and surfaces from the job as ``segment_out_of_bounds``.
+    """
+    if req.source.kind != "url":
+        return None
+    if not _is_youtube_url(req.source.value):
+        return ("invalid_url", "url is not a recognized YouTube URL")
+    start, end = req.startSec, req.endSec
+    if start is None or end is None:
+        return ("bad_segment", "startSec and endSec are required for a YouTube URL")
+    if start < 0 or start >= end:
+        return ("bad_segment", f"need 0 <= startSec < endSec (got startSec={start}, endSec={end})")
+    if end - start > MAX_DURATION_SEC:
+        return ("segment_too_long",
+                f"segment is {end - start:.1f}s; max is {MAX_DURATION_SEC:.0f}s")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -220,23 +288,6 @@ def _ffprobe_duration(path: Path) -> float:
         raise PipelineError("failed_download", f"ffprobe returned non-numeric duration: {proc.stdout!r}") from e
 
 
-def _trim_to(src: Path, dest: Path, seconds: float) -> None:
-    ffmpeg = _which_or_raise("ffmpeg")
-    proc = subprocess.run(
-        [
-            ffmpeg, "-y", "-loglevel", "error",
-            "-i", str(src),
-            "-t", f"{seconds:.3f}",
-            "-c", "copy",
-            str(dest),
-        ],
-        check=False, capture_output=True,
-    )
-    if proc.returncode != 0:
-        tail = proc.stderr[-200:].decode("utf-8", errors="replace")
-        raise PipelineError("failed_inference", f"ffmpeg trim failed: {tail}")
-
-
 def _preprocess(src: Path, dest: Path) -> None:
     """Normalise to TRIBE's input shape.
 
@@ -268,66 +319,99 @@ def _preprocess(src: Path, dest: Path) -> None:
         raise PipelineError("failed_inference", "preprocess produced empty output")
 
 
-def _maybe_rewrite_tiktok(url: str) -> str | None:
-    """Convert a public TikTok URL into the share-shortlink form when we can.
+def _download_sections_arg(start: float, end: float) -> str:
+    """yt-dlp ``--download-sections`` value for the [start, end) window.
 
-    Returns the rewritten URL, or None if the input doesn't look like one
-    we know how to rewrite (in which case the caller just tries it as-is).
+    Format is ``*START-END`` in seconds (CONTRACTS.md §13). ``:g`` keeps it
+    compact (12.0 -> "12", 12.5 -> "12.5") and free of scientific notation
+    across the 0–90 s range we operate in.
     """
-    m = _TIKTOK_VIDEO_ID_RE.search(url)
-    if not m:
-        return None
-    return f"https://www.tiktokv.com/share/video/{m.group('id')}/"
+    return f"*{start:g}-{end:g}"
 
 
-def _download_via_ytdlp(url: str, dest_dir: Path, *, ua_index: int) -> Path:
-    """Run yt-dlp.  Raises PipelineError on failure; classifies TikTok blocks."""
-    out_template = str(dest_dir / "video.%(ext)s")
-    ua = _USER_AGENTS[ua_index % len(_USER_AGENTS)]
-    cmd = [
-        "yt-dlp",
-        "--quiet", "--no-warnings",
-        "--no-playlist",
+def _ytdlp_base_cmd() -> list[str]:
+    return ["yt-dlp", "--quiet", "--no-warnings", "--no-playlist"]
+
+
+def _ytdlp_duration_cmd(url: str, *, ua: str) -> list[str]:
+    """Command that prints the real video duration (seconds), no download."""
+    return _ytdlp_base_cmd() + [
+        "--user-agent", ua,
+        "--skip-download",
+        "--print", "duration",
+        url,
+    ]
+
+
+def _ytdlp_download_cmd(
+    url: str, out_template: str, *, ua: str, start: float, end: float
+) -> list[str]:
+    """Command that downloads ONLY the [start, end) window — never the full video.
+
+    ``--download-sections "*start-end"`` bounds the fetch to the requested
+    window; ``--force-keyframes-at-cuts`` re-cuts at keyframes so the segment
+    boundaries are tight instead of rounded out to the preceding keyframe.
+    """
+    return _ytdlp_base_cmd() + [
         "--no-part",
         "--user-agent", ua,
         "--retries", "2",
         "--fragment-retries", "2",
         "-f", "mp4/bv*+ba/best",
         "--merge-output-format", "mp4",
+        "--download-sections", _download_sections_arg(start, end),
+        "--force-keyframes-at-cuts",
         "-o", out_template,
         url,
     ]
+
+
+def _looks_blocked(stderr_tail: str) -> bool:
+    """True if yt-dlp's stderr looks like an access block / removed video."""
+    low = stderr_tail.lower()
+    return any(sig in low for sig in _BLOCK_SIGNATURES)
+
+
+def _run_ytdlp(cmd: list[str]) -> subprocess.CompletedProcess:
+    """Run a yt-dlp command; map access blocks to download_blocked (§13.5)."""
     proc = subprocess.run(cmd, check=False, capture_output=True)
     if proc.returncode != 0:
-        tail = proc.stderr[-400:].decode("utf-8", errors="replace").lower()
-        if "tiktok" in url.lower() and any(
-            sig in tail
-            for sig in ("blocked", "unable to download", "403", "captcha", "login", "rate")
-        ):
-            raise PipelineError("failed_download", "tiktok_blocked")
+        tail = proc.stderr[-400:].decode("utf-8", errors="replace")
+        if _looks_blocked(tail):
+            raise PipelineError("failed_download", "download_blocked")
         raise PipelineError("failed_download", f"yt-dlp failed: {tail[-200:]}")
+    return proc
+
+
+def _probe_youtube_duration(url: str, *, ua_index: int = 0) -> float:
+    """Real video duration in seconds via yt-dlp metadata (no download).
+
+    Read BEFORE the segment download so an out-of-bounds window fails fast
+    without pulling any media (CONTRACTS.md §13.2).
+    """
+    ua = _USER_AGENTS[ua_index % len(_USER_AGENTS)]
+    proc = _run_ytdlp(_ytdlp_duration_cmd(url, ua=ua))
+    out = proc.stdout.decode("utf-8", errors="replace").strip().splitlines()
+    try:
+        return float(out[0])
+    except (IndexError, ValueError) as e:
+        raise PipelineError(
+            "failed_download", f"yt-dlp returned non-numeric duration: {out!r}"
+        ) from e
+
+
+def _download_segment(
+    url: str, dest_dir: Path, *, start: float, end: float, ua_index: int = 0
+) -> Path:
+    """Download only the [start, end) window of a YouTube URL via yt-dlp."""
+    out_template = str(dest_dir / "video.%(ext)s")
+    ua = _USER_AGENTS[ua_index % len(_USER_AGENTS)]
+    _run_ytdlp(_ytdlp_download_cmd(url, out_template, ua=ua, start=start, end=end))
     for ext in ("mp4", "mkv", "webm", "mov"):
         cand = dest_dir / f"video.{ext}"
         if cand.exists() and cand.stat().st_size > 0:
             return cand
     raise PipelineError("failed_download", "yt-dlp produced no output file")
-
-
-def _download_url(url: str, dest_dir: Path) -> Path:
-    """Try yt-dlp directly; for TikTok URLs that fail, try the share form."""
-    last_exc: PipelineError | None = None
-    rewritten = _maybe_rewrite_tiktok(url) if "tiktok" in url.lower() else None
-    candidates = [url] if rewritten is None else [url, rewritten]
-    for i, candidate in enumerate(candidates):
-        try:
-            return _download_via_ytdlp(candidate, dest_dir, ua_index=i)
-        except PipelineError as e:
-            last_exc = e
-            # Only continue if the first attempt looked like a TikTok block.
-            if "tiktok_blocked" not in e.message and "yt-dlp" not in e.message:
-                raise
-    assert last_exc is not None
-    raise last_exc
 
 
 async def _download_s3(url: str, dest_dir: Path) -> Path:
@@ -456,32 +540,49 @@ async def _run_job(req: PredictRequest) -> None:
     started = time.monotonic()
     workdir = Path(tempfile.mkdtemp(prefix=f"job-{req.jobId}-"))
     try:
-        # 1. Acquire.
+        # 1. Acquire + 2. determine the analyzed duration.
         raw_dir = workdir / "raw"
         raw_dir.mkdir()
         if req.source.kind == "url":
-            raw_path = await asyncio.to_thread(_download_url, req.source.value, raw_dir)
+            # YouTube segment path (CONTRACTS.md §13). The cheap segment checks
+            # already passed synchronously at /predict; the remaining one needs
+            # the real video length, so read it via metadata BEFORE pulling any
+            # media and reject an out-of-bounds window.
+            start, end = float(req.startSec), float(req.endSec)
+            real_duration = await asyncio.to_thread(
+                _probe_youtube_duration, req.source.value
+            )
+            if end > real_duration:
+                await _post_callback(req.callbackUrl, req.callbackToken, {
+                    "jobId": req.jobId,
+                    "status": "rejected_duration",
+                    "durationSec": real_duration,
+                    "error": "segment_out_of_bounds",
+                })
+                return
+            raw_path = await asyncio.to_thread(
+                _download_segment, req.source.value, raw_dir, start=start, end=end
+            )
+            # The analyzed length IS the requested window (§13.3), regardless of
+            # any keyframe padding in the downloaded file.
+            duration = end - start
+            _log.info(
+                "job=%s segment [%.2f, %.2f) of %.1fs video",
+                req.jobId, start, end, real_duration,
+            )
         else:
+            # Upload path: whole file, segment ignored, hard 90 s cap, no trim.
             raw_path = await _download_s3(req.source.value, raw_dir)
-
-        # 2. Duration policy.
-        duration = _ffprobe_duration(raw_path)
-        _log.info("job=%s downloaded %.1fs", req.jobId, duration)
-        trimmed_note: str | None = None
-        if duration > MAX_DURATION_SEC:
-            await _post_callback(req.callbackUrl, req.callbackToken, {
-                "jobId": req.jobId,
-                "status": "rejected_duration",
-                "durationSec": duration,
-                "error": f"video is {duration:.1f}s; max accepted is {MAX_DURATION_SEC:.0f}s",
-            })
-            return
-        if duration > TRIM_THRESHOLD_SEC:
-            trimmed = raw_dir / "trimmed.mp4"
-            await asyncio.to_thread(_trim_to, raw_path, trimmed, TRIM_TARGET_SEC)
-            raw_path = trimmed
-            duration = TRIM_TARGET_SEC
-            trimmed_note = "auto_trimmed_to_60s"
+            duration = _ffprobe_duration(raw_path)
+            _log.info("job=%s uploaded %.1fs", req.jobId, duration)
+            if duration > MAX_DURATION_SEC:
+                await _post_callback(req.callbackUrl, req.callbackToken, {
+                    "jobId": req.jobId,
+                    "status": "rejected_duration",
+                    "durationSec": duration,
+                    "error": f"video is {duration:.1f}s; max accepted is {MAX_DURATION_SEC:.0f}s",
+                })
+                return
 
         # 3-4. Preprocess + inference.  Name the preprocessed file after
         #      the jobId so TribeBackend's video_id-based resolver picks it up.
@@ -524,8 +625,6 @@ async def _run_job(req: PredictRequest) -> None:
             "durationSec": duration,
             "modelVersion": model_version,
         }
-        if trimmed_note:
-            callback_body["error"] = trimmed_note
         await _post_callback(req.callbackUrl, req.callbackToken, callback_body)
 
     except PipelineError as e:
@@ -565,7 +664,6 @@ def root() -> dict:
         "ok": True,
         "model": "tribe-v2",
         "max_duration_sec": MAX_DURATION_SEC,
-        "trim_threshold_sec": TRIM_THRESHOLD_SEC,
     }
 
 
@@ -581,6 +679,14 @@ async def predict(req: PredictRequest, bg: BackgroundTasks) -> dict:
         # caller hears about it instead of waiting for a callback that
         # would be silently dropped on the AWS side.
         raise HTTPException(503, "CALLBACK_SHARED_SECRET not configured on Space")
+    # Re-validate the cheap, request-only segment rules (§13.2). The Lambda
+    # rejects these at create, but the Space never trusts the client: reject
+    # synchronously (HTTP 400 + error_code) before scheduling any work. The
+    # in-bounds check is authoritative in the job (segment_out_of_bounds).
+    seg_err = _segment_request_error(req)
+    if seg_err is not None:
+        code, message = seg_err
+        raise HTTPException(400, detail={"error_code": code, "message": message})
     # We accept the caller's token verbatim (it's what the Lambda is
     # expecting back); we don't compare it to our own secret here.  The
     # Lambda owns the check, not us.

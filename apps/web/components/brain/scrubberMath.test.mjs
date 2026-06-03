@@ -159,3 +159,50 @@ describe("isAtEnd — end detection", () => {
     assert.equal(isAtEnd(9.5, 10, 0.4), false);
   });
 });
+
+describe("≤90s segment clips (§13 / §13.5) — scrubber maps clip-relative", () => {
+  // CONTRACTS.md §13.3: a YouTube + timestamp job analyzes only the
+  // [startSec, endSec) window, and the result's videoDurationSec is the
+  // SEGMENT length (endSec - startSec, ≤ 90s) — not the source video's full
+  // length. So the timeline the scrubber drives is clip-relative: 0 = the
+  // segment start, duration = endSec - startSec. Nothing here should depend
+  // on the source-absolute startSec offset. These cases pin that the
+  // shorter, segment-based clips of the YouTube refocus map cleanly.
+  const startSec = 12;
+  const endSec = 78;
+  const duration = endSec - startSec; // 66s segment, within the 90s cap
+
+  test("timeline span is the segment length, not the source video", () => {
+    assert.equal(duration, 66);
+    assert.ok(duration <= 90, "segment respects the §13.2 hard cap");
+  });
+  test("track maps clip-relative: left→0, right→segment end", () => {
+    close(secondsFromClientX(0, 0, 600, duration), 0);
+    close(secondsFromClientX(600, 0, 600, duration), duration);
+    close(secondsFromClientX(300, 0, 600, duration), duration / 2);
+  });
+  test("playhead clamps to the segment window", () => {
+    assert.equal(clampSeconds(-5, duration), 0);
+    // An absolute endSec fed into the clip-relative scrubber clamps to the
+    // segment end rather than over-shooting.
+    assert.equal(clampSeconds(endSec, duration), duration);
+    assert.equal(clampSeconds(duration, duration), duration);
+  });
+  test("auto-pause / end-detection fire at the segment end", () => {
+    assert.equal(isAtEnd(duration, duration), true);
+    assert.equal(isAtEnd(duration - 1, duration), false);
+    assert.equal(shouldAutoPauseAtEnd(true, duration, duration), true);
+    assert.equal(shouldAutoPauseAtEnd(true, duration - 1, duration), false);
+  });
+  test("keyframes inside the segment snap within the default tolerance", () => {
+    const keyframes = [0, 16.5, 33, 49.5, 66]; // across the 66s clip
+    const tol = resolveSnapTolerance(undefined, duration); // 4% of 66 = 2.64s
+    assert.equal(snapToKeyframe(34, keyframes, tol), 33);
+    assert.equal(snapToKeyframe(65, keyframes, tol), 66);
+    assert.equal(snapToKeyframe(8, keyframes, tol), 8); // between keyframes
+  });
+  test("a near-cap 90s segment still maps end-to-end", () => {
+    close(secondsFromClientX(600, 0, 600, 90), 90);
+    assert.equal(isAtEnd(90, 90), true);
+  });
+});

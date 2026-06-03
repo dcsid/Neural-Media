@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Local single-URL predictor — TikTok / video URL → brain activation JSON.
+"""Local single-URL predictor — YouTube URL (+ optional segment) → brain activation JSON.
 
 This is the offline counterpart of ``services/hf-space/app.py``: it
 runs the same download → preprocess → TRIBE → aggregate pipeline
 against one URL on the local machine, and emits an activation JSON
 in the *exact* shape the HF Space POSTs to its callback.  Useful for
 plumbing the whole stack before cutting a HuggingFace / AWS deploy.
+
+Per CONTRACTS.md §13 (the YouTube + timestamp refocus): pass
+``--start-sec``/``--end-sec`` to analyze only the ``[startSec, endSec)``
+window — yt-dlp fetches just that segment (``--download-sections``), and
+``videoDurationSec`` in the output is the segment length, not the source
+video's full length. The 90 s cap is a hard ceiling (no auto-trim).
 
 Output contract (matches services/hf-space/app.py:_run_job → activation_payload):
 
@@ -18,14 +24,17 @@ Output contract (matches services/hf-space/app.py:_run_job → activation_payloa
 
 Usage:
 
-    python scripts/predict_one_url.py <url> [--output PATH] [--mock] [--max-duration-sec 60]
+    python scripts/predict_one_url.py <youtube-url> [--start-sec S --end-sec E] \
+        [--output PATH] [--mock] [--max-duration-sec 60]
 
 Exit codes:
 
     0  success
-    1  download failed (prints "tiktok_blocked" to stderr if TikTok 403'd
-       — wrapping scripts can grep for that token)
-    2  video duration exceeds --max-duration-sec (default unlimited)
+    1  download failed (prints "download_blocked" to stderr if the host
+       403'd / gated the fetch — wrapping scripts can grep for that token)
+    2  rejected input: bad/oversized segment ("bad_segment" /
+       "segment_too_long"), unsupported URL ("invalid_url"), or whole-video
+       duration over --max-duration-sec
     3  inference / aggregation failed
 """
 
@@ -39,6 +48,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -59,8 +69,6 @@ for _p in (
         sys.path.insert(0, sp)
 
 # All third-party / local imports go below the path shim.
-import numpy as np  # noqa: E402
-
 from shared.schemas import VideoMetadata  # noqa: E402
 
 from neural_media_inference.aggregate import (  # noqa: E402
@@ -73,8 +81,10 @@ from functools import partial  # noqa: E402
 from neural_media_pipeline.downloader import (  # noqa: E402
     DownloadConfig,
     DownloadError,
+    SegmentError,
     _yt_dlp_fetch,
     download_video,
+    validate_segment,
 )
 from neural_media_pipeline.preprocess import (  # noqa: E402
     PreprocessConfig,
@@ -159,24 +169,52 @@ def _seed_from_url(url: str) -> int:
     return int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
 
 
-def _looks_tiktok_blocked(err: BaseException) -> bool:
-    """Sniff a download failure for TikTok-block signatures.
+def _looks_download_blocked(err: BaseException) -> bool:
+    """Sniff a download failure for host-block / gating signatures.
 
     yt-dlp doesn't surface a single typed exception; the cause chain
     carries the original message.  We keep the substring list small and
-    high-signal so a real connectivity error isn't mislabelled.
+    high-signal so a plain connectivity error (DNS, timeout) isn't
+    mislabelled as a block. Platform-agnostic per CONTRACTS.md §13.5
+    (``tiktok_blocked`` → ``download_blocked``): YouTube gates with "sign
+    in to confirm you're not a bot" / HTTP 403; others with 403 / captcha /
+    rate-limit.
     """
+    signatures = (
+        "403", "forbidden", "blocked", "captcha", "sign in to confirm",
+        "not a bot", "login required", "rate limit", "rate-limit",
+        "too many requests",
+    )
     seen: set[int] = set()
     cur: BaseException | None = err
     while cur is not None and id(cur) not in seen:
         seen.add(id(cur))
         msg = str(cur).lower()
-        if "tiktok" in msg and any(
-            sig in msg
-            for sig in ("403", "blocked", "captcha", "login required", "rate")
-        ):
+        if any(sig in msg for sig in signatures):
             return True
         cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def is_supported_youtube_url(url: str) -> bool:
+    """True iff ``url`` is a YouTube form accepted by CONTRACTS.md §13.5.
+
+    Accepted: ``youtube.com/watch?v=…``, ``www.``/``m.youtube.com/watch…``,
+    ``youtu.be/<id>``, and ``youtube.com/shorts/<id>``. Anything else is
+    ``invalid_url`` — TikTok URLs are no longer accepted by this product.
+    """
+    try:
+        parts = urllib.parse.urlparse((url or "").strip())
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower()
+    path = parts.path or ""
+    if host in ("youtube.com", "www.youtube.com", "m.youtube.com"):
+        if path == "/watch":
+            return bool(urllib.parse.parse_qs(parts.query or "").get("v", [""])[0])
+        return path.startswith("/shorts/") and len(path) > len("/shorts/")
+    if host == "youtu.be":
+        return len(path) > 1  # /<id>
     return False
 
 
@@ -211,10 +249,16 @@ def _run_pipeline(
     *,
     mock: bool,
     max_duration_sec: float | None,
+    segment: tuple[float, float] | None = None,
 ) -> dict:
     """Execute download → preprocess → infer → aggregate and return the
     wire-format activation payload.  Raises with a typed sentinel on
-    duration rejection so the CLI can map to exit code 2."""
+    duration rejection so the CLI can map to exit code 2.
+
+    ``segment`` (``(start_sec, end_sec)``) analyzes only that window: the
+    download fetches just the segment and ``videoDurationSec`` becomes the
+    segment length (CONTRACTS.md §13.3). Without it the whole video is
+    fetched, ffprobed, and gated by ``max_duration_sec``."""
     video_id = _stable_video_id(url)
     workdir = Path(tempfile.mkdtemp(prefix=f"predict-{video_id}-"))
     _log.info("workdir=%s", workdir)
@@ -226,7 +270,8 @@ def _run_pipeline(
 
         # 1. Download.  We deliberately don't expose the on-disk cache
         #    (data/videos/) because the brief says not to write there;
-        #    each invocation gets its own tempdir.
+        #    each invocation gets its own tempdir. With a segment, yt-dlp
+        #    pulls only [startSec, endSec) via --download-sections.
         video = VideoMetadata(id=video_id, source_url=url)
         dl_cfg = DownloadConfig(videos_dir=raw_dir)
         # silent=True routes yt-dlp's own ERROR lines into a null logger so
@@ -236,17 +281,25 @@ def _run_pipeline(
             video,
             dl_cfg,
             fetch=partial(_yt_dlp_fetch, silent=True),
+            segment=segment,
         )
         if not result.ok or result.local_path is None:
             raise DownloadError(result.error or "download_video returned no path")
 
-        # 2. Duration probe + rejection.  ffprobe on the freshly-
-        #    downloaded file rather than on the URL — TikTok URLs don't
-        #    expose duration metadata before download anyway.
-        duration_s = _ffprobe_duration(result.local_path)
-        _log.info("video duration: %.2fs", duration_s)
-        if max_duration_sec is not None and duration_s > max_duration_sec:
-            raise _DurationRejected(duration_s, max_duration_sec)
+        # 2. Determine the analyzed duration.
+        if segment is not None:
+            # §13.3: the analyzed length is the segment span. The fetch
+            # already pulled only that window and validate_segment enforced
+            # the 90 s cap, so no ffprobe / max-duration gate here.
+            start_sec, end_sec = segment
+            duration_s = end_sec - start_sec
+            _log.info("segment [%.2f, %.2f) → %.2fs", start_sec, end_sec, duration_s)
+        else:
+            # ffprobe on the freshly-downloaded file rather than the URL.
+            duration_s = _ffprobe_duration(result.local_path)
+            _log.info("video duration: %.2fs", duration_s)
+            if max_duration_sec is not None and duration_s > max_duration_sec:
+                raise _DurationRejected(duration_s, max_duration_sec)
 
         # 3. Preprocess (224x224 @ 8 fps, 16 kHz mono — defaults
         #    pinned by neural_media_inference.runner).
@@ -305,7 +358,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         description="Predict brain activations for one video URL.  Emits JSON "
                     "matching the HF Space callback payload.",
     )
-    p.add_argument("url", help="TikTok / video URL")
+    p.add_argument("url", help="YouTube video URL (watch?v=… / youtu.be/… / /shorts/…)")
+    p.add_argument(
+        "--start-sec", type=float, default=None,
+        help="segment start in seconds (requires --end-sec). Analyzes only "
+             "[startSec, endSec) via yt-dlp --download-sections.",
+    )
+    p.add_argument(
+        "--end-sec", type=float, default=None,
+        help="segment end in seconds (requires --start-sec). Window capped at 90s.",
+    )
     p.add_argument(
         "--output", "-o", type=Path, default=None,
         help="write JSON to this path (default: stdout, pretty-printed)",
@@ -333,18 +395,45 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
     )
 
+    # Resolve + validate the segment (request-only checks, CONTRACTS.md §13.2).
+    segment: tuple[float, float] | None = None
+    if args.start_sec is not None or args.end_sec is not None:
+        if args.start_sec is None or args.end_sec is None:
+            print("bad_segment", file=sys.stderr)
+            print("both --start-sec and --end-sec are required for a segment",
+                  file=sys.stderr)
+            return 2
+        try:
+            segment = validate_segment(args.start_sec, args.end_sec)
+        except SegmentError as e:
+            print(e.code, file=sys.stderr)
+            print(str(e), file=sys.stderr)
+            return 2
+
+    # YouTube-only product (CONTRACTS.md §13). The Lambda/Space re-validate;
+    # this is the CLI layer's check.
+    if not is_supported_youtube_url(args.url):
+        print("invalid_url", file=sys.stderr)
+        print(f"not a supported YouTube URL: {args.url}", file=sys.stderr)
+        return 2
+
     try:
         payload = _run_pipeline(
             args.url,
             mock=args.mock,
             max_duration_sec=args.max_duration_sec,
+            segment=segment,
         )
     except _DurationRejected as e:
         print(str(e), file=sys.stderr)
         return 2
+    except SegmentError as e:  # defense in depth — download_video re-validates
+        print(e.code, file=sys.stderr)
+        print(str(e), file=sys.stderr)
+        return 2
     except DownloadError as e:
-        if _looks_tiktok_blocked(e):
-            print("tiktok_blocked", file=sys.stderr)
+        if _looks_download_blocked(e):
+            print("download_blocked", file=sys.stderr)
         print(f"download failed: {e}", file=sys.stderr)
         return 1
     except PreprocessError as e:

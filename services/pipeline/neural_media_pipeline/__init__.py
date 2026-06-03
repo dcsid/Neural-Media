@@ -1,9 +1,9 @@
-"""Neural Media data pipeline.
+"""Neural Media clip-fetcher.
 
-Importer + downloader + preprocessor + orchestrator for a single-user,
-local-first TikTok watch-history pipeline. Nothing in this package emits
-network telemetry, and outbound network access is confined to the
-downloader (yt-dlp).
+Downloader + preprocessor for the single-video demo path: fetch a clip
+with yt-dlp and normalize it to TRIBE v2's input shape with ffmpeg.
+Nothing in this package emits network telemetry, and outbound network
+access is confined to the downloader (yt-dlp).
 """
 
 from __future__ import annotations
@@ -27,20 +27,6 @@ from .downloader import (  # noqa: E402
     download_batch,
     download_video,
 )
-from .importer import (  # noqa: E402
-    MalformedExportError,
-    parse_export,
-    stable_video_id,
-    stable_watch_event_id,
-)
-from .orchestrate import (  # noqa: E402
-    IngestSummary,
-    Orchestrator,
-    OrchestratorConfig,
-    Phase,
-    ProgressCallback,
-    ProgressEvent,
-)
 from .preprocess import (  # noqa: E402
     PreprocessConfig,
     PreprocessError,
@@ -52,20 +38,10 @@ __all__ = [
     "DownloadConfig",
     "DownloadError",
     "DownloadResult",
-    "IngestSummary",
-    "MalformedExportError",
-    "Orchestrator",
-    "OrchestratorConfig",
-    "Phase",
-    "ProgressCallback",
-    "ProgressEvent",
     "PreprocessConfig",
     "PreprocessError",
     "PreprocessResult",
     "download_batch",
     "download_video",
-    "parse_export",
     "preprocess_video",
-    "stable_video_id",
-    "stable_watch_event_id",
 ]

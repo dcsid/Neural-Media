@@ -13,7 +13,7 @@ short_description: TRIBE v2 inference for single-video brain-prediction requests
 
 # neural-media · HuggingFace Space (TRIBE inference)
 
-GPU service for the "single TikTok → brain" product.
+GPU service for the "single-video → brain" product.
 
 Invoked by AWS Lambda over HTTP; runs `yt-dlp → ffmpeg → TRIBE v2 →
 region aggregation` in a background task, then POSTs the gzipped

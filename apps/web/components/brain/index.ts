@@ -7,6 +7,4 @@ export { BrainMesh, default } from "./BrainMesh";
 export type { BrainMeshProps } from "./BrainMesh";
 export { TimelineScrubber } from "./TimelineScrubber";
 export type { TimelineScrubberProps } from "./TimelineScrubber";
-export { BrainMeshCompare } from "./BrainMeshCompare";
-export type { BrainMeshCompareProps } from "./BrainMeshCompare";
 export { ActivationScale } from "./ActivationScale";

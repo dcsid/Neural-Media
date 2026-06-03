@@ -72,7 +72,11 @@ def test_worker_sends_no_segment_for_upload_job(monkeypatch):
 
     jw.lambda_handler({"jobId": "j2"}, None)
 
-    _job_id, _source_payload, segment = kick.call_args.args
+    _job_id, source_payload, segment = kick.call_args.args
+    # Uploads go to the Space as kind="s3" (a presigned GET it fetches
+    # verbatim), NOT kind="url" — a presigned URL would fail the Space's
+    # YouTube validator.
+    assert source_payload["source"]["kind"] == "s3"
     assert segment == {}  # uploads are analyzed in full (§13.4)
 
 

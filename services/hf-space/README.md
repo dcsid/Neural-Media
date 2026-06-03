@@ -31,15 +31,22 @@ Body:
 ```json
 {
   "jobId": "string",
-  "source": { "kind": "url", "value": "https://..." },
+  "source": { "kind": "url", "value": "https://www.youtube.com/watch?v=…" },
+  "startSec": 12.0,
+  "endSec": 78.0,
   "callbackUrl": "https://...",
   "callbackToken": "shared-with-aws"
 }
 ```
 
-`source.kind` is `"url"` (yt-dlp) or `"s3"` (HTTPS GET of a presigned
-URL).  The Space accepts the request, returns 202 immediately, and
-runs the pipeline in the background.
+`source.kind` is `"url"` (a **YouTube** URL, analyzed over the
+`[startSec, endSec)` window only — downloaded with
+`yt-dlp --download-sections`, never the whole video) or `"s3"` (HTTPS GET of
+a presigned upload; the whole file, segment ignored). The Space re-validates
+the segment and rejects bad requests **synchronously** with
+`400 { "detail": { "error_code" } }` — `invalid_url`, `bad_segment`, or
+`segment_too_long` (window longer than 90 s). Otherwise it returns 202
+immediately and runs the pipeline in the background.
 
 ### Callback (HF Space → AWS)
 
@@ -51,14 +58,16 @@ When the job finishes, the Space POSTs the `callbackUrl` with header
   "jobId": "...",
   "status": "done",
   "activationsB64": "<gzip(JSON.stringify(activation)) then base64>",
-  "durationSec": 47.2,
-  "modelVersion": "<resolved HF commit sha>",
-  "error": "auto_trimmed_to_60s"
+  "durationSec": 66.0,
+  "modelVersion": "<resolved HF commit sha>"
 }
 ```
 
+`durationSec` is the **analyzed segment length** (`endSec - startSec`), not
+the source video's full length.
+
 ```json
-{ "jobId": "...", "status": "failed_download", "error": "tiktok_blocked" }
+{ "jobId": "...", "status": "failed_download", "error": "download_blocked" }
 ```
 
 ```json
@@ -66,9 +75,18 @@ When the job finishes, the Space POSTs the `callbackUrl` with header
 ```
 
 ```json
+{ "jobId": "...", "status": "rejected_duration", "durationSec": 42.0,
+  "error": "segment_out_of_bounds" }
+```
+
+```json
 { "jobId": "...", "status": "rejected_duration", "durationSec": 121.0,
   "error": "video is 121.0s; max accepted is 90s" }
 ```
+
+`segment_out_of_bounds` is reported when `endSec` exceeds the real video
+length (the Space reads it via yt-dlp metadata before downloading); the last
+form is the upload path rejecting a whole file longer than 90 s.
 
 The activation payload (before gzip+base64) matches the shared API
 contract:
@@ -91,9 +109,7 @@ Liveness + introspection.
 | Env var                  | Default          | Notes                                            |
 | ------------------------ | ---------------- | ------------------------------------------------ |
 | `CALLBACK_SHARED_SECRET` | *(required)*     | Refuses requests until set.                      |
-| `HF_MAX_DURATION_SEC`    | `90`             | Strictly longer → `rejected_duration`.           |
-| `HF_TRIM_THRESHOLD_SEC`  | `60`             | Above this → auto-trim to `HF_TRIM_TARGET_SEC`.  |
-| `HF_TRIM_TARGET_SEC`     | `60`             | Trimmed length when the middle band fires.       |
+| `HF_MAX_DURATION_SEC`    | `90`             | Hard cap on the analyzed window (segment or upload). |
 | `ZERO_GPU_DURATION_SEC`  | `110`            | Budget passed to `@spaces.GPU(duration=...)`.    |
 | `HF_HOME`                | `/data/hf-cache` | Model weight cache.                              |
 | `LOG_LEVEL`              | `INFO`           | Standard Python logging level.                   |
@@ -148,7 +164,7 @@ docker run --rm -p 7860:7860 \
 
 curl -X POST http://localhost:7860/predict \
     -H 'content-type: application/json' \
-    -d '{"jobId":"smoke-1","source":{"kind":"url","value":"https://www.youtube.com/watch?v=jNQXAC9IVRw"},"callbackUrl":"http://host.docker.internal:9999/cb","callbackToken":"x"}'
+    -d '{"jobId":"smoke-1","source":{"kind":"url","value":"https://www.youtube.com/watch?v=jNQXAC9IVRw"},"startSec":0,"endSec":18,"callbackUrl":"http://host.docker.internal:9999/cb","callbackToken":"x"}'
 ```
 
 Real-mode inference won't work locally without a CUDA GPU + the TRIBE

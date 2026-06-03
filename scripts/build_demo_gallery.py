@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Build the precomputed demo gallery for /single/gallery.
+"""Build the precomputed demo gallery for /gallery.
 
 Generates a small set of ActivationPayload JSON files plus an index.json
 manifest under apps/web/public/demo-predictions/. The gallery page fetches
 these directly — no backend, no network, no HuggingFace, no AWS. This is
 the Tier-3 fallback that keeps a usable product running at $0 forever.
 
-For each curated entry:
+Each entry is a (YouTube URL, startSec, endSec) segment per CONTRACTS.md
+§13; only that window is analyzed. For each entry:
 
-    1. Try `python scripts/predict_one_url.py <url> --output <path>`. If
-       worker T2's CLI is on disk, its output (real or mock) is what we
-       commit and `modelVersion` flows from the CLI.
+    1. Try `python scripts/predict_one_url.py <url> --start-sec S --end-sec E
+       --output <path>`. If the predictor CLI is on disk, its output (real
+       or mock) is what we commit and `modelVersion` flows from the CLI.
     2. Else, fall back to running `MockBackend` directly here. The output
        is marked with the sentinel modelVersion `"tribe-v2-mock-gallery"`
        so it's obvious in DevTools which entries are real vs synthesised.
@@ -21,7 +22,7 @@ so the same files feed both `<BrainMesh />` directly and the api-v2
 `fetchActivation` codepath if we ever wire the gallery through it.
 
 Usage:
-    python scripts/build_demo_gallery.py
+    python scripts/build_demo_gallery.py [--mock-only]
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ import json
 import re
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -64,57 +66,75 @@ sys.path.insert(0, str(REPO_ROOT))
 class DemoEntry:
     label: str
     url: str
-    # Suggested clip duration. With MockBackend, the activations are
-    # deterministically seeded off (url, seed) so changing this value
-    # changes the produced timeseries — pick a number you actually want
-    # to render. Realistic short-clip range is 12–45s.
-    duration_sec: float
+    # CONTRACTS.md §13: only the [startSec, endSec) window is analyzed.
+    # endSec - startSec is the clip length that flows into MockBackend and
+    # becomes `videoDurationSec`. Realistic short-clip range is 12–45s
+    # (hard cap 90s). With MockBackend the activations are deterministically
+    # seeded off (url, seed), so the window choice shapes the rendered look.
+    startSec: float = 0.0
+    endSec: float | None = None
+    # Legacy convenience: a bare `duration_sec=N` (no endSec) is treated as
+    # the window [startSec, startSec + N). Prefer startSec/endSec.
+    duration_sec: dataclasses.InitVar[float | None] = None
+
+    def __post_init__(self, duration_sec: float | None) -> None:
+        if self.endSec is None:
+            if duration_sec is None:
+                raise ValueError("DemoEntry needs endSec (or legacy duration_sec)")
+            object.__setattr__(self, "endSec", self.startSec + duration_sec)
+
+    @property
+    def analyzed_duration_sec(self) -> float:
+        """Clip length actually analyzed — endSec - startSec (§13.3)."""
+        return self.endSec - self.startSec
 
 
-# All URLs use clearly-synthetic 19-digit IDs starting with `1111…` so
-# anyone tracing them sees these are demo placeholders and not real
-# scrape targets. The accounts are real public/educational accounts
-# whose general content shape these entries are meant to evoke.
+# PLACEHOLDERS. Each URL uses a clearly-fake YouTube video id
+# ("PLACEHLDR0N") so anyone tracing them sees these are demo stand-ins,
+# not real targets. The labels evoke the *kind* of clip each slot holds.
+# The brain terminal swaps in the real preselected (URL, startSec, endSec)
+# clips later, and the real bake then runs on the GPU; until then
+# `--mock-only` proves the tooling end-to-end with no network.
 DEMO_ENTRIES: tuple[DemoEntry, ...] = (
     DemoEntry(
         label="NASA — Aurora over the Arctic",
-        url="https://www.tiktok.com/@nasa/video/1111111111111110001",
-        duration_sec=18.0,
+        url="https://www.youtube.com/watch?v=PLACEHLDR01",
+        startSec=5.0, endSec=23.0,
     ),
     DemoEntry(
         label="NASA — Mars dust storm timelapse",
-        url="https://www.tiktok.com/@nasa/video/1111111111111110002",
-        duration_sec=22.0,
+        url="https://www.youtube.com/watch?v=PLACEHLDR02",
+        startSec=10.0, endSec=32.0,
     ),
     DemoEntry(
         label="NatGeo — Octopus camouflage",
-        url="https://www.tiktok.com/@natgeo/video/1111111111111110003",
-        duration_sec=15.0,
+        url="https://www.youtube.com/watch?v=PLACEHLDR03",
+        startSec=0.0, endSec=15.0,
     ),
     DemoEntry(
         label="NatGeo — Lions at sunset",
-        url="https://www.tiktok.com/@natgeo/video/1111111111111110004",
-        duration_sec=27.0,
+        url="https://www.youtube.com/watch?v=PLACEHLDR04",
+        startSec=8.0, endSec=35.0,
     ),
     DemoEntry(
         label="BBC Earth — Hummingbird (slow-mo)",
-        url="https://www.tiktok.com/@bbcearth/video/1111111111111110005",
-        duration_sec=12.5,
+        url="https://www.youtube.com/watch?v=PLACEHLDR05",
+        startSec=2.0, endSec=14.5,
     ),
     DemoEntry(
         label="Khan Academy — Pythagoras visual proof",
-        url="https://www.tiktok.com/@khan.academy/video/1111111111111110006",
-        duration_sec=33.0,
+        url="https://www.youtube.com/watch?v=PLACEHLDR06",
+        startSec=0.0, endSec=33.0,
     ),
     DemoEntry(
         label="Smithsonian — T-Rex skull tour",
-        url="https://www.tiktok.com/@smithsonian/video/1111111111111110007",
-        duration_sec=20.0,
+        url="https://www.youtube.com/watch?v=PLACEHLDR07",
+        startSec=12.0, endSec=32.0,
     ),
     DemoEntry(
         label="Duolingo — 'thank you' in five languages",
-        url="https://www.tiktok.com/@duolingo/video/1111111111111110008",
-        duration_sec=14.0,
+        url="https://www.youtube.com/watch?v=PLACEHLDR08",
+        startSec=0.0, endSec=14.0,
     ),
 )
 
@@ -132,9 +152,30 @@ def slugify(label: str) -> str:
 
 
 def _video_id_from_url(url: str) -> str:
-    # Last path segment is the video ID for the canonical TikTok URL shape;
-    # fall back to the URL string if anything's odd so MockBackend's seed
-    # mixer still gets *something* unique.
+    """Best-effort stable video id for seeding MockBackend.
+
+    Extracts the YouTube id (watch?v=…, youtu.be/…, /shorts/…); falls back
+    to the last path segment or the raw URL so the seed mixer always gets
+    *something* unique and stable.
+    """
+    try:
+        parts = urllib.parse.urlparse(url)
+    except ValueError:
+        return url
+    host = (parts.hostname or "").lower()
+    if host == "youtu.be":
+        tail = parts.path.lstrip("/").split("/", 1)[0]
+        if tail:
+            return tail
+    if host.endswith("youtube.com"):
+        if parts.path == "/watch":
+            v = urllib.parse.parse_qs(parts.query or "").get("v", [""])[0]
+            if v:
+                return v
+        if parts.path.startswith("/shorts/"):
+            tail = parts.path[len("/shorts/"):].split("/", 1)[0]
+            if tail:
+                return tail
     tail = url.rstrip("/").rsplit("/", 1)[-1]
     return tail or url
 
@@ -143,14 +184,20 @@ def _video_id_from_url(url: str) -> str:
 # Prediction paths
 # ---------------------------------------------------------------------------
 
-def _try_real_cli(url: str, output_path: Path) -> tuple[bool, str | None]:
-    """Try T2's CLI. Returns (ok, error). On ok=True the file at
-    output_path is the prediction JSON; on ok=False we'll fall back."""
+def _try_real_cli(entry: DemoEntry, output_path: Path) -> tuple[bool, str | None]:
+    """Try the predictor CLI on the entry's segment. Returns (ok, error).
+    On ok=True the file at output_path is the prediction JSON; on ok=False
+    we'll fall back to the local mock."""
     if not PREDICT_CLI.exists():
         return False, "predict_one_url.py not present"
     try:
         result = subprocess.run(
-            [sys.executable, str(PREDICT_CLI), url, "--output", str(output_path)],
+            [
+                sys.executable, str(PREDICT_CLI), entry.url,
+                "--start-sec", str(entry.startSec),
+                "--end-sec", str(entry.endSec),
+                "--output", str(output_path),
+            ],
             cwd=str(REPO_ROOT),
             capture_output=True,
             text=True,
@@ -177,12 +224,14 @@ def _mock_predict(entry: DemoEntry, output_path: Path) -> dict[str, Any]:
     )
 
     backend = MockBackend()
+    # The analyzed length is the segment span (endSec - startSec, §13.3).
+    duration = entry.analyzed_duration_sec
     # 2 Hz native sample rate keeps the raw tensor small (~36 frames at 18s)
     # while still giving the downsampler something to pool. Hard-code the
     # seed so the gallery's "look" is reproducible.
     activations = backend.infer(
         video_id=_video_id_from_url(entry.url),
-        duration_s=entry.duration_sec,
+        duration_s=duration,
         seed=42,
         sample_rate_hz=2.0,
     )
@@ -196,11 +245,11 @@ def _mock_predict(entry: DemoEntry, output_path: Path) -> dict[str, Any]:
     if series_len == 1:
         timestamps = [0.0]
     else:
-        step = entry.duration_sec / (series_len - 1)
+        step = duration / (series_len - 1)
         timestamps = [round(i * step, WIRE_TIMESTAMP_DECIMALS) for i in range(series_len)]
 
     payload: dict[str, Any] = {
-        "videoDurationSec": entry.duration_sec,
+        "videoDurationSec": duration,
         "timestamps": timestamps,
         "byRegion": by_region,
         "modelVersion": MOCK_MODEL_VERSION,
@@ -245,7 +294,7 @@ def build(force_mock: bool) -> int:
         used_real = False
         cli_skip_reason: str | None = None
         if not force_mock:
-            ok, err = _try_real_cli(entry.url, output_path)
+            ok, err = _try_real_cli(entry, output_path)
             if ok:
                 used_real = True
             else:
@@ -273,7 +322,9 @@ def build(force_mock: bool) -> int:
             "slug": slug,
             "label": entry.label,
             "url": entry.url,
-            "durationSec": payload.get("videoDurationSec", entry.duration_sec),
+            "startSec": entry.startSec,
+            "endSec": entry.endSec,
+            "durationSec": payload.get("videoDurationSec", entry.analyzed_duration_sec),
             "modelVersion": payload.get("modelVersion", MOCK_MODEL_VERSION),
         })
 
@@ -282,8 +333,12 @@ def build(force_mock: bool) -> int:
 
     _atomic_write_json(OUTPUT_DIR / "index.json", {"entries": manifest})
 
+    try:
+        where: Path | str = OUTPUT_DIR.relative_to(REPO_ROOT)
+    except ValueError:
+        where = OUTPUT_DIR  # e.g. a tmp dir under test, outside the repo
     print()
-    print(f"wrote {len(manifest)} predictions to {OUTPUT_DIR.relative_to(REPO_ROOT)}/")
+    print(f"wrote {len(manifest)} predictions to {where}/")
     print(f"  real: {real}   mock: {mock}")
     return 0
 

@@ -76,8 +76,51 @@ class DownloadError(RuntimeError):
     """
 
 
-# Signature any fetch implementation (real or mock) must match.
-FetchFn = Callable[[str, Path, str], None]
+# CONTRACTS.md §13: a v2 job analyzes only the [startSec, endSec) window,
+# capped at 90 s (no auto-trim — over-long segments are rejected, §13.5).
+MAX_SEGMENT_SEC = 90.0
+
+
+class SegmentError(ValueError):
+    """Invalid ``[start_sec, end_sec)`` segment request.
+
+    ``code`` is the CONTRACTS.md §13.2 ``error_code`` — ``bad_segment`` or
+    ``segment_too_long`` — so a caller can surface it verbatim. The
+    URL-shape check (``invalid_url``) and the duration-dependent
+    ``segment_out_of_bounds`` check live with the caller that knows the
+    real video length; these two are the request-only checks.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def validate_segment(start_sec: float, end_sec: float) -> tuple[float, float]:
+    """Validate a ``[start_sec, end_sec)`` window against CONTRACTS.md §13.2.
+
+    Returns the pair unchanged on success; raises :class:`SegmentError`
+    (carrying the contract ``error_code``) otherwise. Request-only — never
+    downloads or probes the video.
+    """
+    if start_sec < 0 or start_sec >= end_sec:
+        raise SegmentError(
+            "bad_segment",
+            f"segment must satisfy 0 <= startSec < endSec; got [{start_sec}, {end_sec})",
+        )
+    if end_sec - start_sec > MAX_SEGMENT_SEC:
+        raise SegmentError(
+            "segment_too_long",
+            f"segment is {end_sec - start_sec:.3f}s; the cap is {MAX_SEGMENT_SEC:.0f}s",
+        )
+    return start_sec, end_sec
+
+
+# Signature any fetch implementation (real or mock) must match. The base
+# call is ``fetch(url, dest, user_agent)``; ``download_video`` additionally
+# passes ``segment=(start, end)`` when a window is requested, so a fetcher
+# that supports segment downloads accepts an optional ``segment`` keyword.
+FetchFn = Callable[..., None]
 SleepFn = Callable[[float], None]
 
 
@@ -167,6 +210,7 @@ def _yt_dlp_fetch(
     user_agent: str,
     *,
     silent: bool = False,
+    segment: tuple[float, float] | None = None,
 ) -> None:
     """Single network seam. Lazily imports yt-dlp so test environments
     that monkeypatch this never need yt-dlp installed at all.
@@ -179,6 +223,12 @@ def _yt_dlp_fetch(
     yt-dlp's ERROR lines mixed in with their own rephrased failure
     messages. The pipeline orchestrator never sets it, so the
     long-standing batch-ingest log output is preserved.
+
+    ``segment`` (``(start_sec, end_sec)``) restricts the download to that
+    window via yt-dlp's ``download_ranges`` — the Python-API form of the
+    ``--download-sections "*start-end"`` CLI flag — with
+    ``force_keyframes_at_cuts`` so the cut is frame-accurate. ``None``
+    downloads the whole video (CONTRACTS.md §13).
     """
     import yt_dlp  # type: ignore[import-not-found]  # lazy, optional dep
 
@@ -200,6 +250,14 @@ def _yt_dlp_fetch(
     }
     if silent:
         ydl_opts["logger"] = _NullYtdlLogger()
+    if segment is not None:
+        # Lazy import: download_range_func lives in yt_dlp.utils and is only
+        # needed on the segment path.
+        from yt_dlp.utils import download_range_func  # type: ignore[import-not-found]
+
+        start_sec, end_sec = segment
+        ydl_opts["download_ranges"] = download_range_func(None, [(start_sec, end_sec)])
+        ydl_opts["force_keyframes_at_cuts"] = True
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
@@ -232,6 +290,7 @@ def download_video(
     fetch: FetchFn = _yt_dlp_fetch,
     sleep: SleepFn = time.sleep,
     rng: random.Random | None = None,
+    segment: tuple[float, float] | None = None,
 ) -> DownloadResult:
     """Download one video with retry, backoff, and UA rotation.
 
@@ -240,7 +299,16 @@ def download_video(
 
     Raises ``DownloadError`` only after the retry budget is exhausted.
     Per-attempt failures are caught and retried.
+
+    ``segment`` downloads only the ``[start_sec, end_sec)`` window
+    (CONTRACTS.md §13). It is validated up front — a bad window raises
+    :class:`SegmentError` before any network call (and is never retried) —
+    and forwarded to the fetch seam. The on-disk cache key is the video id,
+    so a caller mixing whole-video and segment fetches should use a
+    distinct ``videos_dir`` per request (the bake tooling uses a tempdir).
     """
+    if segment is not None:
+        validate_segment(*segment)
     rng = rng if rng is not None else random.Random()
     dest = _local_path(cfg, video.id)
 
@@ -248,11 +316,14 @@ def download_video(
         _log.debug("event=download_cache_hit video_id=%s", video.id)
         return DownloadResult(video_id=video.id, local_path=dest, skipped=True, attempts=0)
 
+    # Only thread `segment` through when set, so fetch seams that take the
+    # base (url, dest, ua) signature keep working for whole-video fetches.
+    fetch_kwargs: dict[str, object] = {"segment": segment} if segment is not None else {}
     last_err: BaseException | None = None
     for attempt in range(1, cfg.max_attempts + 1):
         ua = rng.choice(cfg.user_agents)
         try:
-            fetch(video.source_url, dest, ua)
+            fetch(video.source_url, dest, ua, **fetch_kwargs)
         except Exception as exc:  # noqa: BLE001 — yt-dlp raises a wide variety
             last_err = exc
             _log.debug(
@@ -331,12 +402,15 @@ def download_batch(
 
 
 __all__ = [
+    "MAX_SEGMENT_SEC",
     "DownloadConfig",
     "DownloadError",
     "DownloadResult",
     "FetchFn",
+    "SegmentError",
     "SleepFn",
     "download_batch",
     "download_video",
+    "validate_segment",
     "yt_dlp_available",
 ]

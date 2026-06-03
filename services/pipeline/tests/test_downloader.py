@@ -16,10 +16,13 @@ from pathlib import Path
 import pytest
 
 from neural_media_pipeline.downloader import (
+    MAX_SEGMENT_SEC,
     DownloadConfig,
     DownloadError,
+    SegmentError,
     download_batch,
     download_video,
+    validate_segment,
     yt_dlp_available,
 )
 from shared.schemas import VideoMetadata
@@ -353,3 +356,104 @@ def test_yt_dlp_available_returns_false_when_missing(
     monkeypatch.setattr(importlib.util, "find_spec", lambda _: None)
     monkeypatch.setattr(dl.shutil, "which", lambda _name: None)
     assert yt_dlp_available() is False
+
+
+# ---------------------------------------------------------------------------
+# Segment download (--download-sections) — CONTRACTS.md §13
+# ---------------------------------------------------------------------------
+
+def test_validate_segment_accepts_valid() -> None:
+    assert validate_segment(10.0, 25.0) == (10.0, 25.0)
+    assert validate_segment(0.0, MAX_SEGMENT_SEC) == (0.0, MAX_SEGMENT_SEC)
+
+
+@pytest.mark.parametrize("start,end", [(-1.0, 10.0), (10.0, 10.0), (20.0, 5.0)])
+def test_validate_segment_bad_segment(start: float, end: float) -> None:
+    with pytest.raises(SegmentError) as exc_info:
+        validate_segment(start, end)
+    assert exc_info.value.code == "bad_segment"
+
+
+def test_validate_segment_too_long() -> None:
+    with pytest.raises(SegmentError) as exc_info:
+        validate_segment(0.0, MAX_SEGMENT_SEC + 0.1)
+    assert exc_info.value.code == "segment_too_long"
+
+
+def test_download_video_forwards_segment_to_fetch(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    captured: dict[str, object] = {}
+
+    def fake_fetch(url: str, dest: Path, ua: str, *, segment=None) -> None:
+        captured["segment"] = segment
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"seg")
+
+    res = download_video(
+        _video(), cfg, fetch=fake_fetch, sleep=_Sleeps(),
+        rng=random.Random(0), segment=(12.0, 30.0),
+    )
+    assert res.ok is True and res.skipped is False
+    assert captured["segment"] == (12.0, 30.0)
+
+
+def test_download_video_without_segment_uses_base_fetch_signature(tmp_path: Path) -> None:
+    """A fetcher taking only (url, dest, ua) still works when no segment is
+    requested — the segment kwarg is only threaded through when set."""
+    cfg = _cfg(tmp_path)
+
+    def base_fetch(url: str, dest: Path, ua: str) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"ok")
+
+    res = download_video(_video(), cfg, fetch=base_fetch, sleep=_Sleeps(), rng=random.Random(0))
+    assert res.ok is True and res.skipped is False
+
+
+def test_download_video_invalid_segment_raises_before_fetch(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+
+    def boom_fetch(*args, **kwargs):  # pragma: no cover — must not run
+        raise AssertionError("fetch must not run on an invalid segment")
+
+    with pytest.raises(SegmentError) as exc_info:
+        download_video(_video(), cfg, fetch=boom_fetch, sleep=_Sleeps(), segment=(50.0, 10.0))
+    assert exc_info.value.code == "bad_segment"
+
+
+def test_yt_dlp_fetch_wires_download_ranges(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_yt_dlp_fetch`` with a segment passes ``download_ranges`` +
+    ``force_keyframes_at_cuts`` to yt-dlp — verified via a fake yt_dlp
+    module so the test needs no real yt-dlp install."""
+    import types
+
+    from neural_media_pipeline.downloader import _yt_dlp_fetch
+
+    dest = tmp_path / "vid.mp4"
+    captured: dict[str, object] = {}
+
+    class _FakeYDL:
+        def __init__(self, opts):
+            captured["opts"] = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def download(self, _urls):
+            dest.write_bytes(b"seg")  # simulate yt-dlp writing the file
+
+    fake_yt = types.ModuleType("yt_dlp")
+    fake_yt.YoutubeDL = _FakeYDL  # type: ignore[attr-defined]
+    fake_utils = types.ModuleType("yt_dlp.utils")
+    fake_utils.download_range_func = lambda chapters, ranges: ("RANGES", ranges)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "yt_dlp", fake_yt)
+    monkeypatch.setitem(sys.modules, "yt_dlp.utils", fake_utils)
+
+    _yt_dlp_fetch("https://www.youtube.com/watch?v=abc", dest, "UA", segment=(12.0, 30.0))
+
+    opts = captured["opts"]
+    assert opts["force_keyframes_at_cuts"] is True
+    assert opts["download_ranges"] == ("RANGES", [(12.0, 30.0)])

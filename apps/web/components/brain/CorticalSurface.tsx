@@ -78,9 +78,8 @@ export function CorticalSurface({
   // the render output reparents the mesh from `gltf.scene` into the
   // surrounding `<group>` on first mount — and three.js's
   // `Object3D.add()` implicitly removes the child from its previous
-  // parent. Under React StrictMode (or BrainMeshCompare's two
-  // side-by-side surfaces, or any HMR re-mount), the second mount then
-  // re-runs the mesh-finder useMemo against a `gltf.scene` that's been
+  // parent. Under React StrictMode or any HMR re-mount, the second mount
+  // then re-runs the mesh-finder useMemo against a `gltf.scene` that's been
   // emptied by the first mount and throws "did not contain a mesh".
   // Fetching + GLTFLoader.parse() into per-instance state gives each
   // component its own fresh scene, so reparenting one doesn't strip
@@ -188,13 +187,13 @@ export function CorticalSurface({
 
   // Free GPU resources when the surface is rebuilt (url/GLB change) or the
   // component unmounts. three.js never auto-disposes geometry buffers or
-  // materials, so without this every HMR edit, StrictMode remount, or
-  // BrainMeshCompare side-swap would leak the cortical-surface geometry's
-  // GPU buffers (including the per-vertex colour attribute) and the
-  // MeshStandardMaterial. `built` is a fresh per-parse object (see the
-  // loader note above) and only ever becomes non-null after the async
-  // fetch resolves, so this cleanup always targets exactly the resources
-  // created here — never ones a later render of the same instance reuses.
+  // materials, so without this every HMR edit or StrictMode remount would
+  // leak the cortical-surface geometry's GPU buffers (including the
+  // per-vertex colour attribute) and the MeshStandardMaterial. `built` is a
+  // fresh per-parse object (see the loader note above) and only ever becomes
+  // non-null after the async fetch resolves, so this cleanup always targets
+  // exactly the resources created here — never ones a later render of the
+  // same instance reuses.
   useEffect(() => {
     if (!built) return;
     const { mesh, material, originalMaterial } = built;

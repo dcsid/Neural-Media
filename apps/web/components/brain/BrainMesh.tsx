@@ -57,18 +57,6 @@ export interface BrainMeshProps {
   // labels the regions and the legend would compete for attention.
   hideLegend?: boolean;
   onReady?: () => void;
-  // Optional hover lift-out. When provided, BrainMesh forwards its
-  // CorticalSurface hover event to the parent instead of (also) rendering
-  // its own tooltip — used by BrainMeshCompare to share hover state across
-  // two side-by-side meshes. Single-mesh consumers leave it undefined and
-  // the original internal-tooltip behavior is preserved.
-  onHover?: (e: CorticalHoverEvent | null) => void;
-  // Optional externally-supplied hover (e.g. mirrored from the sibling
-  // mesh in BrainMeshCompare). When set, BrainMesh renders the tooltip for
-  // this event in addition to (or instead of) its own local hover.
-  // BrainMesh keeps its own internal hover state working — the merge rule
-  // is "local hover wins, otherwise fall back to externalHover".
-  externalHover?: CorticalHoverEvent | null;
 }
 
 const SURFACE_URL = "/brain/fsaverage5.glb";
@@ -133,8 +121,6 @@ export function BrainMesh({
   activationPurged = false,
   hideLegend = false,
   onReady,
-  onHover,
-  externalHover,
 }: BrainMeshProps) {
   const reduceMotion = useReducedMotion();
   const surfaceAvailable = useSurfaceAvailable(SURFACE_URL);
@@ -216,56 +202,22 @@ export function BrainMesh({
   const containerRef = useRef<HTMLDivElement>(null);
   const [hover, setHover] = useState<RegionHoverInfo | null>(null);
 
-  const handleHover = useCallback(
-    (e: CorticalHoverEvent | null) => {
-      // Lift-out: if the parent wired up onHover, forward the raw event
-      // upward (in clientX/Y space — the parent will translate it into
-      // whatever container space it cares about). We still set our local
-      // hover so the tooltip can render correctly relative to *this*
-      // mesh's container; the parent gets the underlying event verbatim.
-      onHover?.(e);
-      if (!e || !containerRef.current) {
-        setHover(null);
-        return;
-      }
-      const rect = containerRef.current.getBoundingClientRect();
-      setHover({
-        regionId: e.regionId,
-        activation: e.activation,
-        vertexIndex: e.vertexIndex,
-        x: e.clientX - rect.left,
-        y: e.clientY - rect.top,
-      });
-    },
-    [onHover],
-  );
-
-  // Translate an external hover event (from a sibling mesh) into the local
-  // container's coordinate space so the tooltip can render in the right
-  // spot. We do NOT mirror the cursor position one-for-one — instead we
-  // map by vertex/region so the tooltip lands somewhere sensible without
-  // overlaying the pointer of the *other* mesh.
-  const mirroredHover: RegionHoverInfo | null = (() => {
-    if (!externalHover || !containerRef.current) return null;
+  const handleHover = useCallback((e: CorticalHoverEvent | null) => {
+    // Translate the surface's clientX/Y hover into container-relative
+    // coordinates for the tooltip; clear it when the pointer leaves.
+    if (!e || !containerRef.current) {
+      setHover(null);
+      return;
+    }
     const rect = containerRef.current.getBoundingClientRect();
-    // Park the mirrored tooltip at the top-left interior of the panel —
-    // far enough from the corner to avoid the legend, and predictable
-    // across both panes. We don't have a way to reverse-project the
-    // hovered vertex back to screen space cheaply, so this is the
-    // honest compromise.
-    return {
-      regionId: externalHover.regionId,
-      activation: externalHover.activation,
-      vertexIndex: externalHover.vertexIndex,
-      x: Math.min(rect.width - 200, 16),
-      y: 16,
-    };
-  })();
-
-  // Local hover wins. The mirrored hover only paints when the user isn't
-  // already hovering this pane directly — otherwise we'd render two
-  // tooltips and they'd argue.
-  const displayedHover = hover ?? mirroredHover;
+    setHover({
+      regionId: e.regionId,
+      activation: e.activation,
+      vertexIndex: e.vertexIndex,
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top,
+    });
+  }, []);
 
   const handleReady = useCallback(() => {
     if (firstPaintMs === null) {
@@ -528,7 +480,7 @@ export function BrainMesh({
         </div>
       )}
 
-      <RegionTooltip hover={displayedHover} />
+      <RegionTooltip hover={hover} />
       {activationPurged && (
         <div
           role="status"

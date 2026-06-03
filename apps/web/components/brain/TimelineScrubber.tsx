@@ -71,8 +71,8 @@ function pct(n: number, d: number): string {
 }
 
 // 00:00.00 — minutes / seconds / centiseconds. mm grows past 99:59.99 for
-// extremely long inputs but TikToks max out at ~10 minutes, so two digits
-// is plenty visually.
+// extremely long inputs, but the analysis segment is capped at 90s, so two
+// digits is plenty visually.
 function formatTime(sec: number): string {
   if (!Number.isFinite(sec) || sec < 0) sec = 0;
   const m = Math.floor(sec / 60);

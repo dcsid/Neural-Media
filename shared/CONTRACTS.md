@@ -543,3 +543,20 @@ The direct-MP4 upload path may remain as a secondary input (whole file,
 still subject to the 90 s cap). Timestamp selection applies to the
 YouTube-URL path only; an uploaded file is analyzed in full (≤90 s).
 Keep it working; do not extend it with segment selection.
+
+### 13.5 Implementation notes (resolves the Phase-1 worker questions)
+
+- **The segment flows all the way to the Space.** The internal Lambda → Space
+  `POST /predict` request gains `startSec` and `endSec` (top-level, alongside
+  `source`/`callbackUrl`/`callbackToken`). `source.kind=="url"`'s value is a
+  YouTube URL; `source.kind=="s3"` (upload) stays and ignores the segment.
+- **Generic block status.** Rename `tiktok_blocked` → **`download_blocked`**
+  everywhere it is emitted or consumed (Space `app.py` + `mock_local.py`, the
+  AWS callback Lambda, the frontend's special-case). No longer TikTok-specific.
+- **Accepted YouTube URL forms** (client validator + server): `youtube.com/watch?v=…`,
+  `www.youtube.com/watch…`, `m.youtube.com/watch…`, `youtu.be/…`, and
+  `youtube.com/shorts/…`. Anything else → `invalid_url`.
+- **No auto-trim.** The previous 60–90 s auto-trim band is removed. The segment
+  is taken verbatim from `[startSec, endSec)`; `endSec − startSec > 90` is
+  rejected (`segment_too_long`) rather than silently trimmed. `MAX_DURATION_SEC`
+  stays 90 as the hard ceiling; the `TRIM_THRESHOLD/TRIM_TARGET` logic goes away.

@@ -36,8 +36,8 @@ out/
 .pnpm-store/
 
 # --- Neural Media user data --------------------------------------------------
-# These directories hold a real user's TikTok data + inference outputs.
-# NEVER commit them. data/sample/ is the only data path that ships.
+# These directories hold a real user's video data + inference outputs.
+# NEVER commit them.
 data/videos/*
 !data/videos/.gitkeep
 data/activations/*

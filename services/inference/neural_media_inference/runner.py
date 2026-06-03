@@ -103,8 +103,8 @@ def run_inference(
     activations_dir = Path(activations_dir)
     activations_dir.mkdir(parents=True, exist_ok=True)
 
-    # run_id / created_at overrides exist for fixture regeneration only
-    # (scripts/build_sample_outputs.py). Production callers leave them None.
+    # run_id / created_at overrides exist for deterministic test fixtures
+    # only. Production callers leave them None.
     run_id = run_id if run_id is not None else str(uuid.uuid4())
     created_at = created_at if created_at is not None else datetime.now(timezone.utc)
 

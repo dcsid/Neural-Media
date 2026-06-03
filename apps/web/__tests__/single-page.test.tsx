@@ -33,7 +33,7 @@ import * as apiV2 from "@/lib/api-v2";
 
 const api = vi.mocked(apiV2);
 
-const URL_A = "https://www.tiktok.com/@nasa/video/123";
+const URL_A = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
 
 function activation(): apiV2.ActivationPayload {
   const timestamps = [0, 0.5, 1];
@@ -60,18 +60,21 @@ describe("/single state machine", () => {
     const user = userEvent.setup();
     render(<SingleVideoPage />);
 
-    await user.type(screen.getByLabelText(/tiktok url/i), URL_A);
+    await user.type(screen.getByLabelText(/youtube url/i), URL_A);
     await user.click(screen.getByRole("button", { name: /^predict$/i }));
 
     expect(await screen.findByText(/of brain activity/i)).toBeInTheDocument();
-    expect(api.createUrlJob).toHaveBeenCalledWith(URL_A);
+    expect(api.createUrlJob).toHaveBeenCalledWith(URL_A, {
+      startSec: 0,
+      endSec: 30,
+    });
     expect(api.fetchActivation).toHaveBeenCalledWith(
       "https://cdn/job-1.json",
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
-    // P3.9: header switches from the CTA to an acknowledgement.
+    // header switches from the CTA to an acknowledgement once results land.
     expect(
-      screen.getByRole("heading", { name: /your brain on that tiktok/i }),
+      screen.getByRole("heading", { name: /your brain on that video/i }),
     ).toBeInTheDocument();
   });
 
@@ -97,7 +100,7 @@ describe("/single state machine", () => {
 
     const user = userEvent.setup();
     render(<SingleVideoPage />);
-    const input = screen.getByLabelText(/tiktok url/i);
+    const input = screen.getByLabelText(/youtube url/i);
 
     await user.type(input, URL_A);
     await user.click(screen.getByRole("button", { name: /^predict$/i }));
@@ -108,30 +111,30 @@ describe("/single state machine", () => {
     // Fix the URL and resubmit — the stale error must not survive into the
     // successful run.
     await user.clear(input);
-    await user.type(input, "https://www.tiktok.com/@nasa/video/999");
+    await user.type(input, "https://www.youtube.com/watch?v=anotherVid1");
     await user.click(screen.getByRole("button", { name: /^predict$/i }));
 
     expect(await screen.findByText(/of brain activity/i)).toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
-  it("offers the upload fallback on tiktok_blocked and recovers via upload", async () => {
+  it("offers the upload fallback on download_blocked and recovers via upload", async () => {
     api.createUrlJob.mockResolvedValue({ jobId: "job-1" });
     api.getJob.mockResolvedValueOnce({
       jobId: "job-1",
       status: "failed_download",
-      error: "tiktok_blocked",
+      error: "download_blocked",
       createdAt: 0,
       elapsedSec: 1,
     });
 
     const user = userEvent.setup();
     render(<SingleVideoPage />);
-    await user.type(screen.getByLabelText(/tiktok url/i), URL_A);
+    await user.type(screen.getByLabelText(/youtube url/i), URL_A);
     await user.click(screen.getByRole("button", { name: /^predict$/i }));
 
     expect(
-      await screen.findByText(/tiktok blocked our download/i),
+      await screen.findByText(/youtube blocked our download/i),
     ).toBeInTheDocument();
 
     // Upload an MP4 from the error panel → new job, then keep it in-flight.
@@ -172,7 +175,7 @@ describe("/single state machine", () => {
 
     const user = userEvent.setup();
     const { unmount } = render(<SingleVideoPage />);
-    await user.type(screen.getByLabelText(/tiktok url/i), URL_A);
+    await user.type(screen.getByLabelText(/youtube url/i), URL_A);
     await user.click(screen.getByRole("button", { name: /^predict$/i }));
 
     await vi.waitFor(() => expect(api.getJob).toHaveBeenCalled());
@@ -185,7 +188,7 @@ describe("/single state machine", () => {
     const user = userEvent.setup();
     render(<SingleVideoPage />);
 
-    const url = screen.getByLabelText(/tiktok url/i);
+    const url = screen.getByLabelText(/youtube url/i);
     expect(url).toBeRequired();
     expect(url).toHaveAttribute("aria-required", "true");
 
@@ -195,6 +198,62 @@ describe("/single state machine", () => {
     expect(
       screen.getByLabelText(/upload an mp4 video file/i),
     ).toHaveAttribute("type", "file");
+  });
+});
+
+describe("/single segment picker (Phase 2)", () => {
+  it("validates the segment inline and gates Predict on it", async () => {
+    const user = userEvent.setup();
+    render(<SingleVideoPage />);
+    await user.type(screen.getByLabelText(/youtube url/i), URL_A);
+
+    const end = screen.getByLabelText(/end \(s\)/i);
+    const predict = () => screen.getByRole("button", { name: /^predict$/i });
+
+    expect(predict()).toBeEnabled(); // default 0–30s is valid
+
+    await user.clear(end);
+    await user.type(end, "0"); // start 0 >= end 0 → bad_segment
+    expect(predict()).toBeDisabled();
+    expect(screen.getByText(/start before the end/i)).toBeInTheDocument();
+
+    await user.clear(end);
+    await user.type(end, "200"); // 200s window > 90s cap → segment_too_long
+    expect(predict()).toBeDisabled();
+    expect(screen.getByText(/90 seconds or less/i)).toBeInTheDocument();
+
+    await user.clear(end);
+    await user.type(end, "45");
+    expect(predict()).toBeEnabled();
+  });
+
+  it("threads the chosen [startSec, endSec) into createUrlJob", async () => {
+    api.createUrlJob.mockResolvedValue({ jobId: "job-x" });
+    api.getJob.mockResolvedValue({
+      jobId: "job-x",
+      status: "inferring",
+      createdAt: 0,
+      elapsedSec: 1,
+    });
+
+    const user = userEvent.setup();
+    render(<SingleVideoPage />);
+    await user.type(screen.getByLabelText(/youtube url/i), URL_A);
+
+    const start = screen.getByLabelText(/start \(s\)/i);
+    const end = screen.getByLabelText(/end \(s\)/i);
+    await user.clear(start);
+    await user.type(start, "12");
+    await user.clear(end);
+    await user.type(end, "78");
+    await user.click(screen.getByRole("button", { name: /^predict$/i }));
+
+    await vi.waitFor(() =>
+      expect(api.createUrlJob).toHaveBeenCalledWith(URL_A, {
+        startSec: 12,
+        endSec: 78,
+      }),
+    );
   });
 });
 
@@ -212,7 +271,7 @@ describe("/single timeout boundary (P2.7)", () => {
     });
 
     render(<SingleVideoPage />);
-    const input = screen.getByLabelText(/tiktok url/i);
+    const input = screen.getByLabelText(/youtube url/i);
     fireEvent.change(input, { target: { value: URL_A } });
     fireEvent.click(screen.getByRole("button", { name: /^predict$/i }));
 
@@ -220,7 +279,7 @@ describe("/single timeout boundary (P2.7)", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(50);
     });
-    expect(screen.getByText(/fetching the tiktok/i)).toBeInTheDocument();
+    expect(screen.getByText(/fetching that segment/i)).toBeInTheDocument();
 
     // Cross the 180s wall-clock cap (check fires on the tick past it).
     await act(async () => {

@@ -6,7 +6,7 @@ import { Footer } from "@/components/Footer";
 export const metadata: Metadata = {
   title: "Neural Media",
   description:
-    "Predicted average cortical fMRI response to your TikTok watch history. Local-first. Non-commercial. Built on Meta FAIR TRIBE v2.",
+    "Predicted average cortical fMRI response to a short YouTube video segment. Paste a URL, pick a clip, watch the brain light up. Non-commercial. Built on Meta FAIR TRIBE v2.",
 };
 
 export default function RootLayout({

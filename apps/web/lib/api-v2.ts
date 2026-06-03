@@ -1,7 +1,7 @@
 // Client-side bindings for the v2 "single video → brain" job API.
 //
 // The backend (T2/T3) implements:
-//   POST /v2/jobs                          { url }                          → 201 { jobId }
+//   POST /v2/jobs                          { url, startSec, endSec }        → 201 { jobId }
 //   POST /v2/jobs/upload                   { filename, contentType }        → 201 { jobId, uploadUrl, uploadKey }
 //   POST /v2/jobs/upload/{id}/confirm                                       → 200
 //   GET  /v2/jobs/{id}                                                      → 200 JobStatus
@@ -71,8 +71,9 @@ export interface JobStatusResponse {
   // it on the done callback. Diagnostic only — not all responses
   // include it (failure/intermediate statuses won't).
   modelVersion?: string;
-  // Short machine-readable error code. The frontend special-cases
-  // "tiktok_blocked" on failed_download to surface the upload fallback.
+  // Short machine-readable error code (CONTRACTS.md §13.2 vocabulary, e.g.
+  // "download_blocked", "segment_out_of_bounds"). The frontend special-cases
+  // "download_blocked" on failed_download to surface the upload fallback.
   error?: string;
   // Actual decoded video duration as measured by ffprobe on the HF Space.
   // Reported through the hf-callback once inference completes; absent on
@@ -252,13 +253,24 @@ async function parseJsonOrThrow<T>(url: string, response: Response): Promise<T> 
 // Public API
 // ---------------------------------------------------------------------------
 
+// The [startSec, endSec) window to analyze (CONTRACTS.md §13.1). The Space
+// fetches only this segment via `yt-dlp --download-sections`.
+export interface Segment {
+  startSec: number;
+  endSec: number;
+}
+
 export async function createUrlJob(
   url: string,
+  segment: Segment,
   opts: RequestOpts = {},
 ): Promise<CreateUrlJobResponse> {
-  return postJson<{ url: string }, CreateUrlJobResponse>(
+  return postJson<
+    { url: string; startSec: number; endSec: number },
+    CreateUrlJobResponse
+  >(
     "/v2/jobs",
-    { url },
+    { url, startSec: segment.startSec, endSec: segment.endSec },
     opts,
   );
 }
@@ -468,11 +480,12 @@ function validateActivation(url: string, raw: unknown): ActivationPayload {
 // URL validation
 // ---------------------------------------------------------------------------
 
-// Loose TikTok URL recogniser. We accept the canonical tiktok.com/@user/video/<id>,
-// the vm.tiktok.com / vt.tiktok.com short links, and any tiktok.com host —
-// the backend will do the strict parse + validate; this is purely client-side
-// gating for the Predict button.
-export function looksLikeTikTokUrl(input: string): boolean {
+// Client-side YouTube URL recogniser. Accepts the forms in CONTRACTS.md §13.5:
+//   youtube.com/watch?v=…, www./m.youtube.com/watch…, youtu.be/…,
+//   youtube.com/shorts/…
+// Purely client gating for instant feedback — the Lambda + Space re-validate
+// authoritatively (anything they reject → `invalid_url`).
+export function looksLikeYouTubeUrl(input: string): boolean {
   const trimmed = input.trim();
   if (trimmed.length === 0) return false;
   let parsed: URL;
@@ -482,9 +495,44 @@ export function looksLikeTikTokUrl(input: string): boolean {
     return false;
   }
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return false;
-  const host = parsed.hostname.toLowerCase();
-  return (
-    host === "tiktok.com" ||
-    host.endsWith(".tiktok.com")
-  );
+  const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+  if (host === "youtu.be") {
+    return parsed.pathname.length > 1; // youtu.be/<id>
+  }
+  if (host === "youtube.com" || host === "m.youtube.com") {
+    if (parsed.pathname === "/watch") {
+      const v = parsed.searchParams.get("v");
+      return v !== null && v.length > 0;
+    }
+    return (
+      parsed.pathname.startsWith("/shorts/") &&
+      parsed.pathname.length > "/shorts/".length
+    );
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Segment validation
+// ---------------------------------------------------------------------------
+
+// Hard ceiling on an analyzed window (CONTRACTS.md §13.2). The model + the
+// cost/latency budget are built around short stimuli.
+export const MAX_SEGMENT_SEC = 90;
+
+// The create-time segment error_codes the client can pre-check (§13.2).
+// `segment_out_of_bounds` is NOT here — it needs the real video duration, so
+// only the Space can decide it; it surfaces as a failed job status.
+export type SegmentError = "bad_segment" | "segment_too_long";
+
+// Pre-validate the [startSec, endSec) window, returning the matching contract
+// error_code or null when acceptable. The server re-validates authoritatively.
+export function validateSegment(
+  startSec: number,
+  endSec: number,
+): SegmentError | null {
+  if (!Number.isFinite(startSec) || !Number.isFinite(endSec)) return "bad_segment";
+  if (startSec < 0 || startSec >= endSec) return "bad_segment";
+  if (endSec - startSec > MAX_SEGMENT_SEC) return "segment_too_long";
+  return null;
 }

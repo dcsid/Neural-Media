@@ -16,8 +16,8 @@ export default function AboutPage() {
         What Neural Media does — and what it doesn&apos;t.
       </h1>
       <p className="mt-4 max-w-[60ch] text-[13px] leading-relaxed text-ink-200">
-        Neural Media runs every video in your local TikTok watch history
-        through Meta FAIR&apos;s TRIBE v2 model to predict the{" "}
+        Neural Media runs a short YouTube video segment through Meta
+        FAIR&apos;s TRIBE v2 model to predict the{" "}
         <span className="text-ink-50">
           predicted average cortical response
         </span>{" "}

@@ -4,7 +4,7 @@ import { cleanup, render, screen, within } from "@testing-library/react";
 // The brain mesh is irrelevant here — stub next/dynamic so R3F never loads.
 vi.mock("next/dynamic", () => ({ default: () => () => null }));
 
-import DemoGalleryPage from "@/app/single/gallery/page";
+import DemoGalleryPage from "@/app/gallery/page";
 
 afterEach(() => cleanup());
 

@@ -20,8 +20,10 @@ import {
   fetchActivation,
   getJob,
   isFailureStatus,
-  looksLikeTikTokUrl,
+  looksLikeYouTubeUrl,
+  MAX_SEGMENT_SEC,
   putUpload,
+  validateSegment,
   type ActivationPayload,
   type JobStatus,
   type JobStatusResponse,
@@ -57,6 +59,11 @@ interface IdleState {
   kind: "idle";
   mode: SubmitMode;
   url: string;
+  // Segment window as raw input strings so the number fields can be cleared
+  // / partially typed; parsed + validated (CONTRACTS.md §13.2) at submit.
+  // Applies to the URL path only — uploads are analyzed in full (§13.4).
+  startInput: string;
+  endInput: string;
   // Submission-time errors (e.g. POST /v2/jobs returned 4xx, file too large).
   // Re-renders the idle form with the error inline.
   submitError?: string;
@@ -85,8 +92,9 @@ type ErrorKind = TerminalFailureStatus | "network" | "timeout";
 interface ErrorState {
   kind: "error";
   errorKind: ErrorKind;
-  // Server-supplied machine-readable error code (e.g. "tiktok_blocked").
-  // Drives the upload-fallback branch when errorKind=failed_download.
+  // Server-supplied machine-readable error code (e.g. "download_blocked",
+  // "segment_out_of_bounds"). Drives the upload-fallback / out-of-bounds
+  // branches when errorKind=failed_download.
   errorCode?: string;
 }
 
@@ -105,17 +113,38 @@ type Phase = IdleState | TrackingState | ResultState | ErrorState;
 const STATUS_COPY: Record<JobStatus, string> = {
   pending: "Queueing your job...",
   downloading:
-    "Fetching the TikTok... (this sometimes fails — we'll let you know)",
+    "Fetching that segment from YouTube... (this can fail — we'll let you know)",
   inferring: "Predicting brain activity...",
   done: "Loading results...",
   failed_download: "We couldn't fetch that video.",
-  failed_inference: "The model couldn't process that clip.",
-  rejected_duration: "Clip too long.",
+  failed_inference: "The model couldn't process that segment.",
+  rejected_duration: "Segment too long.",
 };
 
 const POLL_INTERVAL_MS = 2000;
 const POLL_TIMEOUT_MS = 180_000;
 const TYPICAL_LATENCY_SEC = 30;
+
+// User-facing copy for the contract error_codes (CONTRACTS.md §13.2). Shared
+// by the picker's inline validation, the create-time 400 fallback, and the
+// error panel.
+const ERROR_CODE_COPY: Record<string, string> = {
+  invalid_url: "That doesn't look like a YouTube URL.",
+  bad_segment: "Pick a start and end with the start before the end.",
+  segment_too_long: `Keep the window to ${MAX_SEGMENT_SEC} seconds or less.`,
+  segment_out_of_bounds:
+    "That window runs past the end of the video — pick an earlier one.",
+  download_blocked: "YouTube blocked the download for that video.",
+};
+
+// Read the contract `error_code` off an ApiV2Error's parsed 400 body.
+function errorCodeFromBody(body: unknown): string | undefined {
+  if (typeof body === "object" && body !== null) {
+    const code = (body as Record<string, unknown>).error_code;
+    if (typeof code === "string") return code;
+  }
+  return undefined;
+}
 
 // ---------------------------------------------------------------------------
 // Page
@@ -126,6 +155,8 @@ export default function SingleVideoPage() {
     kind: "idle",
     mode: "url",
     url: "",
+    startInput: "0",
+    endInput: "30",
   });
 
   // Top-level AbortController for any in-flight fetch (polling loop,
@@ -142,13 +173,20 @@ export default function SingleVideoPage() {
   // ----- IDLE: submit handlers -------------------------------------------
 
   const submitUrl = useCallback(
-    async (url: string) => {
+    async (url: string, startSec: number, endSec: number) => {
       const trimmed = url.trim();
-      if (!looksLikeTikTokUrl(trimmed)) {
+      if (!looksLikeYouTubeUrl(trimmed)) {
         setPhase((p) =>
           p.kind === "idle"
-            ? { ...p, submitError: "That doesn't look like a TikTok URL." }
+            ? { ...p, submitError: ERROR_CODE_COPY.invalid_url }
             : p,
+        );
+        return;
+      }
+      const segErr = validateSegment(startSec, endSec);
+      if (segErr) {
+        setPhase((p) =>
+          p.kind === "idle" ? { ...p, submitError: ERROR_CODE_COPY[segErr] } : p,
         );
         return;
       }
@@ -158,7 +196,7 @@ export default function SingleVideoPage() {
           : p,
       );
       try {
-        const { jobId } = await createUrlJob(trimmed);
+        const { jobId } = await createUrlJob(trimmed, { startSec, endSec });
         setPhase({
           kind: "tracking",
           jobId,
@@ -167,10 +205,15 @@ export default function SingleVideoPage() {
           startedAtMs: Date.now(),
         });
       } catch (err) {
+        // The server re-validates (§13.2); surface its error_code verbatim
+        // when present, otherwise a generic message.
+        const code =
+          err instanceof ApiV2Error ? errorCodeFromBody(err.body) : undefined;
         const msg =
-          err instanceof ApiV2Error
+          (code && ERROR_CODE_COPY[code]) ??
+          (err instanceof ApiV2Error
             ? `Couldn't start the job (${err.kind}${err.status ? ` ${err.status}` : ""}).`
-            : "Couldn't start the job.";
+            : "Couldn't start the job.");
         setPhase((p) =>
           p.kind === "idle"
             ? { ...p, submitting: false, submitError: msg }
@@ -208,7 +251,7 @@ export default function SingleVideoPage() {
           ? `Upload failed (${err.kind}${err.status ? ` ${err.status}` : ""}).`
           : "Upload failed.";
       // We may already be in the error phase (uploading FROM the
-      // tiktok_blocked screen) — in that case stay in error but surface
+      // download_blocked screen) — in that case stay in error but surface
       // the inline message via errorCode. From idle, fall back to idle.
       setPhase((p) => {
         if (p.kind === "idle") {
@@ -225,7 +268,13 @@ export default function SingleVideoPage() {
   const reset = useCallback(() => {
     abortRef.current?.abort();
     abortRef.current = null;
-    setPhase({ kind: "idle", mode: "url", url: "" });
+    setPhase({
+      kind: "idle",
+      mode: "url",
+      url: "",
+      startInput: "0",
+      endInput: "30",
+    });
   }, []);
 
   // ----- TRACKING: polling -----------------------------------------------
@@ -348,13 +397,13 @@ export default function SingleVideoPage() {
         <p className="eyebrow">Single video</p>
         <h1 className="mt-2 font-serif text-[28px] leading-tight tracking-tightish text-ink-50">
           {phase.kind === "result"
-            ? "Your brain on that TikTok"
-            : "See your brain on a TikTok"}
+            ? "Your brain on that video"
+            : "See your brain on a YouTube clip"}
         </h1>
         <p className="mt-3 max-w-[64ch] text-[14px] leading-relaxed text-ink-200">
           {phase.kind === "result"
-            ? "Predicted average cortical response for your clip, rendered on the fsaverage5 surface below."
-            : "Paste a TikTok URL. Watch your brain predict its way through the video."}
+            ? "Predicted average cortical response for your segment, rendered on the fsaverage5 surface below."
+            : `Paste a YouTube URL, pick a window up to ${MAX_SEGMENT_SEC}s, and watch your brain predict its way through it.`}
         </p>
       </header>
 
@@ -408,7 +457,7 @@ export default function SingleVideoPage() {
 interface IdlePanelProps {
   state: IdleState;
   onChange: (next: IdleState) => void;
-  onSubmitUrl: (url: string) => void;
+  onSubmitUrl: (url: string, startSec: number, endSec: number) => void;
   onSubmitUpload: (file: File) => void;
 }
 
@@ -418,16 +467,26 @@ function IdlePanel({
   onSubmitUrl,
   onSubmitUpload,
 }: IdlePanelProps) {
-  const valid = looksLikeTikTokUrl(state.url);
+  const urlValid = looksLikeYouTubeUrl(state.url);
+  const startSec = Number.parseFloat(state.startInput);
+  const endSec = Number.parseFloat(state.endInput);
+  const segmentError = validateSegment(startSec, endSec);
+  const canSubmit = urlValid && segmentError === null && !state.submitting;
 
   const onUrlChange = (e: ChangeEvent<HTMLInputElement>) => {
     onChange({ ...state, url: e.target.value, submitError: undefined });
   };
+  const onStartChange = (e: ChangeEvent<HTMLInputElement>) => {
+    onChange({ ...state, startInput: e.target.value, submitError: undefined });
+  };
+  const onEndChange = (e: ChangeEvent<HTMLInputElement>) => {
+    onChange({ ...state, endInput: e.target.value, submitError: undefined });
+  };
 
   const onUrlSubmit = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    if (!valid || state.submitting) return;
-    onSubmitUrl(state.url);
+    if (!canSubmit) return;
+    onSubmitUrl(state.url, startSec, endSec);
   };
 
   const switchToUpload = () =>
@@ -440,18 +499,18 @@ function IdlePanel({
       {state.mode === "url" ? (
         <>
           <form onSubmit={onUrlSubmit} className="space-y-3">
-            <label className="eyebrow block" htmlFor="single-tiktok-url">
-              TikTok URL
+            <label className="eyebrow block" htmlFor="single-youtube-url">
+              YouTube URL
             </label>
             <input
-              id="single-tiktok-url"
+              id="single-youtube-url"
               type="url"
               inputMode="url"
               autoComplete="off"
               spellCheck={false}
               required
               aria-required="true"
-              placeholder="https://www.tiktok.com/@user/video/..."
+              placeholder="https://www.youtube.com/watch?v=..."
               value={state.url}
               onChange={onUrlChange}
               disabled={state.submitting}
@@ -461,13 +520,77 @@ function IdlePanel({
                 "focus-visible:border-accent focus-visible:outline-none",
               ].join(" ")}
             />
+            {state.url.length > 0 && !urlValid && (
+              <p role="alert" className="text-[12px] text-accent">
+                {ERROR_CODE_COPY.invalid_url}
+              </p>
+            )}
+
+            <fieldset className="space-y-2" disabled={state.submitting}>
+              <legend className="eyebrow">
+                Segment (max {MAX_SEGMENT_SEC}s)
+              </legend>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label
+                    htmlFor="single-start-sec"
+                    className="block text-[11px] text-ink-300"
+                  >
+                    Start (s)
+                  </label>
+                  <input
+                    id="single-start-sec"
+                    type="number"
+                    min={0}
+                    step={1}
+                    inputMode="decimal"
+                    value={state.startInput}
+                    onChange={onStartChange}
+                    aria-describedby="single-segment-hint"
+                    className="mt-1 w-full border border-line bg-canvas px-3 py-2 font-mono text-[13px] tabular-nums text-ink-100 focus-visible:border-accent focus-visible:outline-none"
+                  />
+                </div>
+                <div>
+                  <label
+                    htmlFor="single-end-sec"
+                    className="block text-[11px] text-ink-300"
+                  >
+                    End (s)
+                  </label>
+                  <input
+                    id="single-end-sec"
+                    type="number"
+                    min={0}
+                    step={1}
+                    inputMode="decimal"
+                    value={state.endInput}
+                    onChange={onEndChange}
+                    aria-describedby="single-segment-hint"
+                    className="mt-1 w-full border border-line bg-canvas px-3 py-2 font-mono text-[13px] tabular-nums text-ink-100 focus-visible:border-accent focus-visible:outline-none"
+                  />
+                </div>
+              </div>
+              <p
+                id="single-segment-hint"
+                className="font-mono text-[11px] text-ink-400"
+              >
+                {segmentError ? (
+                  <span role="alert" className="text-accent">
+                    {ERROR_CODE_COPY[segmentError]}
+                  </span>
+                ) : (
+                  `${(endSec - startSec).toFixed(0)}s segment`
+                )}
+              </p>
+            </fieldset>
+
             <button
               type="submit"
-              disabled={!valid || state.submitting}
+              disabled={!canSubmit}
               className={[
                 "w-full border px-4 py-2 font-mono text-[12px]",
                 "uppercase tracking-[0.08em] transition-colors",
-                valid && !state.submitting
+                canSubmit
                   ? "border-accent bg-accent/10 text-accent hover:bg-accent/20"
                   : "cursor-not-allowed border-line bg-surface/40 text-ink-500",
               ].join(" ")}
@@ -490,7 +613,7 @@ function IdlePanel({
             >
               upload an MP4 directly
             </button>{" "}
-            — useful when TikTok blocks the fetch.
+            — useful when YouTube blocks the download.
           </div>
           <div className="text-[12px] leading-relaxed text-ink-300">
             No clip handy?{" "}
@@ -628,35 +751,45 @@ interface ErrorPanelProps {
 }
 
 function ErrorPanel({ state, onReset, onSubmitUpload }: ErrorPanelProps) {
-  const isTikTokBlocked =
-    state.errorKind === "failed_download" && state.errorCode === "tiktok_blocked";
+  const isDownloadBlocked =
+    state.errorKind === "failed_download" &&
+    state.errorCode === "download_blocked";
+  const isOutOfBounds = state.errorCode === "segment_out_of_bounds";
   const isRejectedDuration = state.errorKind === "rejected_duration";
   const isTimeout = state.errorKind === "timeout";
 
   let heading = "Something went wrong";
   let body =
-    "We hit an error while predicting. Try the URL again, or upload the MP4 directly.";
-  if (isTikTokBlocked) {
-    heading = "TikTok blocked our download";
+    "We hit an error while predicting. Try the URL again, or upload an MP4 directly.";
+  if (isDownloadBlocked) {
+    heading = "YouTube blocked our download";
     body =
       "Save the video to your device and drop it here — we'll run the prediction on the upload.";
-  } else if (isRejectedDuration) {
-    heading = "Clip too long";
+  } else if (isOutOfBounds) {
+    heading = "That window is past the end of the video";
     body =
-      "Clips longer than 90 seconds aren't supported. Try a shorter one.";
+      "Your segment runs past where the video ends. Pick an earlier window and try again.";
+  } else if (isRejectedDuration) {
+    heading = "Segment too long";
+    body = `Segments longer than ${MAX_SEGMENT_SEC} seconds aren't supported. Pick a shorter window.`;
   } else if (state.errorKind === "failed_download") {
     heading = "We couldn't fetch that video";
     body =
-      "TikTok wouldn't serve it. If you have the file locally, upload it and we'll run the prediction directly.";
+      "YouTube wouldn't serve it. If you have the file locally, upload it and we'll run the prediction directly.";
   } else if (state.errorKind === "failed_inference") {
-    heading = "The model couldn't process that clip";
+    heading = "The model couldn't process that segment";
     body =
-      "Inference failed partway through. This is usually a transient issue — try again, or upload a different clip.";
+      "Inference failed partway through. This is usually a transient issue — try again, or upload a different video.";
   } else if (isTimeout) {
     heading = "This is taking longer than expected";
     body =
       "We stopped polling after 3 minutes. The job may still finish — refresh the page to check, or try again.";
   }
+
+  // Upload fallback only helps when the download itself was blocked — not for
+  // an out-of-bounds segment (that's a timestamp fix, not a fetch problem).
+  const showUploadFallback =
+    state.errorKind === "failed_download" && !isOutOfBounds;
 
   return (
     <div className="motion-fade-in flex h-full flex-col gap-4 border border-accent/40 bg-surface/40 p-6">
@@ -666,7 +799,7 @@ function ErrorPanel({ state, onReset, onSubmitUpload }: ErrorPanelProps) {
         {body}
       </p>
 
-      {(isTikTokBlocked || state.errorKind === "failed_download") && (
+      {showUploadFallback && (
         <UploadDropzone disabled={false} onFile={onSubmitUpload} prominent />
       )}
 
@@ -681,7 +814,9 @@ function ErrorPanel({ state, onReset, onSubmitUpload }: ErrorPanelProps) {
         onClick={onReset}
         className="mt-auto w-full border border-line px-4 py-2 font-mono text-[12px] uppercase tracking-[0.08em] text-ink-200 transition-colors hover:border-accent hover:text-accent"
       >
-        {isRejectedDuration || isTimeout ? "Try another" : "Start over"}
+        {isRejectedDuration || isTimeout || isOutOfBounds
+          ? "Try another"
+          : "Start over"}
       </button>
     </div>
   );

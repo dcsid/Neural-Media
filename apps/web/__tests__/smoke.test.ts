@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 // Smoke test: proves the Vitest harness, jsdom environment, and the
 // `@/` + `@shared/` path aliases all resolve before the real suites lean
 // on them.
-import { looksLikeTikTokUrl } from "@/lib/api-v2";
+import { looksLikeYouTubeUrl } from "@/lib/api-v2";
 import { REGION_IDS } from "@shared/types";
 
 describe("vitest harness", () => {
@@ -13,9 +13,9 @@ describe("vitest harness", () => {
   });
 
   it("resolves the @/ alias", () => {
-    expect(looksLikeTikTokUrl("https://www.tiktok.com/@nasa/video/123")).toBe(
-      true,
-    );
+    expect(
+      looksLikeYouTubeUrl("https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+    ).toBe(true);
   });
 
   it("resolves the @shared/ alias", () => {

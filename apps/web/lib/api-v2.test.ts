@@ -5,7 +5,9 @@ import {
   createUrlJob,
   fetchActivation,
   getJob,
-  looksLikeTikTokUrl,
+  looksLikeYouTubeUrl,
+  MAX_SEGMENT_SEC,
+  validateSegment,
   type ActivationPayload,
 } from "@/lib/api-v2";
 
@@ -46,9 +48,12 @@ describe("fetch wrappers re-throw AbortError before wrapping (P1.4)", () => {
   it("re-throws a DOMException AbortError untouched", async () => {
     const abort = new DOMException("Aborted", "AbortError");
     mockFetchReject(abort);
-    await expect(createUrlJob("https://www.tiktok.com/@a/video/1")).rejects.toBe(
-      abort,
-    );
+    await expect(
+      createUrlJob("https://www.youtube.com/watch?v=abc", {
+        startSec: 0,
+        endSec: 30,
+      }),
+    ).rejects.toBe(abort);
   });
 
   it("re-throws a plain-Error AbortError untouched (non-DOMException runtimes)", async () => {
@@ -61,31 +66,56 @@ describe("fetch wrappers re-throw AbortError before wrapping (P1.4)", () => {
 
   it("still wraps a genuine network failure as ApiV2Error offline", async () => {
     mockFetchReject(new TypeError("Failed to fetch"));
-    const err = await createUrlJob("https://www.tiktok.com/@a/video/1").catch(
-      (e) => e,
-    );
+    const err = await createUrlJob("https://www.youtube.com/watch?v=abc", {
+      startSec: 0,
+      endSec: 30,
+    }).catch((e) => e);
     expect(err).toBeInstanceOf(ApiV2Error);
     expect(err.kind).toBe("offline");
   });
 });
 
-// --- looksLikeTikTokUrl -----------------------------------------------------
+// --- looksLikeYouTubeUrl -----------------------------------------------------
 
-describe("looksLikeTikTokUrl", () => {
+describe("looksLikeYouTubeUrl", () => {
   it.each([
-    ["https://www.tiktok.com/@nasa/video/123", true],
-    ["https://tiktok.com/@x", true],
-    ["https://vm.tiktok.com/abc", true],
-    ["http://m.tiktok.com/v/1", true],
+    ["https://www.youtube.com/watch?v=dQw4w9WgXcQ", true],
+    ["https://youtube.com/watch?v=abc", true],
+    ["https://m.youtube.com/watch?v=abc", true],
+    ["https://youtu.be/dQw4w9WgXcQ", true],
+    ["https://www.youtube.com/shorts/abc123", true],
+    ["http://youtube.com/watch?v=abc", true],
     ["", false],
     ["not a url", false],
-    ["https://example.com/@x", false],
-    ["ftp://tiktok.com/x", false],
-    // Suffix check must not be fooled by lookalike hosts.
-    ["https://eviltiktok.com/@x", false],
-    ["https://tiktok.com.attacker.net/@x", false],
+    ["https://www.youtube.com/watch", false], // no v param
+    ["https://youtu.be/", false], // no id
+    ["https://www.youtube.com/feed/subscriptions", false],
+    ["https://example.com/watch?v=abc", false],
+    ["ftp://youtube.com/watch?v=abc", false],
+    // Lookalike hosts must be rejected.
+    ["https://notyoutube.com/watch?v=abc", false],
+    ["https://youtube.com.attacker.net/watch?v=abc", false],
+    ["https://www.tiktok.com/@a/video/1", false],
   ])("%s -> %s", (input, expected) => {
-    expect(looksLikeTikTokUrl(input)).toBe(expected);
+    expect(looksLikeYouTubeUrl(input)).toBe(expected);
+  });
+});
+
+// --- validateSegment --------------------------------------------------------
+
+describe("validateSegment (CONTRACTS.md §13.2)", () => {
+  it.each([
+    [0, 30, null],
+    [12, 78, null],
+    [0, MAX_SEGMENT_SEC, null], // exactly the cap is allowed
+    [0, MAX_SEGMENT_SEC + 0.1, "segment_too_long"],
+    [10, 10, "bad_segment"], // start == end
+    [20, 10, "bad_segment"], // start > end
+    [-1, 30, "bad_segment"], // negative start
+    [Number.NaN, 30, "bad_segment"], // empty input parses to NaN
+    [0, Number.NaN, "bad_segment"],
+  ])("(%s, %s) -> %s", (start, end, expected) => {
+    expect(validateSegment(start, end)).toBe(expected);
   });
 });
 

@@ -469,3 +469,77 @@ event sites today:
 The convention is additive — pre-existing `_log` messages have not
 been reformatted. Workers adding new mutation or rejection sites
 should follow the same pattern.
+
+---
+
+## 13. v2 Single-Video Job — YouTube URL + segment (CANONICAL)
+
+Single source of truth for the v2 single-video product after the
+**YouTube + timestamp refocus**. Supersedes the earlier "paste a TikTok
+URL, analyze the whole clip" assumption. Three surfaces must agree:
+
+| Surface                  | File                                              |
+|--------------------------|---------------------------------------------------|
+| Frontend client + picker | `apps/web/lib/api-v2.ts` + the `/single` page     |
+| Orchestration            | `infra/aws/lambdas/jobs_create` (+ the chain)     |
+| Inference                | `services/hf-space/app.py` (`POST /predict`)      |
+
+### 13.1 Create a job
+
+`POST /v2/jobs`
+
+```json
+{
+  "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+  "startSec": 12.0,
+  "endSec": 78.0
+}
+```
+
+- `url` — a **YouTube** video URL. Accepted hosts: `youtube.com`,
+  `www.youtube.com`, `m.youtube.com`, `youtu.be`. TikTok URLs are no
+  longer accepted by this product.
+- `startSec` — segment start in seconds from the video start; `>= 0`.
+- `endSec` — segment end in seconds; `> startSec`.
+
+The job analyzes **only the `[startSec, endSec)` window** — the Space
+fetches just that segment with `yt-dlp --download-sections "*startSec-endSec"`,
+never the whole video.
+
+### 13.2 Validation (every layer re-validates — never trust the client)
+
+The frontend pre-checks for instant feedback; the Lambda and the Space
+both re-validate. Cheap, request-only checks reject **synchronously** at
+`POST /v2/jobs` (HTTP 400 + `error_code`); the in-bounds check needs the
+real video length so it is authoritative in the Space and surfaces as a
+terminal **failed** job status.
+
+| Rule                                       | `error_code`            | Where               |
+|--------------------------------------------|-------------------------|---------------------|
+| `url` is not a recognized YouTube URL      | `invalid_url`           | 400 at create       |
+| `startSec < 0` or `startSec >= endSec`     | `bad_segment`           | 400 at create       |
+| `endSec - startSec > 90`                   | `segment_too_long`      | 400 at create       |
+| `endSec > <real video duration>`           | `segment_out_of_bounds` | failed status (Space reads duration via yt-dlp metadata **before** download) |
+
+The **90-second ceiling is a hard cap** — the model + the cost/latency
+budget are built around short stimuli. The frontend may also pre-check
+the bound if it has the duration (e.g. via a YouTube oEmbed/metadata
+call), but the server-side check is authoritative.
+
+These join the existing terminal failure statuses (`failed_download`,
+`failed_inference`) reported through normal job-status polling.
+
+### 13.3 Everything downstream is unchanged
+
+- `GET /v2/jobs/{id}` polling, the `JobStatus` vocabulary, and the result
+  `ActivationPayload` are **unchanged** from the existing v2 flow.
+- In the result, `videoDurationSec` is the **analyzed segment length**
+  (`endSec - startSec`, after any auto-trim) — not the source video's
+  full length.
+
+### 13.4 Upload path (secondary)
+
+The direct-MP4 upload path may remain as a secondary input (whole file,
+still subject to the 90 s cap). Timestamp selection applies to the
+YouTube-URL path only; an uploaded file is analyzed in full (≤90 s).
+Keep it working; do not extend it with segment selection.

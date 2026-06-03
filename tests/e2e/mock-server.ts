@@ -95,7 +95,7 @@ function scheduleBlocked(job: Job) {
   job.timers.push(
     setTimeout(() => {
       job.status = "failed_download";
-      job.error = "tiktok_blocked";
+      job.error = "download_blocked";
     }, 2000),
   );
 }

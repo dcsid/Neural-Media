@@ -69,7 +69,7 @@ def test_rejects_non_youtube_url(patched, url):
     put, invoke = patched
     resp = jc.lambda_handler(_event({"url": url, "startSec": 0, "endSec": 30}), None)
     assert resp["statusCode"] == 400
-    assert json.loads(resp["body"])["error"] == "invalid_url"
+    assert json.loads(resp["body"])["error_code"] == "invalid_url"
     put.assert_not_called()
     invoke.assert_not_called()
 
@@ -97,7 +97,7 @@ def test_bad_segment(patched, start, end):
         _event({"url": _VALID_URL, "startSec": start, "endSec": end}), None
     )
     assert resp["statusCode"] == 400
-    assert json.loads(resp["body"])["error"] == "bad_segment"
+    assert json.loads(resp["body"])["error_code"] == "bad_segment"
     put.assert_not_called()
 
 
@@ -107,7 +107,7 @@ def test_segment_too_long(patched):
         _event({"url": _VALID_URL, "startSec": 0, "endSec": 91}), None
     )
     assert resp["statusCode"] == 400
-    assert json.loads(resp["body"])["error"] == "segment_too_long"
+    assert json.loads(resp["body"])["error_code"] == "segment_too_long"
     put.assert_not_called()
 
 
@@ -126,7 +126,7 @@ def test_invalid_url_takes_precedence_over_bad_segment(patched):
     resp = jc.lambda_handler(
         _event({"url": "https://tiktok.com/x", "startSec": 50, "endSec": 10}), None
     )
-    assert json.loads(resp["body"])["error"] == "invalid_url"
+    assert json.loads(resp["body"])["error_code"] == "invalid_url"
 
 
 # --- record shape ----------------------------------------------------------
@@ -153,4 +153,4 @@ def test_malformed_json_body_is_invalid_url(patched):
     # parse_body returns {} on junk → url is None → invalid_url.
     resp = jc.lambda_handler({"body": "{not valid json"}, None)
     assert resp["statusCode"] == 400
-    assert json.loads(resp["body"])["error"] == "invalid_url"
+    assert json.loads(resp["body"])["error_code"] == "invalid_url"

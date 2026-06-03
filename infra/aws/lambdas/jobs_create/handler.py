@@ -105,13 +105,13 @@ def lambda_handler(event: dict, _context) -> dict:
 
     url = body.get("url")
     if not _is_valid_youtube_url(url):
-        return json_response(400, {"error": "invalid_url"})
+        return json_response(400, {"error_code": "invalid_url"})
 
     start_sec = body.get("startSec")
     end_sec = body.get("endSec")
     seg_err = _segment_error(start_sec, end_sec)
     if seg_err is not None:
-        return json_response(400, {"error": seg_err})
+        return json_response(400, {"error_code": seg_err})
 
     job_id = new_job_id()
     now = now_epoch()

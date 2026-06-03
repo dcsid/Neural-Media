@@ -83,17 +83,17 @@ def lambda_handler(event: dict, _context):
     # Translate the stored source into the discriminated-union shape the
     # HF Space's pydantic PredictRequest expects:
     #   { "source": { "kind": "url" | "s3", "value": "<url>" } }
-    # We always tag kind="url" because S3 paths get presigned to URLs above,
-    # and the Space's url and s3 source handlers do the same thing once given
-    # an HTTP URL. Keeping the discriminator field around leaves room to
-    # eventually let the Space differentiate (e.g., to skip the redownload).
+    # YouTube-URL jobs go to the Space as kind="url" (it validates + segments
+    # them). Uploaded files go as kind="s3" with a presigned GET URL the Space
+    # fetches verbatim — no YouTube validation, whole file (CONTRACTS §13.4/§13.5).
+    # Sending an upload as kind="url" would fail the Space's YouTube validator.
     source = job.get("source")
     if source == "url":
         source_payload = {"source": {"kind": "url", "value": job["sourceUrl"]}}
     elif source == "s3":
         source_payload = {
             "source": {
-                "kind": "url",
+                "kind": "s3",
                 "value": presigned_get(job["uploadKey"], expires_in=3600),
             }
         }

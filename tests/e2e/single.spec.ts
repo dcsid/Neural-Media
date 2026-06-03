@@ -41,7 +41,7 @@ async function clickPredict(page: import("@playwright/test").Page) {
 
 test.describe("/single — TikTok URL → brain", () => {
   test("happy path: URL → result", async ({ page }) => {
-    await page.goto("/single");
+    await page.goto("/");
     await fillUrl(page, SAMPLE_URL);
     await clickPredict(page);
 
@@ -69,7 +69,7 @@ test.describe("/single — TikTok URL → brain", () => {
   });
 
   test("tiktok blocked → upload fallback", async ({ page }) => {
-    await page.goto("/single");
+    await page.goto("/");
     await fillUrl(page, BLOCKED_URL);
     await clickPredict(page);
 
@@ -94,7 +94,7 @@ test.describe("/single — TikTok URL → brain", () => {
   });
 
   test("too long: rejected_duration", async ({ page }) => {
-    await page.goto("/single");
+    await page.goto("/");
     await fillUrl(page, LONG_URL);
     await clickPredict(page);
 
@@ -110,7 +110,7 @@ test.describe("/single — TikTok URL → brain", () => {
       if (/\/v2\/jobs/.test(r.url())) apiRequests.push(r);
     });
 
-    await page.goto("/single");
+    await page.goto("/");
     await fillUrl(page, SAMPLE_URL);
     await clickPredict(page);
 

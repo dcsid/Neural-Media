@@ -116,7 +116,6 @@ jobs:
             infra/aws/lambdas \
             services/inference/neural_media_inference \
             services/pipeline/neural_media_pipeline \
-            services/api/neural_media_api \
             services/hf-space
 
       - name: pip install services (editable)
@@ -127,17 +126,12 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e services/inference
           python -m pip install -e services/pipeline
-          python -m pip install -e services/api
-          # httpx is required by Starlette's TestClient, which the
-          # services/api test suite uses. It's not declared as a runtime
-          # dep of the api package (FastAPI doesn't require httpx in
-          # production), so we install it explicitly here.
-          python -m pip install pytest httpx
+          python -m pip install pytest
 
       - name: pytest services
         run: |
           set -euo pipefail
-          for svc in services/inference services/pipeline services/api; do
+          for svc in services/inference services/pipeline; do
             if [ -d "$svc/tests" ]; then
               echo "::group::pytest $svc"
               ( cd "$svc" && python -m pytest -q )

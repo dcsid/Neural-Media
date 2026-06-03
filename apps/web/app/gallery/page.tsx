@@ -165,7 +165,7 @@ export default function DemoGalleryPage() {
 
   return (
     <main className="mx-auto max-w-[1280px] px-8 pb-16 pt-12">
-      <DemoModeBanner cta={{ href: "/single", label: "Predict your own clip →" }}>
+      <DemoModeBanner cta={{ href: "/", label: "Predict your own clip →" }}>
         These predictions are precomputed and ship with the build — curated
         short clips run through the pipeline in mock mode. Nothing is fetched
         or inferred live.
@@ -182,10 +182,10 @@ export default function DemoGalleryPage() {
           </p>
         </div>
         <Link
-          href="/single"
+          href="/"
           className="font-mono text-[11px] uppercase tracking-[0.08em] text-ink-300 hover:text-accent"
         >
-          ← back to single
+          ← back
         </Link>
       </header>
 

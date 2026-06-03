@@ -1,9 +1,8 @@
 import Link from "next/link";
 
 const NAV = [
-  { href: "/", label: "Dashboard" },
-  { href: "/single", label: "Single video" },
-  { href: "/compare", label: "Compare" },
+  { href: "/gallery", label: "Gallery" },
+  { href: "/about", label: "About" },
 ] as const;
 
 export function Header() {

@@ -131,7 +131,7 @@ def _stub_pipeline_io(predict, monkeypatch, tmp_path, *, duration_s: float):
 def test_predict_one_url_pipeline_wire_invariants(predict, monkeypatch, tmp_path):
     _stub_pipeline_io(predict, monkeypatch, tmp_path, duration_s=24.0)
     payload = predict._run_pipeline(
-        "https://www.tiktok.com/@x/video/1", mock=True, max_duration_sec=None
+        "https://www.youtube.com/watch?v=aaaaaaaaaaa", mock=True, max_duration_sec=None
     )
 
     _assert_wire_payload(payload)
@@ -145,7 +145,7 @@ def test_predict_one_url_pipeline_t1_edge(predict, monkeypatch, tmp_path):
     # series must still be length 1.
     _stub_pipeline_io(predict, monkeypatch, tmp_path, duration_s=0.3)
     payload = predict._run_pipeline(
-        "https://www.tiktok.com/@x/video/2", mock=True, max_duration_sec=None
+        "https://www.youtube.com/watch?v=bbbbbbbbbbb", mock=True, max_duration_sec=None
     )
 
     assert len(payload["timestamps"]) == 1

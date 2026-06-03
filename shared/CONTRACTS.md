@@ -71,10 +71,6 @@ in full — only summarized metrics are sent. Format:
   - `t` (float32): seconds from video start, one row per timepoint
   - `v_0000` ... `v_20483` (float32): predicted BOLD per cortical vertex
 
-For the mock inference service, equivalent JSON files live under
-`data/sample/mock_inference/` for ease of inspection — the production
-contract is Parquet.
-
 A companion sidecar `{inference_run_id}.meta.json` records:
 
 ```json

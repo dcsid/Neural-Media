@@ -65,9 +65,6 @@ by `runner.py`.
 
 Package scripts (`services/inference/scripts/`):
 
-- `build_sample_outputs.py` (`make sample`) — runs MockBackend over the committed
-  TikTok export and writes the `data/sample/mock_inference/` JSON fixtures the
-  API's SampleStore serves.
 - `build_region_masks.py` — regenerate `data/region_masks.json` from the atlas.
 - `validate_real_mode.py` — pre-flight check that TRIBE and its transitive
   HuggingFace repos are reachable before attempting a real run.

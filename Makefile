@@ -6,40 +6,29 @@ PYTHON ?= python3
 PNPM ?= pnpm
 
 REPO_ROOT := $(shell pwd)
-DB_PATH ?= $(REPO_ROOT)/data/sqlite/neural_media.db
 
-# Every Python package in this repo (pipeline, api, inference) is exposed
-# to children via PYTHONPATH rather than relying on the editable .pth files
-# pip drops into site-packages. macOS's sandbox occasionally marks those
-# .pth files with the UF_HIDDEN flag, and Python's site.py silently skips
-# hidden .pth files — so editable installs vanish from import resolution
-# even though `pip list` still claims them. PYTHONPATH bypasses the .pth
-# mechanism entirely and is reliable across reboots, reinstalls, and
-# sandbox re-scans. The `unhide-pth` target is the manual escape hatch
-# for the cases where you're invoking python directly without `make`.
-export PYTHONPATH := $(REPO_ROOT)/services/pipeline:$(REPO_ROOT)/services/api:$(REPO_ROOT)/services/inference
+# The Python packages (the pipeline clip-fetcher + inference) are exposed to
+# children via PYTHONPATH rather than the editable .pth files — macOS's sandbox
+# occasionally hides those and Python's site.py skips hidden .pth files.
+# `unhide-pth` is the manual escape hatch when invoking python without `make`.
+export PYTHONPATH := $(REPO_ROOT)/services/pipeline:$(REPO_ROOT)/services/inference
 
-.PHONY: help install install-system install-python install-web sample ingest init-db \
-        dev dev-api dev-api-mock dev-web test test-python test-web \
-        typecheck-web clean unhide-pth bench-ingest e2e
+.PHONY: help install install-system install-python install-web \
+        dev-web test test-python test-web typecheck-web clean unhide-pth e2e
 
 help:
 	@echo "Neural Media — make targets"
 	@echo ""
-	@echo "  make install         install all services and the web app"
+	@echo "  make install         install the Python services + the web app"
 	@echo "  make install-system  brew install ffmpeg + other non-Python deps"
-	@echo "  make sample          regenerate mock inference outputs (SampleStore)"
-	@echo "  make ingest EXPORT=… ingest a real TikTok export through the CLI"
-	@echo "  make init-db         create the SQLite catalog (idempotent)"
-	@echo "  make dev             run API (:8000) and web (:3000) together"
-	@echo "  make dev-api         FastAPI on SqliteStore (demo path — drag-drop visible)"
-	@echo "  make dev-api-mock    FastAPI on SampleStore (mock JSON fixtures)"
-	@echo "  make dev-web         run only the Next.js dev server"
-	@echo "  make test            run all tests"
-	@echo "  make typecheck-web   tsc --noEmit for the web app"
-	@echo "  make clean           remove generated artifacts (videos, activations, db)"
+	@echo "  make dev-web         run the Next.js dev server (:3000)"
+	@echo "  make dev-single      print the local single-video (cloud-mode) dev loop"
+	@echo "  make test            python + web typecheck + vitest"
+	@echo "  make e2e             Playwright end-to-end suite"
+	@echo "  make clean           remove generated artifacts"
 	@echo "  make unhide-pth      strip macOS UF_HIDDEN from editable .pth files"
-	@echo "  make bench-ingest    mock-mode ingest perf (N=5000 or EXPORT=...)"
+	@echo ""
+	@echo "  make help-single     the single-video deploy/dev surface"
 
 # -----------------------------------------------------------------------------
 # Install
@@ -47,9 +36,6 @@ help:
 
 install: install-python install-web
 
-# install-system: non-Python system deps (ffmpeg + ffprobe) via Homebrew.
-# Required by services/pipeline (preprocess) and scripts/predict_one_url.py.
-# yt-dlp itself ships via the [dev] pip extra and doesn't need brew.
 install-system:
 	@if ! command -v brew >/dev/null 2>&1; then \
 	  echo "Homebrew not found. Install from https://brew.sh first."; exit 1; \
@@ -60,113 +46,44 @@ install-system:
 install-python:
 	$(PYTHON) -m pip install -e services/inference
 	$(PYTHON) -m pip install -e services/pipeline
-	$(PYTHON) -m pip install -e services/api
 
 install-web:
 	cd apps/web && $(PNPM) install
 
 # -----------------------------------------------------------------------------
-# Sample data
+# Dev / tests
 # -----------------------------------------------------------------------------
-
-sample:
-	$(PYTHON) services/inference/scripts/build_sample_outputs.py
-
-# -----------------------------------------------------------------------------
-# Ingest a real TikTok export.
-#
-#   make ingest EXPORT=/path/to/user_data.json
-#
-# Runs the data-pipeline orchestrator end-to-end: importer →
-# yt-dlp downloader → ffmpeg preprocessor → ml-inference. Persists into
-# `data/sqlite/neural_media.db` and `data/activations/`.
-# -----------------------------------------------------------------------------
-
-ingest:
-ifndef EXPORT
-	$(error EXPORT is required. Usage: make ingest EXPORT=/path/to/user_data.json)
-endif
-	$(PYTHON) -m neural_media_pipeline $(EXPORT)
-
-# -----------------------------------------------------------------------------
-# SQLite catalog bring-up (idempotent).
-# -----------------------------------------------------------------------------
-
-init-db:
-	$(PYTHON) services/api/scripts/init_db.py
-
-# -----------------------------------------------------------------------------
-# Dev
-# -----------------------------------------------------------------------------
-
-dev:
-	@echo "Run 'make dev-api' and 'make dev-web' in two terminals." && exit 1
-
-# dev-api: SqliteStore by default so drag-and-drop imports show up live on
-# the dashboard without restarting the server. The DB is auto-initialised
-# on first POST to /api/v1/import — `make init-db` is optional.
-# DB_PATH is quoted because the repo path may contain spaces (e.g. "Spring 2026").
-dev-api:
-	cd services/api && NEURAL_MEDIA_DB_PATH="$(DB_PATH)" \
-	  uvicorn neural_media_api.main:app \
-	  --host 127.0.0.1 --port 8000 --reload
-
-# dev-api-mock: SampleStore (no env var). Reads `data/sample/mock_inference/`.
-# Use this when you want to explore the dashboard with `make sample` data
-# instead of the import flow.
-dev-api-mock:
-	cd services/api && uvicorn neural_media_api.main:app \
-	  --host 127.0.0.1 --port 8000 --reload
 
 dev-web:
 	cd apps/web && $(PNPM) dev
 
-# -----------------------------------------------------------------------------
-# Tests
-# -----------------------------------------------------------------------------
-
-test: test-python typecheck-web
+test: test-python typecheck-web test-web
 
 test-python:
 	cd services/inference && $(PYTHON) -m pytest -q
 	cd services/pipeline && $(PYTHON) -m pytest -q
-	cd services/api && $(PYTHON) -m pytest -q
 
 typecheck-web:
 	cd apps/web && $(PNPM) typecheck
 
+test-web:
+	$(PNPM) --filter @neural-media/web test:run
+
 # -----------------------------------------------------------------------------
-# End-to-end (Playwright)
-#
-# Walks the full /single → brain user journey against a fully mocked /v2/jobs*
-# backend (see tests/e2e/mock-server.ts). Playwright's webServer config boots
-# both apps/web (:3000) and the mock (:3001) before the suite runs.
-#
-# First run requires the chromium browser:
-#   $(PNPM) -C tests/e2e exec playwright install chromium
+# End-to-end (Playwright). Walks the single-video → brain journey at `/`
+# against a mocked /v2/jobs* backend (tests/e2e/mock-server.ts). The webServer
+# config builds + serves apps/web and boots the mock before the suite runs.
+# First run needs chromium: $(PNPM) -C tests/e2e exec playwright install chromium
 # -----------------------------------------------------------------------------
 
 e2e:
 	$(PNPM) -C tests/e2e exec playwright test
 
-# -----------------------------------------------------------------------------
-# Clean
-# -----------------------------------------------------------------------------
-
 clean:
-	rm -rf data/videos/* data/activations/* data/sqlite/*
-	@echo "Cleared user data. (Sample fixtures under data/sample/ are kept.)"
+	rm -rf data/videos/* data/activations/* 2>/dev/null || true
+	@echo "Cleared generated artifacts."
 
-# -----------------------------------------------------------------------------
-# macOS sandbox helper.
-#
-# pip occasionally writes editable .pth files into site-packages with the
-# UF_HIDDEN BSD flag set. Python's site.py skips hidden .pth files for
-# security, which makes editable installs vanish from import resolution.
-# This target strips the flag so the editable installs become visible
-# again. Idempotent. No-op on non-macOS.
-# -----------------------------------------------------------------------------
-
+# macOS sandbox helper (editable .pth UF_HIDDEN). Idempotent; no-op off macOS.
 unhide-pth:
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
 	  find "$(REPO_ROOT)/.venv-dev/lib" -name '__editable__*.pth' \
@@ -176,53 +93,12 @@ unhide-pth:
 	  echo "skipped (sandbox UF_HIDDEN issue is macOS-specific)"; \
 	fi
 
-# -----------------------------------------------------------------------------
-# Mock-mode ingest benchmark.
-#
-#   make bench-ingest             # uses the user's real Watch History.txt
-#   make bench-ingest N=5000      # synthetic N-video run
-#   make bench-ingest EXPORT=/path/to/Watch\ History.txt
-#
-# Reports wall time + videos/sec for one mock-mode end-to-end ingest with
-# `--purge-after-inference --purge-activations` (the demo path). See
-# docs/bench-results.md for the targets and the numbers we're chasing.
-# -----------------------------------------------------------------------------
-
-# Default export = the location the data-pipeline brief calls out. Override
-# either EXPORT (real export) or N (synthetic). EXPORT wins when both are set.
-EXPORT ?= [redacted-path] Activity/Watch History.txt
-N ?=
-
-bench-ingest:
-	@if [ -n "$(N)" ]; then \
-	  echo "Benchmarking synthetic $(N)-video ingest..."; \
-	  $(PYTHON) services/pipeline/scripts/bench_mock.py $(N); \
-	elif [ -f "$(EXPORT)" ]; then \
-	  echo "Benchmarking real export: $(EXPORT)"; \
-	  $(PYTHON) services/pipeline/scripts/bench_mock.py --export "$(EXPORT)"; \
-	else \
-	  echo "EXPORT=$(EXPORT) not found and N is unset."; \
-	  echo "Usage:"; \
-	  echo "  make bench-ingest N=5000"; \
-	  echo "  make bench-ingest EXPORT=/path/to/Watch\\ History.txt"; \
-	  exit 1; \
-	fi
-
 # =============================================================================
-# Single-video pipeline (v2 cloud architecture).
-#
-# These targets compose the cloud-mode demo: an HF Space (TRIBE + yt-dlp +
-# ffmpeg) does real inference on demand, an AWS API Gateway + Lambda + S3
-# stack accepts jobs and serves results, and the Next.js dashboard
-# (NEXT_PUBLIC_API_BASE_V2) talks to the gateway. None of this is wired
-# into the existing `dev` / `dev-api` flow — those still run the local
-# SQLite + SampleStore demo path.
-#
+# Single-video pipeline (AWS + HF Space cloud architecture).
 # Run `make help-single` for the discovery surface.
 # =============================================================================
 
-.PHONY: help-single dev-single dev-single-mock dev-single-api dev-single-web \
-        deploy-aws deploy-hf-space smoke-single
+.PHONY: help-single dev-single deploy-aws deploy-hf-space smoke-single
 
 help-single:
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) \
@@ -242,44 +118,33 @@ dev-single: ## print the three terminal commands for the local single-video loop
 	@echo "                            HFCallbackSecretSsmVersion=1"
 	@echo ""
 	@echo "    Note: HFSpaceUrl is the base URL only — jobs_worker appends /predict."
-	@echo "          The bucket name is generated by the template, not a parameter."
 	@echo "          See infra/aws/sam-local.md §4 for the sam-env.json contents."
 	@echo ""
 	@echo "  TERM 3  Next.js web    (port 3000)"
 	@echo "    NEXT_PUBLIC_API_BASE_V2=http://127.0.0.1:3001 $(PNPM) --filter @neural-media/web dev"
 	@echo ""
 	@echo "Then smoke-test: API_BASE=http://127.0.0.1:3001 make smoke-single"
-	@echo ""
-	@echo "See infra/aws/sam-local.md for the DynamoDB-local / S3-local prereqs."
 
 deploy-aws: ## sam build && sam deploy from infra/aws/
 	cd infra/aws && sam build && sam deploy
 
 deploy-hf-space: ## print the recipe to push services/hf-space/ to the HuggingFace remote
-	@echo "Deploy the real HF Space (T2's app, not the mock):"
+	@echo "Deploy the real HF Space (app.py, not the mock):"
 	@echo ""
 	@echo "  1. Create a Space on huggingface.co (Docker SDK, GPU/A10G or CPU)."
-	@echo "  2. In the Space settings, set environment variables:"
-	@echo "       CALLBACK_SHARED_SECRET = <same value you store in SSM at"
-	@echo "                                 /neural-media/hf-callback-secret>"
+	@echo "  2. Set CALLBACK_SHARED_SECRET in the Space (same value as SSM"
+	@echo "     /neural-media/hf-callback-secret)."
 	@echo "  3. From repo root:"
-	@echo "       cd services/hf-space"
-	@echo "       hf auth login                          # if not already"
-	@echo "       git init -b main                       # if not already a repo"
+	@echo "       cd services/hf-space && hf auth login"
+	@echo "       git init -b main"
 	@echo "       git remote add hf https://huggingface.co/spaces/<user>/<space>"
-	@echo "       git add -A && git commit -m 'Deploy single-video Space'"
-	@echo "       git push hf main"
-	@echo ""
-	@echo "  4. The Space rebuilds automatically. Note the public URL"
-	@echo "     (e.g. https://<user>-<space>.hf.space) — paste it into"
-	@echo "     'sam deploy --guided' as the HFSpaceUrl parameter."
+	@echo "       git add -A && git commit -m 'Deploy single-video Space' && git push hf main"
 	@echo ""
 	@echo "See docs/single-video-deploy.md for the full runbook."
 
 smoke-single: ## run scripts/smoke-test-single.sh against $$API_BASE
 	@if [ -z "$$API_BASE" ]; then \
-	  echo "ERROR: API_BASE is required. e.g.:"; \
-	  echo "  API_BASE=http://127.0.0.1:3001 make smoke-single"; \
+	  echo "ERROR: API_BASE is required, e.g. API_BASE=http://127.0.0.1:3001 make smoke-single"; \
 	  exit 1; \
 	fi
 	bash scripts/smoke-test-single.sh

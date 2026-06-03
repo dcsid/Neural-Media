@@ -10,8 +10,9 @@ target <90 s end-to-end.
 Pipeline (see brief):
 
     1.  Acquire video.
-           kind=url : yt-dlp with rotating UA, TikTok share-shortlink
-                     fallback.  On block → failed_download / tiktok_blocked.
+           kind=url : yt-dlp with rotating UA, plus a share-shortlink retry
+                     for hosts that block the canonical URL.  On block →
+                     failed_download / tiktok_blocked.
            kind=s3  : plain HTTPS GET on the presigned URL.
     2.  ffprobe duration.
            > 90 s          : rejected_duration.
@@ -95,8 +96,8 @@ AUDIO_SR = 16000
 # `python app.py` works locally without HF runtime present.
 ZERO_GPU_DURATION_SEC = int(os.environ.get("ZERO_GPU_DURATION_SEC", "110"))
 
-# yt-dlp UAs to rotate through.  TikTok in particular rate-limits by UA, so
-# we round-robin per request.  These are real recent UAs — nothing exotic.
+# yt-dlp UAs to rotate through.  Some video hosts rate-limit by UA, so we
+# round-robin per request.  These are real recent UAs — nothing exotic.
 _USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",

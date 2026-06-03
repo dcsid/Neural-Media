@@ -1,23 +1,19 @@
 [project]
 name = "neural-media-pipeline"
 version = "0.0.1"
-description = "TikTok export → normalized videos + watch events for Neural Media. Local-first; nothing leaves the machine."
+description = "Clip-fetcher for Neural Media: download a video (yt-dlp) and normalize it to TRIBE v2's input shape (ffmpeg). Local-first; nothing leaves the machine."
 requires-python = ">=3.11"
 license = { text = "CC-BY-NC-4.0" }
 dependencies = [
   "pydantic>=2.6",
   # Preprocessing pulls DEFAULT_PREPROCESSING_PARAMS from the inference
-  # package so the data-pipeline can never drift from the values TRIBE v2
-  # expects on its input. The orchestrator also calls
-  # `neural_media_inference.run_inference(...)` directly.
+  # package so the clip-fetcher can never drift from the values TRIBE v2
+  # expects on its input.
   "neural-media-inference",
 ]
 
 [tool.uv.sources]
 neural-media-inference = { path = "../inference", editable = true }
-
-[project.scripts]
-neural-media-pipeline = "neural_media_pipeline.cli:main"
 
 [project.optional-dependencies]
 # Real network/media tooling. Tests monkeypatch the network seam, so

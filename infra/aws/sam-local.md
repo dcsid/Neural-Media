@@ -103,7 +103,7 @@ python services/hf-space/mock_local.py
 ```
 
 The mock returns 202 immediately and POSTs back to `callbackUrl` 5-15s
-later. 1-in-8 calls return `failed_download` / `tiktok_blocked` so the
+later. 1-in-8 calls return `failed_download` / `download_blocked` so the
 frontend error path gets exercised.
 
 **Docker networking**: when SAM Lambdas (running inside Docker) call the

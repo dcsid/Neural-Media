@@ -1,7 +1,7 @@
 # Neural Media — AWS control plane
 
 AWS infrastructure-as-code (AWS SAM / CloudFormation) for the
-single-video "TikTok URL → brain activation" product. The control plane
+single-video "YouTube URL + segment → brain activation" product. The control plane
 lives entirely in AWS; the heavy ML work happens on a Hugging Face Space
 and reports back via a signed HTTP callback.
 

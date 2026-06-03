@@ -5,6 +5,10 @@ payload { "jobId": "<hex>" }. Does NOT block on HF inference: it POSTs to
 the Space, which acknowledges immediately and then runs yt-dlp + ffmpeg +
 TRIBE in the background. When the Space finishes it POSTs the result to
 /v2/internal/hf-callback, which writes S3 + flips status to done.
+
+For YouTube-URL jobs the analysis window (startSec/endSec) rides along to the
+Space's /predict call; uploads carry no segment and are analyzed in full
+(CONTRACTS §13.4 / §13.5).
 """
 from __future__ import annotations
 
@@ -31,16 +35,29 @@ CALLBACK_URL = os.environ["CALLBACK_URL"]
 HF_KICK_TIMEOUT_SEC = 10
 
 
-def _kick_hf_space(job_id: str, source_payload: dict) -> None:
+def _predict_payload(
+    job_id: str, source_payload: dict, segment: dict, callback_token: str
+) -> dict:
+    """Body for the Space's POST /predict.
+
+    ``segment`` carries top-level ``startSec``/``endSec`` for YouTube-URL jobs
+    (CONTRACTS §13.5) and is empty for uploads, which the Space analyzes in
+    full. Kept pure (no network) so it is unit-testable.
+    """
+    return {
+        "jobId": job_id,
+        "callbackUrl": CALLBACK_URL,
+        "callbackToken": callback_token,
+        **source_payload,
+        **segment,
+    }
+
+
+def _kick_hf_space(job_id: str, source_payload: dict, segment: dict) -> None:
     body = json.dumps(
-        {
-            "jobId": job_id,
-            "callbackUrl": CALLBACK_URL,
-            # Resolved at cold start from SSM SecureString; memoised
-            # for the warm container's lifetime (see shared/).
-            "callbackToken": get_callback_secret(),
-            **source_payload,
-        }
+        # callbackToken is resolved at cold start from SSM SecureString and
+        # memoised for the warm container's lifetime (see shared/).
+        _predict_payload(job_id, source_payload, segment, get_callback_secret())
     ).encode("utf-8")
     req = urllib.request.Request(
         f"{HF_SPACE_URL}/predict",
@@ -89,10 +106,20 @@ def lambda_handler(event: dict, _context):
         )
         return {"ok": False, "error": "unknown_source"}
 
+    # Segment selection applies to the YouTube-URL path only; uploads are
+    # analyzed in full (CONTRACTS §13.4). startSec/endSec come back from
+    # DynamoDB as Decimal — cast to float for the JSON /predict body.
+    segment: dict = {}
+    if job.get("startSec") is not None and job.get("endSec") is not None:
+        segment = {
+            "startSec": float(job["startSec"]),
+            "endSec": float(job["endSec"]),
+        }
+
     update_job(job_id, status=STATUS_DOWNLOADING, updatedAt=now_epoch())
 
     try:
-        _kick_hf_space(job_id, source_payload)
+        _kick_hf_space(job_id, source_payload, segment)
     except (urllib.error.URLError, RuntimeError, TimeoutError) as e:
         update_job(
             job_id,

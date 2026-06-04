@@ -1,6 +1,6 @@
 // Tiny in-process mock of the AWS /v2/jobs* API contract used by the e2e
 // suite. Runs on :3001. The web app is started with
-// NEXT_PUBLIC_API_BASE_URL=http://localhost:3001 so all job calls land here.
+// NEXT_PUBLIC_API_BASE_V2=http://localhost:3001 so all job calls land here.
 //
 // Status progression (per API contract):
 //   pending → downloading (1s) → inferring (3s) → done (6s)

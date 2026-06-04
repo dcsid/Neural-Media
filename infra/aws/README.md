@@ -84,7 +84,8 @@ aws ssm put-parameter \
 echo "Hand this to the HF Space deploy: $SECRET"
 ```
 
-Worker T2 needs the same value as a Space secret named `HF_CALLBACK_SECRET`.
+The HF Space needs the same value as a Space secret named `CALLBACK_SHARED_SECRET`
+(the env var `services/hf-space/app.py` reads).
 
 ### 2. Enable AWS billing metrics (account-wide, one-time)
 
@@ -197,7 +198,8 @@ Set globally in `template.yaml`:
 | `RESULTS_BUCKET` | `Ref ResultsBucket` | all |
 | `FRONTEND_ORIGIN` | `Ref FrontendOrigin` | all (informational) |
 | `HF_SPACE_URL` | `Ref HFSpaceUrl` | jobs_worker |
-| `HF_CALLBACK_SECRET` | `{{resolve:ssm-secure:${HFCallbackSecretSsmName}:${HFCallbackSecretSsmVersion}}}` | jobs_worker (signs callbacks), hf_callback (verifies them) |
+| `HF_CALLBACK_SECRET_SSM_NAME` | `Ref HFCallbackSecretSsmName` | jobs_worker (signs callbacks), hf_callback (verifies them) — both fetch the secret at runtime via `ssm:GetParameter` |
+| `HF_CALLBACK_SECRET_SSM_VERSION` | `Ref HFCallbackSecretSsmVersion` | optional pinned version (empty = latest) |
 | `STAGE` | `Ref Stage` | all (informational) |
 
 Per-function additions:
@@ -298,13 +300,14 @@ aws ssm delete-parameter --name /neural-media/hf-callback-secret
 
 ## Security trade-offs (documented)
 
-1. **`HF_CALLBACK_SECRET` is plaintext in the Lambda env.** The
-   `{{resolve:ssm-secure:...}}` dynamic reference decrypts at deploy time
-   and writes the cleartext value into the Lambda environment.
-   Anyone with `lambda:GetFunctionConfiguration` on the function can read
-   it. For this stack scope that's acceptable; for a multi-tenant
-   production setup, swap to runtime SSM fetch + caching with `kms:Decrypt`
-   on the Lambda role.
+1. **The callback secret is fetched at runtime, never stored in the Lambda
+   env.** The Lambda env carries only the SSM parameter *name* + version
+   (`HF_CALLBACK_SECRET_SSM_NAME`/`_VERSION`); `shared.get_callback_secret()`
+   calls `ssm:GetParameter` with `WithDecryption=True` on first use and
+   memoises it for the warm container. The cleartext never appears in
+   `lambda:GetFunctionConfiguration` output. (CFN's `{{resolve:ssm-secure}}`
+   dynamic reference is deliberately NOT used — it would bake the cleartext
+   into the function env.)
 2. **No WAF or rate-limiting.** API Gateway HTTP API doesn't support WAF
    directly (REST API does). For a public-facing demo at $0, rely on the
    $5 billing alarm + DynamoDB on-demand cost ceiling; add per-IP

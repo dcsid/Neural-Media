@@ -86,6 +86,7 @@ Do everything that doesn't need a GPU off the clock.
 ```bash
 git clone <this repo> && cd Neural-Media
 python -m venv .venv && . .venv/bin/activate
+pip install -e 'services/pipeline'                # clip-fetcher: yt-dlp + ffmpeg seam
 pip install -e 'services/inference[real]'        # pulls tribev2 + torch (multi-GB)
 hf auth login                                     # paste your Read token (gated LLaMA)
 python services/inference/scripts/validate_real_mode.py   # re-confirm on the box

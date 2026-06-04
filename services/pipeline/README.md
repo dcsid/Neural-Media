@@ -1,8 +1,8 @@
 # neural-media-pipeline — clip-fetcher
 
 Fetch a single video and normalize it to the shape TRIBE v2 expects.
-**Local-first: nothing leaves the machine**, and outbound network access is
-confined to the downloader (yt-dlp).
+The only outbound network access is the downloader (yt-dlp) fetching the
+requested clip; the package logs no full URLs and phones nothing else home.
 
 This package is deliberately small — two stages, no orchestration, no
 catalog. It is the front of the single-video demo path: a caller hands it a
@@ -44,13 +44,6 @@ pre = preprocess_video(dl.local_path, video.id, PreprocessConfig(processed_dir="
 Both stages are idempotent on disk (a non-empty output is a cache hit) and
 side-effect-free under their injectable seams (`fetch=` / `run=`), so callers
 and tests can stub the network and ffmpeg.
-
-### `probe_share_url.py`
-
-[`scripts/probe_share_url.py`](scripts/probe_share_url.py) makes a single
-real yt-dlp call to confirm a share-shortlink still resolves — a manual
-smoke check when yt-dlp ships an extractor change. It is the only code here
-that hits the network on purpose; run it by hand, not in CI.
 
 ## Error handling
 

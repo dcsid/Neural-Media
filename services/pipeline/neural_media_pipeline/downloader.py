@@ -1,7 +1,7 @@
 """yt-dlp wrapper for the Neural Media pipeline.
 
-TikTok aggressively rate-limits, so every network call goes through one
-thin seam (``_yt_dlp_fetch``) with:
+Video hosts rate-limit and occasionally gate downloads, so every network
+call goes through one thin seam (``_yt_dlp_fetch``) with:
 
   * full-jitter exponential backoff, capped at 5 attempts
   * a rotating pool of public User-Agent strings
@@ -9,7 +9,7 @@ thin seam (``_yt_dlp_fetch``) with:
   * an on-disk dedup cache — if ``data/videos/{video_id}.mp4`` already
     exists, the network is not touched
 
-Tests must NEVER hit TikTok. They monkeypatch ``_yt_dlp_fetch`` (or pass
+Tests must NEVER hit the network. They monkeypatch ``_yt_dlp_fetch`` (or pass
 a fake ``fetch=`` callable to ``download_video``/``download_batch``) and
 inject deterministic ``sleep``/``rng`` shims.
 
@@ -17,25 +17,9 @@ Privacy: this module never logs full source URLs. The stable video id
 is a hash of the URL and is safe to log; the URL itself is not. See
 ``docs/scientific-framing.md``.
 
-URL forms supported by the wrapper
-----------------------------------
-
-The newer TikTok export (``Watch History.txt``) emits share-shortlink
-URLs of the form::
-
-    https://www.tiktokv.com/share/video/<numeric_id>/
-
-rather than the older ``https://www.tiktok.com/@<handle>/video/<id>``
-form. ``yt_dlp`` resolves the share host through a redirect to the
-canonical tiktok.com URL and downloads the underlying mp4 the same way,
-so no code change is needed here.
-
-Probe recorded on 2026-05-17 against
-``https://www.tiktokv.com/share/video/7640163791312801054/`` from the
-user's local ``Watch History.txt`` (yt_dlp 2026.3.17, default
-``_yt_dlp_fetch`` opts): OK, 3 752 713 bytes mp4 written. Re-run
-``services/pipeline/scripts/probe_share_url.py`` (one network call) to
-re-verify if yt-dlp ships an extractor change.
+Accepted URLs are YouTube forms (``youtube.com/watch?v=…``, ``youtu.be/…``,
+``m.``/``/shorts``) — see ``is_supported_youtube_url``. ``yt_dlp`` resolves
+the canonical video and downloads the underlying mp4.
 """
 
 from __future__ import annotations

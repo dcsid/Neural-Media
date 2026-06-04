@@ -20,9 +20,9 @@ export function Footer() {
         <div className="max-w-[60ch]">
           <p className="eyebrow mb-2">Non-commercial</p>
           <p className="leading-relaxed">
-            Built on Meta FAIR TRIBE v2, distributed under CC-BY-NC 4.0. This
-            app is local-first: watch history never leaves your machine. No
-            analytics, no telemetry.
+            Built on Meta FAIR TRIBE v2, distributed under CC-BY-NC 4.0. No
+            account, no tracking: we analyze only the segment you choose and keep
+            just the prediction. No analytics, no telemetry.
           </p>
         </div>
         <nav className="flex flex-col gap-2 md:items-end" aria-label="Footer">

@@ -3,8 +3,8 @@ Build apps/web/public/brain/fsaverage5.regions.bin from ml-inference's
 HCP-MMP1 / Glasser parcellation.
 
 Source: services/inference/neural_media_inference/data/region_masks.json
-        (canonical atlas for the inference aggregator — same masks the
-        API serves /api/v1/videos/{id}/metrics through).
+        (canonical atlas for the inference aggregator — the same masks the
+        region aggregation is computed over).
 
 The committed .bin is byte-aligned with that JSON so the hover tooltip
 in BrainMesh agrees with the metrics table for the same vertex. When

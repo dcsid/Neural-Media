@@ -159,7 +159,7 @@ class TribeBackend:
     def extra_params(self) -> dict[str, Any]:
         """Backend-specific entries the runner merges into params_json.
 
-        CONTRACTS.md §8 + the worker brief require weights hash, torch
+        CONTRACTS.md §9 + the worker brief require weights hash, torch
         version, CUDA version, seed. The runner already records the seed;
         the rest comes from here.
         """

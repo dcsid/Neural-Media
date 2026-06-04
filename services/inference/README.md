@@ -57,7 +57,7 @@ Per run, written next to each other under `activations_dir`:
 ## Reproducibility envelope
 
 Every `InferenceRun.params_json` carries model id + version, seed, preprocessing
-params, a config hash, and a UTC timestamp (CONTRACTS.md §8). `TribeBackend` adds
+params, a config hash, and a UTC timestamp (CONTRACTS.md §9). `TribeBackend` adds
 the resolved weights sha, torch/CUDA versions, and the output transform. Enforced
 by `runner.py`.
 

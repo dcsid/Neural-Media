@@ -49,7 +49,7 @@ def test_reproducibility_envelope_is_complete(tmp_path):
     assert run.seed == 11
     assert run.created_at.tzinfo is not None  # UTC, not naive
     p = run.params_json
-    # CONTRACTS.md §8: model id+version live on InferenceRun itself; params
+    # CONTRACTS.md §9: model id+version live on InferenceRun itself; params
     # must carry seed-relevant preprocessing + config hash + timestamp.
     assert "preprocessing" in p
     assert {"video_resolution", "video_fps", "audio_sample_rate_hz"} <= set(p["preprocessing"])

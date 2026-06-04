@@ -8,7 +8,7 @@
 * aggregates region metrics,
 * builds the wire-format `ActivationOutput`,
 * assembles the `InferenceRun` row with the full reproducibility envelope
-  (CONTRACTS.md §8).
+  (CONTRACTS.md §9).
 
 The reproducibility envelope is non-negotiable: every `InferenceRun.params_json`
 carries the model id + version, seed, preprocessing params, TRIBE config
@@ -140,7 +140,7 @@ def run_inference(
     # downsampled axis below so it stays the same length as `region_means`.
     full_timestamps = np.arange(num_timepoints, dtype=np.float64) / sample_rate_hz
 
-    # Reproducibility envelope — CONTRACTS.md §8.
+    # Reproducibility envelope — CONTRACTS.md §9.
     preprocessing_params = {**DEFAULT_PREPROCESSING_PARAMS, **(extra_params or {})}
     params_json: dict[str, Any] = {
         "duration_s": float(duration_s),

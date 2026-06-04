@@ -45,15 +45,6 @@ export interface VideoMetadata {
   tags: string[];
 }
 
-export interface WatchEvent {
-  id: string;
-  video_id: string;
-  watched_at: ISODateString;
-  duration_watched_s: number | null;
-  completion_pct: number | null;
-  source: "tiktok_export";
-}
-
 export type InferenceStatus = "pending" | "running" | "complete" | "failed";
 
 export interface InferenceRun {
@@ -76,46 +67,6 @@ export interface RegionMetrics {
   peak: number;
   sustained: number;
   timeseries: number[];
-}
-
-export interface RegionDef {
-  region_id: RegionId;
-  description: string;
-}
-
-export interface AggregateBucket {
-  mean: number;
-  peak: number;
-}
-
-export interface ClusterSummary {
-  cluster_id: number;
-  size: number;
-  exemplar_video_ids: string[];
-}
-
-// Per-author rollup for the dashboard's "who you watch" panel.
-// `top_region` is the region with the highest per-author peak across
-// the author's videos. Capped at top 20 by `videos` desc. See
-// CONTRACTS.md §6 and docs/worker-briefs/aggregate-by-author-proposal.md.
-export interface AuthorBucket {
-  author: string | null;
-  videos: number;
-  total_watch_time_s: number;
-  mean_activation: number;
-  top_region: RegionId;
-}
-
-export interface AggregateReport {
-  total_videos: number;
-  total_watch_time_s: number;
-  first_watched_at: ISODateString | null;
-  last_watched_at: ISODateString | null;
-  by_region: Record<RegionId, AggregateBucket>;
-  by_hour_of_day: number[]; // length 24
-  by_day_of_week: number[]; // length 7  (Mon=0)
-  by_author: AuthorBucket[]; // may be empty until aggregator ships
-  clusters: ClusterSummary[];
 }
 
 // ---------------------------------------------------------------------------
@@ -142,111 +93,3 @@ export interface ActivationOutput {
   keyframe_vertices: Record<string, number[]>;
   region_means: Record<RegionId, number[]>;
 }
-
-// ---------------------------------------------------------------------------
-// Import job (CONTRACTS.md §8)
-// ---------------------------------------------------------------------------
-
-export type ImportJobStatus =
-  | "queued"
-  | "running"
-  | "complete"
-  | "partial"
-  | "failed";
-
-export type ImportMode = "mock" | "real";
-
-export type ImportPhase =
-  | "parsing"
-  | "downloading"
-  | "preprocessing"
-  | "inferring";
-
-export interface ImportJobProgress {
-  current: number;
-  total: number | null;
-  // Free-form phase string. The four documented values are listed in
-  // `ImportPhase`, but the frontend does not branch on them — it only
-  // renders the string after a dash on the status line.
-  phase: string | null;
-}
-
-export interface ImportJob {
-  id: string;
-  status: ImportJobStatus;
-  mode: ImportMode;
-  created_at: ISODateString;
-  updated_at: ISODateString;
-  completed_at: ISODateString | null;
-  progress: ImportJobProgress;
-  error: string | null;
-  source_filename: string | null;
-}
-
-// ---------------------------------------------------------------------------
-// Capabilities (GET /api/v1/capabilities) — what the backend can run on the
-// current host. `real_blockers` is a list of short tokens (e.g.
-// "missing-extra", "missing-ffmpeg", "missing-yt-dlp", "missing-gpu") when
-// `real` is false.
-// ---------------------------------------------------------------------------
-
-export interface Capabilities {
-  mock: boolean;
-  real: boolean;
-  real_blockers: string[];
-}
-
-// ---------------------------------------------------------------------------
-// Debug / observability (GET /api/v1/debug) — single-call snapshot of
-// process state so the dashboard's planned status sliver doesn't have to
-// fan out four GETs. See CONTRACTS.md §12.
-// ---------------------------------------------------------------------------
-
-export interface DebugCounts {
-  videos: number;
-  watch_events: number;
-  inference_runs: number;
-  import_jobs: number;
-}
-
-export interface DebugDiskUsage {
-  videos: number;       // bytes
-  activations: number;  // bytes
-  imports: number;      // bytes
-  sqlite: number;       // bytes — catalog file only, not WAL/shm sidecars
-}
-
-export interface DebugReport {
-  version: string;
-  db_path: string;
-  videos_dir: string;
-  counts: DebugCounts;
-  latest_import: ImportJob | null;
-  capabilities: Capabilities;
-  disk_usage: DebugDiskUsage;
-  uptime_s: number;
-}
-
-// ---------------------------------------------------------------------------
-// API endpoint paths — used by the frontend, kept here so the contract is
-// type-checked.
-// ---------------------------------------------------------------------------
-
-export const API_BASE = "/api/v1" as const;
-
-export const ENDPOINTS = {
-  health: `${API_BASE}/health`,
-  videos: `${API_BASE}/videos`,
-  video: (id: string) => `${API_BASE}/videos/${id}`,
-  videoMetrics: (id: string) => `${API_BASE}/videos/${id}/metrics`,
-  videoActivation: (id: string) => `${API_BASE}/videos/${id}/activation`,
-  regions: `${API_BASE}/regions`,
-  aggregate: `${API_BASE}/aggregate`,
-  watchEvents: `${API_BASE}/watch-events`,
-  inferenceRuns: `${API_BASE}/inference-runs`,
-  importStart: `${API_BASE}/import`,
-  importJob: (id: string) => `${API_BASE}/import/${id}`,
-  importRetry: (id: string) => `${API_BASE}/import/${id}/retry`,
-  capabilities: `${API_BASE}/capabilities`,
-  debug: `${API_BASE}/debug`,
-} as const;

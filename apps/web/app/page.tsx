@@ -94,8 +94,12 @@ interface ErrorState {
   errorKind: ErrorKind;
   // Server-supplied machine-readable error code (e.g. "download_blocked",
   // "segment_out_of_bounds"). Drives the upload-fallback / out-of-bounds
-  // branches when errorKind=failed_download.
+  // branches — never shown raw in the UI.
   errorCode?: string;
+  // Set while an upload from the download-blocked fallback is in flight; holds
+  // an inline message if that upload itself fails (so the panel stays usable).
+  uploading?: boolean;
+  uploadError?: string;
 }
 
 interface ResultState {
@@ -124,6 +128,11 @@ const STATUS_COPY: Record<JobStatus, string> = {
 const POLL_INTERVAL_MS = 2000;
 const POLL_TIMEOUT_MS = 180_000;
 const TYPICAL_LATENCY_SEC = 30;
+
+// A single failed status poll (a 5xx blip, a dropped packet) shouldn't kill
+// the run — keep ticking and recover on the next success. Surface a connection
+// error only after this many in a row; the 180s cap is the ultimate backstop.
+const MAX_CONSECUTIVE_POLL_FAILURES = 5;
 
 // User-facing copy for the contract error_codes (CONTRACTS.md §13.2). Shared
 // by the picker's inline validation, the create-time 400 fallback, and the
@@ -164,6 +173,12 @@ export default function SingleVideoPage() {
   // owns requests; aborted on unmount or on phase transition.
   const abortRef = useRef<AbortController | null>(null);
 
+  // Guards double-submit / resubmit-while-in-flight (a recruiter mashing
+  // Predict or dropping two files): any create chain in progress short-circuits
+  // a second until it settles. A ref so it updates synchronously, before React
+  // re-renders the disabled button.
+  const inFlightRef = useRef(false);
+
   useEffect(() => {
     return () => {
       abortRef.current?.abort();
@@ -174,6 +189,7 @@ export default function SingleVideoPage() {
 
   const submitUrl = useCallback(
     async (url: string, startSec: number, endSec: number) => {
+      if (inFlightRef.current) return; // double-submit / resubmit-in-flight
       const trimmed = url.trim();
       if (!looksLikeYouTubeUrl(trimmed)) {
         setPhase((p) =>
@@ -190,6 +206,7 @@ export default function SingleVideoPage() {
         );
         return;
       }
+      inFlightRef.current = true;
       setPhase((p) =>
         p.kind === "idle"
           ? { ...p, submitting: true, submitError: undefined }
@@ -205,32 +222,39 @@ export default function SingleVideoPage() {
           startedAtMs: Date.now(),
         });
       } catch (err) {
-        // The server re-validates (§13.2); surface its error_code verbatim
-        // when present, otherwise a generic message.
+        // Server re-validates (§13.2): map a known error_code to friendly copy;
+        // otherwise a calm, non-technical fallback (never a raw code/status).
         const code =
           err instanceof ApiV2Error ? errorCodeFromBody(err.body) : undefined;
         const msg =
           (code && ERROR_CODE_COPY[code]) ??
-          (err instanceof ApiV2Error
-            ? `Couldn't start the job (${err.kind}${err.status ? ` ${err.status}` : ""}).`
-            : "Couldn't start the job.");
+          "Couldn't start the job. Check your connection and try again.";
         setPhase((p) =>
           p.kind === "idle"
             ? { ...p, submitting: false, submitError: msg }
             : p,
         );
+      } finally {
+        inFlightRef.current = false;
       }
     },
     [],
   );
 
   const submitUpload = useCallback(async (file: File) => {
-    // Set a busy flag if we're still in idle, so the form shows progress.
-    setPhase((p) =>
-      p.kind === "idle"
-        ? { ...p, submitting: true, submitError: undefined }
-        : p,
-    );
+    if (inFlightRef.current) return; // double-drop / resubmit-in-flight
+    inFlightRef.current = true;
+    // Mark busy without losing the user's place: from idle, show the form
+    // spinner; from the error panel, show the dropzone's uploading state.
+    setPhase((p) => {
+      if (p.kind === "idle") {
+        return { ...p, submitting: true, submitError: undefined };
+      }
+      if (p.kind === "error") {
+        return { ...p, uploading: true, uploadError: undefined };
+      }
+      return p;
+    });
     try {
       const created = await createUploadJob(
         file.name,
@@ -245,29 +269,31 @@ export default function SingleVideoPage() {
         elapsedSec: 0,
         startedAtMs: Date.now(),
       });
-    } catch (err) {
-      const msg =
-        err instanceof ApiV2Error
-          ? `Upload failed (${err.kind}${err.status ? ` ${err.status}` : ""}).`
-          : "Upload failed.";
-      // We may already be in the error phase (uploading FROM the
-      // download_blocked screen) — in that case stay in error but surface
-      // the inline message via errorCode. From idle, fall back to idle.
+    } catch {
+      // Stay where the user is and offer a clean retry — from idle, inline on
+      // the form; from the download-blocked panel, inline on the dropzone.
       setPhase((p) => {
         if (p.kind === "idle") {
-          return { ...p, submitting: false, submitError: msg };
+          return { ...p, submitting: false, submitError: "Upload failed. Try again." };
         }
         if (p.kind === "error") {
-          return { ...p, errorCode: "upload_failed" };
+          return {
+            ...p,
+            uploading: false,
+            uploadError: "That upload didn't go through — try again.",
+          };
         }
         return p;
       });
+    } finally {
+      inFlightRef.current = false;
     }
   }, []);
 
   const reset = useCallback(() => {
     abortRef.current?.abort();
     abortRef.current = null;
+    inFlightRef.current = false;
     setPhase({
       kind: "idle",
       mode: "url",
@@ -297,21 +323,20 @@ export default function SingleVideoPage() {
     abortRef.current = controller;
 
     let cancelled = false;
+    let consecutiveFailures = 0;
 
     async function poll() {
       let res: JobStatusResponse;
       try {
         res = await getJob(jobId, { signal: controller.signal });
-      } catch (err) {
+        consecutiveFailures = 0; // a successful poll clears the streak
+      } catch {
         if (controller.signal.aborted) return;
-        // One transient failure shouldn't kill the loop — log and keep
-        // ticking. If we hit the timeout we'll surface it then.
-        if (err instanceof ApiV2Error && err.kind === "offline") {
-          return;
-        }
-        // For HTTP/parse errors, treat as a network failure so the user
-        // sees something rather than an indefinite spinner.
-        if (!cancelled) {
+        // Transient failure (offline, 5xx, parse): don't kill the run on a
+        // blip — the next tick retries. Surface a connection error only after
+        // a sustained streak; the 180s cap is the ultimate backstop.
+        consecutiveFailures += 1;
+        if (consecutiveFailures >= MAX_CONSECUTIVE_POLL_FAILURES && !cancelled) {
           setPhase({ kind: "error", errorKind: "network" });
         }
         return;
@@ -403,7 +428,7 @@ export default function SingleVideoPage() {
         <p className="mt-3 max-w-[64ch] text-[14px] leading-relaxed text-ink-200">
           {phase.kind === "result"
             ? "Predicted average cortical response for your segment, rendered on the fsaverage5 surface below."
-            : `Paste a YouTube URL, pick a window up to ${MAX_SEGMENT_SEC}s, and watch your brain predict its way through it.`}
+            : `Paste a YouTube link, choose up to ${MAX_SEGMENT_SEC} seconds, and watch the predicted cortical response light up the 3D brain.`}
         </p>
       </header>
 
@@ -528,7 +553,7 @@ function IdlePanel({
 
             <fieldset className="space-y-2" disabled={state.submitting}>
               <legend className="eyebrow">
-                Segment (max {MAX_SEGMENT_SEC}s)
+                Segment to analyze (≤{MAX_SEGMENT_SEC}s)
               </legend>
               <div className="grid grid-cols-2 gap-3">
                 <div>
@@ -579,7 +604,7 @@ function IdlePanel({
                     {ERROR_CODE_COPY[segmentError]}
                   </span>
                 ) : (
-                  `${(endSec - startSec).toFixed(0)}s segment`
+                  `${(endSec - startSec).toFixed(0)}s selected · up to ${MAX_SEGMENT_SEC}s`
                 )}
               </p>
             </fieldset>
@@ -757,10 +782,10 @@ function ErrorPanel({ state, onReset, onSubmitUpload }: ErrorPanelProps) {
   const isOutOfBounds = state.errorCode === "segment_out_of_bounds";
   const isRejectedDuration = state.errorKind === "rejected_duration";
   const isTimeout = state.errorKind === "timeout";
+  const isNetwork = state.errorKind === "network";
 
   let heading = "Something went wrong";
-  let body =
-    "We hit an error while predicting. Try the URL again, or upload an MP4 directly.";
+  let body = "Something tripped up on our end. Start over and give it another go.";
   if (isDownloadBlocked) {
     heading = "YouTube blocked our download";
     body =
@@ -777,36 +802,51 @@ function ErrorPanel({ state, onReset, onSubmitUpload }: ErrorPanelProps) {
     body =
       "YouTube wouldn't serve it. If you have the file locally, upload it and we'll run the prediction directly.";
   } else if (state.errorKind === "failed_inference") {
-    heading = "The model couldn't process that segment";
+    heading = "We couldn't finish that prediction";
     body =
-      "Inference failed partway through. This is usually a transient issue — try again, or upload a different video.";
+      "The run didn't complete — usually a transient hiccup. Start over and try again.";
+  } else if (isNetwork) {
+    heading = "We lost the connection";
+    body =
+      "We couldn't reach the prediction service. Check your connection and try again.";
   } else if (isTimeout) {
     heading = "This is taking longer than expected";
     body =
-      "We stopped polling after 3 minutes. The job may still finish — refresh the page to check, or try again.";
+      "We stopped checking after 3 minutes. The job may still finish — try again, or come back in a moment.";
   }
 
   // Upload fallback only helps when the download itself was blocked — not for
-  // an out-of-bounds segment (that's a timestamp fix, not a fetch problem).
+  // an out-of-bounds segment (a timestamp fix) or a dropped connection.
   const showUploadFallback =
     state.errorKind === "failed_download" && !isOutOfBounds;
+  const tryAnother = isRejectedDuration || isTimeout || isOutOfBounds;
 
   return (
     <div className="motion-fade-in flex h-full flex-col gap-4 border border-accent/40 bg-surface/40 p-6">
-      <p className="eyebrow text-accent">Error · {state.errorKind}</p>
+      <p className="eyebrow text-accent">Error</p>
       <p className="font-serif text-[18px] leading-tight text-ink-50">{heading}</p>
       <p className="max-w-[44ch] text-[13px] leading-relaxed text-ink-200">
         {body}
       </p>
 
       {showUploadFallback && (
-        <UploadDropzone disabled={false} onFile={onSubmitUpload} prominent />
-      )}
-
-      {state.errorCode && (
-        <p className="font-mono text-[11px] text-ink-400">
-          code: {state.errorCode}
-        </p>
+        <>
+          <UploadDropzone
+            disabled={state.uploading === true}
+            onFile={onSubmitUpload}
+            prominent
+          />
+          {state.uploading && (
+            <p className="font-mono text-[11px] uppercase tracking-[0.08em] text-ink-300">
+              Uploading…
+            </p>
+          )}
+          {state.uploadError && (
+            <p role="alert" className="text-[12px] text-accent">
+              {state.uploadError}
+            </p>
+          )}
+        </>
       )}
 
       <button
@@ -814,9 +854,7 @@ function ErrorPanel({ state, onReset, onSubmitUpload }: ErrorPanelProps) {
         onClick={onReset}
         className="mt-auto w-full border border-line px-4 py-2 font-mono text-[12px] uppercase tracking-[0.08em] text-ink-200 transition-colors hover:border-accent hover:text-accent"
       >
-        {isRejectedDuration || isTimeout || isOutOfBounds
-          ? "Try another"
-          : "Start over"}
+        {tryAnother ? "Try another" : "Start over"}
       </button>
     </div>
   );

@@ -19,6 +19,11 @@ import { useActivationFrame } from "./hooks/useActivationFrame";
 import { useReducedMotion } from "./hooks/useReducedMotion";
 import { useRegionMask } from "./hooks/useRegionMask";
 import { useTour } from "./hooks/useTour";
+import { useWebGLAvailable } from "./hooks/useWebGLAvailable";
+import {
+  BrainCanvasSkeleton,
+  BrainCanvasUnavailable,
+} from "./BrainCanvasStates";
 import { RegionLegend } from "./RegionLegend";
 import { RegionTooltip, type RegionHoverInfo } from "./RegionTooltip";
 import { TourCameraDriver } from "./TourCameraDriver";
@@ -123,6 +128,7 @@ export function BrainMesh({
   onReady,
 }: BrainMeshProps) {
   const reduceMotion = useReducedMotion();
+  const webglAvailable = useWebGLAvailable();
   const surfaceAvailable = useSurfaceAvailable(SURFACE_URL);
   const regionMask = useRegionMask();
 
@@ -197,6 +203,9 @@ export function BrainMesh({
   const [devSample, setDevSample] = useState<DevSample | null>(null);
   const mountedAt = useRef(performance.now());
   const [firstPaintMs, setFirstPaintMs] = useState<number | null>(null);
+  // Gates the loading skeleton overlay — flips true on the first painted
+  // frame (handleReady) so the canvas box never flashes empty.
+  const [ready, setReady] = useState(false);
 
   // Container-relative pointer position for the tooltip.
   const containerRef = useRef<HTMLDivElement>(null);
@@ -220,6 +229,7 @@ export function BrainMesh({
   }, []);
 
   const handleReady = useCallback(() => {
+    setReady(true);
     if (firstPaintMs === null) {
       setFirstPaintMs(performance.now() - mountedAt.current);
     }
@@ -255,10 +265,22 @@ export function BrainMesh({
     [tour],
   );
 
+  // No WebGL → render an honest static fallback instead of mounting a Canvas
+  // that would throw on context creation (the surface error boundary lives
+  // *inside* the Canvas and can't catch that failure).
+  if (!webglAvailable) {
+    return (
+      <div className="relative h-full w-full">
+        <BrainCanvasUnavailable />
+      </div>
+    );
+  }
+
   return (
     <div
       ref={containerRef}
       className="relative h-full w-full"
+      aria-busy={!ready}
       onPointerDown={onCanvasPointerDown}
     >
       <Canvas
@@ -450,7 +472,9 @@ export function BrainMesh({
           aria-label="Camera presets"
           className={[
             "pointer-events-auto absolute bottom-3 left-3 z-10",
-            "flex items-stretch gap-px overflow-hidden border border-line",
+            // Hidden on phones — six small targets crowd a narrow canvas and
+            // are fiddly to tap; drag-to-rotate still works there.
+            "hidden items-stretch gap-px overflow-hidden border border-line sm:flex",
             "bg-surface/95 font-mono text-[10px] uppercase tracking-[0.06em]",
             "text-ink-200 backdrop-blur-sm shadow-sm",
           ].join(" ")}
@@ -498,6 +522,26 @@ export function BrainMesh({
         </div>
       )}
       {devEnabled && <DevOverlay sample={devSample} />}
+
+      {/* Loading skeleton — covers the canvas box until the first frame
+          paints, so there's no flash of an empty dark canvas while WebGL
+          initialises and the GLB parses. Kept mounted and faded out (not
+          unmounted) so the reveal is a smooth cross-fade. pointer-events-none
+          + aria-hidden so it never intercepts input or double-announces. */}
+      <div
+        aria-hidden
+        className={[
+          "pointer-events-none absolute inset-0 z-20 transition-opacity duration-500",
+          ready ? "opacity-0" : "opacity-100",
+        ].join(" ")}
+      >
+        <BrainCanvasSkeleton />
+      </div>
+      {!ready && (
+        <span role="status" className="sr-only">
+          Loading brain visualisation…
+        </span>
+      )}
     </div>
   );
 }

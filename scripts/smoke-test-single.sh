@@ -1,27 +1,29 @@
 #!/usr/bin/env bash
-# Single-video pipeline end-to-end smoke test.
+# Post-deploy smoke test for the v2 single-video pipeline.
+#
+# Drives the full chain against a DEPLOYED (or mock) API base URL:
+#     POST /v2/jobs { url, startSec, endSec }   -> 201 { jobId }
+#     GET  /v2/jobs/{jobId}                       -> poll until terminal
+#     GET  resultUrl                              -> ActivationPayload JSON
+# then asserts the ActivationPayload shape (CONTRACTS.md §13.3, mirrored by
+# apps/web/lib/api-v2.ts validateActivation):
+#     - the 8 canonical regions are all present
+#     - every region's series is a number[] the SAME length as `timestamps`
 #
 # Usage:
-#     API_BASE=https://abc123.execute-api.us-east-1.amazonaws.com \
-#       scripts/smoke-test-single.sh
+#     scripts/smoke-test-single.sh https://abc123.execute-api.us-east-1.amazonaws.com/dev
+#     API_BASE=http://localhost:3001 scripts/smoke-test-single.sh   # e2e mock-server
 #
-# Or against `sam local`:
-#     API_BASE=http://127.0.0.1:3001 scripts/smoke-test-single.sh
+# Tunables (env): SAMPLE_URL START_SEC END_SEC POLL_INTERVAL_SEC TIMEOUT_SEC
 #
-# Exercises:
-#     POST /v2/jobs               -> { jobId }
-#     GET  /v2/jobs/{jobId}       -> poll until terminal
-#     GET  resultUrl              -> activation JSON (gzip'd at rest, but
-#                                    presigned S3 URL serves it transparent)
-#
-# Deps: curl + jq. Nothing else. No AWS credentials needed — API_BASE is
-# unauthenticated for the demo (rate-limited at the gateway).
+# Deps: curl + jq. No AWS credentials needed — the demo API is unauthenticated
+# (rate-limited at the gateway).
 #
 # Exit codes:
-#     0   status=done, byRegion has all eight regions, exit clean
-#     1   pipeline ran but terminated in a failed_* state
+#     0   status=done and the ActivationPayload passed every assertion
+#     1   pipeline reached a failed_* status, or a shape assertion failed
 #     2   timed out before reaching a terminal status
-#     3   pre-flight problem (API_BASE missing, jq missing, etc.)
+#     3   pre-flight problem (API base / curl / jq missing)
 
 set -euo pipefail
 
@@ -29,72 +31,88 @@ set -euo pipefail
 # Config
 # ---------------------------------------------------------------------------
 
-# A short, public TikTok video. If TikTok blocks the request the mock
-# Space's 1/8 simulated failure path will trip eventually — re-run.
-SAMPLE_URL="${SAMPLE_URL:-https://www.tiktok.com/@scout2015/video/6718335390845095173}"
+# API base may be arg 1 or $API_BASE. Trailing slash is stripped below.
+API_BASE="${1:-${API_BASE:-}}"
+
+# "Me at the zoo" — the first YouTube video, ~19s, reliably public. The
+# [0s, 18s) window stays comfortably under the 90s segment cap.
+SAMPLE_URL="${SAMPLE_URL:-https://www.youtube.com/watch?v=jNQXAC9IVRw}"
+START_SEC="${START_SEC:-0}"
+END_SEC="${END_SEC:-18}"
 POLL_INTERVAL_SEC="${POLL_INTERVAL_SEC:-3}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-180}"
+
+# The frontend ships these 8 regions; the result must carry all of them
+# (must match shared REGION_IDS / api-v2.ts).
+EXPECTED_REGIONS='["v1","v2","v3","v4","auditory","language","ffa","vwfa"]'
+
+if [[ -t 1 ]]; then G=$'\033[32m'; R=$'\033[31m'; Z=$'\033[0m'; else G=""; R=""; Z=""; fi
+pass() { printf '  %s✓%s %s\n' "$G" "$Z" "$1"; }
+fail() { printf '  %s✗%s %s\n' "$R" "$Z" "$1" >&2; }
 
 # ---------------------------------------------------------------------------
 # Pre-flight
 # ---------------------------------------------------------------------------
 
-if [[ -z "${API_BASE:-}" ]]; then
-  echo "ERROR: API_BASE is required." >&2
-  echo "  e.g. API_BASE=http://127.0.0.1:3001 $0" >&2
+if [[ -z "$API_BASE" ]]; then
+  fail "API base URL is required (pass as arg 1 or set \$API_BASE)."
+  echo "    e.g. $0 https://abc123.execute-api.us-east-1.amazonaws.com/dev" >&2
+  echo "    or   API_BASE=http://localhost:3001 $0" >&2
   exit 3
 fi
-# Strip any trailing slash so we never emit a URL with `//`.
 API_BASE="${API_BASE%/}"
 
 for bin in curl jq; do
   if ! command -v "$bin" >/dev/null 2>&1; then
-    echo "ERROR: \`$bin\` not on PATH." >&2
+    fail "\`$bin\` not on PATH."
     exit 3
   fi
 done
 
-echo "==> API_BASE = $API_BASE"
-echo "==> sample URL = $SAMPLE_URL"
+echo "==> API base : $API_BASE"
+echo "==> sample   : $SAMPLE_URL  [${START_SEC}s, ${END_SEC}s)"
 
 # ---------------------------------------------------------------------------
 # 1. Create the job
 # ---------------------------------------------------------------------------
 
+req_body="$(jq -nc \
+  --arg url "$SAMPLE_URL" --argjson s "$START_SEC" --argjson e "$END_SEC" \
+  '{url: $url, startSec: $s, endSec: $e}')"
+
 create_resp="$(curl --fail-with-body -sS -X POST \
-  -H 'Content-Type: application/json' \
-  -d "{\"url\":\"${SAMPLE_URL}\"}" \
-  "${API_BASE}/v2/jobs")"
+  -H 'Content-Type: application/json' -d "$req_body" \
+  "${API_BASE}/v2/jobs")" || { fail "POST /v2/jobs failed: ${create_resp:-<no body>}"; exit 1; }
 
 job_id="$(jq -r '.jobId // empty' <<<"$create_resp")"
 if [[ -z "$job_id" ]]; then
-  echo "ERROR: POST /v2/jobs did not return a jobId." >&2
-  echo "  response: $create_resp" >&2
+  fail "POST /v2/jobs returned no jobId. response: $create_resp"
   exit 1
 fi
-echo "==> created jobId=$job_id"
+pass "created job $job_id"
 
 # ---------------------------------------------------------------------------
-# 2. Poll until terminal or timeout
+# 2. Poll until a terminal status or timeout
 # ---------------------------------------------------------------------------
 
 deadline=$(( $(date +%s) + TIMEOUT_SEC ))
-status="unknown"
-last_status=""
+status=""
+last=""
 result_url=""
-error_msg=""
 
 while :; do
   if (( $(date +%s) >= deadline )); then
-    echo "ERROR: timed out after ${TIMEOUT_SEC}s in status=${status}" >&2
+    fail "timed out after ${TIMEOUT_SEC}s (last status=${status:-none})"
     exit 2
   fi
 
-  poll="$(curl --fail-with-body -sS "${API_BASE}/v2/jobs/${job_id}")"
+  poll="$(curl --fail-with-body -sS "${API_BASE}/v2/jobs/${job_id}")" \
+    || { fail "GET /v2/jobs/${job_id} failed"; exit 1; }
   status="$(jq -r '.status // "unknown"' <<<"$poll")"
-  if [[ "$status" != "$last_status" ]]; then
-    echo "    status -> $status  (elapsedSec=$(jq -r '.elapsedSec // 0' <<<"$poll"))"
-    last_status="$status"
+
+  if [[ "$status" != "$last" ]]; then
+    echo "    status → ${status}  (elapsedSec=$(jq -r '.elapsedSec // 0' <<<"$poll"))"
+    last="$status"
   fi
 
   case "$status" in
@@ -103,57 +121,86 @@ while :; do
       break
       ;;
     failed_download|failed_inference|rejected_duration)
-      error_msg="$(jq -r '.error // "(no error message)"' <<<"$poll")"
-      echo "FAIL: terminal status=$status error=$error_msg" >&2
+      fail "terminal status=${status} error=$(jq -r '.error // "(none)"' <<<"$poll")"
       exit 1
       ;;
     pending|downloading|inferring)
       sleep "$POLL_INTERVAL_SEC"
       ;;
     *)
-      echo "WARN: unexpected status=$status — continuing to poll" >&2
+      echo "    (unexpected status=${status}; continuing to poll)" >&2
       sleep "$POLL_INTERVAL_SEC"
       ;;
   esac
 done
+pass "job reached status=done"
 
 # ---------------------------------------------------------------------------
-# 3. Fetch and validate the result
+# 3. Fetch the result
 # ---------------------------------------------------------------------------
 
 if [[ -z "$result_url" ]]; then
-  echo "ERROR: status=done but no resultUrl in response" >&2
+  fail "status=done but the response carried no resultUrl"
   exit 1
 fi
-echo "==> fetching resultUrl"
-# `--compressed` lets curl request gzip transfer-encoding so the S3 object
-# (stored as application/gzip) is decoded on the fly. If the bucket
-# returns it as octet-stream we'll need to gunzip manually — try both.
+
+# S3 serves the result gzip'd (Content-Encoding: gzip), which --compressed
+# decodes transparently. If we still don't have JSON, the object is raw gzip
+# bytes — re-fetch and gunzip by hand.
 result_json="$(curl --fail-with-body --compressed -sS "$result_url" || true)"
-if ! jq -e . <<<"$result_json" >/dev/null 2>&1; then
-  # Probably raw gzip. Re-fetch as binary and gunzip.
+if ! jq -e . >/dev/null 2>&1 <<<"$result_json"; then
   tmp="$(mktemp)"
-  curl --fail-with-body -sS "$result_url" -o "$tmp"
-  result_json="$(gunzip -c "$tmp")"
+  curl --fail-with-body -sS "$result_url" -o "$tmp" \
+    || { fail "could not fetch resultUrl"; rm -f "$tmp"; exit 1; }
+  result_json="$(gunzip -c "$tmp" 2>/dev/null || cat "$tmp")"
   rm -f "$tmp"
 fi
-
-echo "==> result summary"
-jq -r '
-  "  videoDurationSec: \(.videoDurationSec)",
-  "  modelVersion:     \(.modelVersion)",
-  "  byRegion keys:    \(.byRegion | keys | join(", "))",
-  "  timestamps[0..2]: \(.timestamps[0:3])"
-' <<<"$result_json"
-
-# Contract assertion: every region we ship in the frontend must be present.
-expected_regions='["v1","v2","v3","v4","auditory","language","ffa","vwfa"]'
-missing="$(jq -r --argjson expected "$expected_regions" '
-  $expected - (.byRegion | keys) | join(", ")
-' <<<"$result_json")"
-if [[ -n "$missing" ]]; then
-  echo "FAIL: byRegion is missing: $missing" >&2
+if ! jq -e . >/dev/null 2>&1 <<<"$result_json"; then
+  fail "resultUrl did not return valid JSON"
   exit 1
 fi
+pass "fetched ActivationPayload"
 
-echo "OK"
+# ---------------------------------------------------------------------------
+# 4. Assert the ActivationPayload shape (CONTRACTS.md §13.3)
+# ---------------------------------------------------------------------------
+
+ok=1
+mark() { if [[ "$1" == "ok" ]]; then pass "$2"; else fail "$2"; ok=0; fi; }
+jqbool() { if jq -e "$1" >/dev/null 2>&1 <<<"$result_json"; then echo ok; else echo no; fi; }
+
+mark "$(jqbool '.videoDurationSec | type == "number"')" "videoDurationSec is a number"
+mark "$(jqbool '.modelVersion | type == "string"')"     "modelVersion is a string"
+
+n_ts="$(jq -r '(.timestamps // []) | length' <<<"$result_json")"
+mark "$(jqbool '(.timestamps | type == "array") and (.timestamps | length > 0) and (all(.timestamps[]; type == "number"))')" \
+  "timestamps is a non-empty number[] (n=${n_ts})"
+
+missing="$(jq -r --argjson exp "$EXPECTED_REGIONS" \
+  '($exp - ((.byRegion // {}) | keys)) | join(", ")' <<<"$result_json")"
+if [[ -z "$missing" ]]; then mark ok "byRegion has all 8 regions"; else mark no "byRegion missing: ${missing}"; fi
+
+# Every region series must be a number[] of length == timestamps length.
+badlen="$(jq -r --argjson exp "$EXPECTED_REGIONS" '
+  . as $root
+  | ($root.timestamps // [] | length) as $n
+  | [ $exp[] as $r
+      | ($root.byRegion[$r] // null) as $s
+      | if ($s | type) != "array" or any($s[]; type != "number") then "\($r):not-number[]"
+        elif ($s | length) != $n then "\($r):len=\($s|length)≠\($n)"
+        else empty end ]
+  | join(", ")' <<<"$result_json")"
+if [[ -z "$badlen" ]]; then
+  mark ok "every region series is a number[] of length ${n_ts}"
+else
+  mark no "series shape problems: ${badlen}"
+fi
+
+echo
+if [[ "$ok" == "1" ]]; then
+  printf '%sPASS%s — single-video pipeline healthy (job %s)\n' "$G" "$Z" "$job_id"
+  exit 0
+else
+  printf '%sFAIL%s — ActivationPayload failed one or more assertions\n' "$R" "$Z" >&2
+  exit 1
+fi

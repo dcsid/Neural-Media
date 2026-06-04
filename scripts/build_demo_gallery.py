@@ -46,9 +46,12 @@ PREDICT_CLI = REPO_ROOT / "scripts" / "predict_one_url.py"
 OUTPUT_DIR = REPO_ROOT / "apps" / "web" / "public" / "demo-predictions"
 MOCK_MODEL_VERSION = "tribe-v2-mock-gallery"
 
-# Inference imports get resolved via PYTHONPATH (the Makefile sets this for
-# `make` invocations; we also fall back to direct sys.path injection for
-# `python scripts/build_demo_gallery.py`).
+# Inference + pipeline imports get resolved via PYTHONPATH (the Makefile sets
+# this for `make` invocations; we also fall back to direct sys.path injection
+# for `python scripts/build_demo_gallery.py`). `neural_media_pipeline` is on
+# the path for the `--dry-run` validators (is_supported_youtube_url /
+# validate_segment), which are imported lazily so `--help` needs no deps.
+sys.path.insert(0, str(REPO_ROOT / "services" / "pipeline"))
 sys.path.insert(0, str(REPO_ROOT / "services" / "inference"))
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -89,51 +92,66 @@ class DemoEntry:
         return self.endSec - self.startSec
 
 
-# PLACEHOLDERS. Each URL uses a clearly-fake YouTube video id
-# ("PLACEHLDR0N") so anyone tracing them sees these are demo stand-ins,
-# not real targets. The labels evoke the *kind* of clip each slot holds.
-# The brain terminal swaps in the real preselected (URL, startSec, endSec)
-# clips later, and the real bake then runs on the GPU; until then
-# `--mock-only` proves the tooling end-to-end with no network.
+# ─────────────────────────────────────────────────────────────────────────
+# TODO(brain): replace these 8 PLACEHOLDERS with the real clip list.
+#
+# Each URL id is the obvious sentinel "REPLACE_ME_0N" — NOT a valid 11-char
+# YouTube id — so `python scripts/build_demo_gallery.py --dry-run` FAILS
+# (invalid_url) until you fill in real clips. That failure is the gate that
+# stops a half-edited list reaching the (expensive) GPU bake.
+#
+# Replace each entry with a real (YouTube URL, startSec, endSec), keeping
+# 0 <= startSec < endSec and endSec - startSec <= 90, and pick varied content
+# (visual / faces / on-screen text / music) so the brain maps differ
+# clip-to-clip. Format:
+#
+#     DemoEntry(
+#         label="NASA — Aurora over the Arctic",
+#         url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",   # real 11-char id
+#         startSec=12.0, endSec=30.0,                          # end-start <= 90
+#     ),
+#
+# After editing, `--dry-run` must print all-PASS before you bake for real.
+# ─────────────────────────────────────────────────────────────────────────
 DEMO_ENTRIES: tuple[DemoEntry, ...] = (
     DemoEntry(
         label="NASA — Aurora over the Arctic",
-        url="https://www.youtube.com/watch?v=PLACEHLDR01",
+        url="https://www.youtube.com/watch?v=REPLACE_ME_01",
         startSec=5.0, endSec=23.0,
     ),
     DemoEntry(
         label="NASA — Mars dust storm timelapse",
-        url="https://www.youtube.com/watch?v=PLACEHLDR02",
+        url="https://www.youtube.com/watch?v=REPLACE_ME_02",
         startSec=10.0, endSec=32.0,
     ),
     DemoEntry(
         label="NatGeo — Octopus camouflage",
-        url="https://www.youtube.com/watch?v=PLACEHLDR03",
+        url="https://www.youtube.com/watch?v=REPLACE_ME_03",
         startSec=0.0, endSec=15.0,
     ),
     DemoEntry(
         label="NatGeo — Lions at sunset",
-        url="https://www.youtube.com/watch?v=PLACEHLDR04",
+        url="https://www.youtube.com/watch?v=REPLACE_ME_04",
         startSec=8.0, endSec=35.0,
     ),
     DemoEntry(
         label="BBC Earth — Hummingbird (slow-mo)",
-        url="https://www.youtube.com/watch?v=PLACEHLDR05",
+        url="https://www.youtube.com/watch?v=REPLACE_ME_05",
         startSec=2.0, endSec=14.5,
     ),
     DemoEntry(
         label="Khan Academy — Pythagoras visual proof",
-        url="https://www.youtube.com/watch?v=PLACEHLDR06",
+        url="https://www.youtube.com/watch?v=REPLACE_ME_06",
         startSec=0.0, endSec=33.0,
     ),
     DemoEntry(
         label="Smithsonian — T-Rex skull tour",
-        url="https://www.youtube.com/watch?v=PLACEHLDR07",
+        url="https://www.youtube.com/watch?v=REPLACE_ME_07",
         startSec=12.0, endSec=32.0,
     ),
     DemoEntry(
         label="Duolingo — 'thank you' in five languages",
-        url="https://www.youtube.com/watch?v=PLACEHLDR08",
+        url="https://www.youtube.com/watch?v=REPLACE_ME_08",
         startSec=0.0, endSec=14.0,
     ),
 )
@@ -343,6 +361,48 @@ def build(force_mock: bool) -> int:
     return 0
 
 
+def dry_run(entries: tuple[DemoEntry, ...] = DEMO_ENTRIES) -> int:
+    """Validate every entry against CONTRACTS.md §13 with NO GPU/network.
+
+    Uses the *same* validators the real download path enforces
+    (``is_supported_youtube_url`` + ``validate_segment``), so a PASS here
+    means the bake won't be rejected for a bad URL or segment. Prints a
+    per-entry PASS/FAIL table; returns 1 if any entry fails, else 0.
+    """
+    # Lazy import keeps `--help` dependency-free; pulled from the pipeline
+    # package so the dry-run gate matches the real download-time checks.
+    from neural_media_pipeline.downloader import (
+        SegmentError,
+        is_supported_youtube_url,
+        validate_segment,
+    )
+
+    print(f"{'STATUS':<6}  {'LABEL':<42}  {'SEGMENT':>14}  REASON")
+    print("-" * 78)
+    failures = 0
+    for entry in entries:
+        reasons: list[str] = []
+        if not is_supported_youtube_url(entry.url):
+            reasons.append("invalid_url")
+        try:
+            validate_segment(entry.startSec, entry.endSec)
+        except SegmentError as exc:
+            reasons.append(exc.code)
+        ok = not reasons
+        failures += 0 if ok else 1
+        seg = f"[{entry.startSec:g},{entry.endSec:g})"
+        print(f"{'PASS' if ok else 'FAIL':<6}  {entry.label[:42]:<42}  "
+              f"{seg:>14}  {'ok' if ok else ', '.join(reasons)}")
+    print("-" * 78)
+    total = len(entries)
+    print(f"{total - failures}/{total} PASS")
+    if failures:
+        plural = "y" if failures == 1 else "ies"
+        print(f"\n{failures} entr{plural} FAILED — fix the clip list (see the "
+              "TODO block in this file) before baking for real.")
+    return 1 if failures else 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -351,7 +411,16 @@ def main() -> int:
         help="Skip the real CLI even if it exists. Useful for reproducible "
              "checked-in gallery output.",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate the clip list (YouTube URL + segment) against the "
+             "contract with NO GPU/network. Prints a PASS/FAIL table and "
+             "exits nonzero on any failure. Run this before the real bake.",
+    )
     args = parser.parse_args()
+    if args.dry_run:
+        return dry_run()
     return build(force_mock=args.mock_only)
 
 

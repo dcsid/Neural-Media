@@ -22,6 +22,7 @@ from neural_media_pipeline.downloader import (
     SegmentError,
     download_batch,
     download_video,
+    is_supported_youtube_url,
     validate_segment,
     yt_dlp_available,
 )
@@ -457,3 +458,34 @@ def test_yt_dlp_fetch_wires_download_ranges(tmp_path: Path, monkeypatch: pytest.
     opts = captured["opts"]
     assert opts["force_keyframes_at_cuts"] is True
     assert opts["download_ranges"] == ("RANGES", [(12.0, 30.0)])
+
+
+# ---------------------------------------------------------------------------
+# is_supported_youtube_url — the §13.5 URL gate (shared by the predictor CLI
+# and the gallery-bake --dry-run)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("url", [
+    "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    "https://youtube.com/watch?v=dQw4w9WgXcQ",
+    "https://m.youtube.com/watch?v=dQw4w9WgXcQ",
+    "https://youtu.be/dQw4w9WgXcQ",
+    "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+    "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=12s",  # extra params ok
+])
+def test_is_supported_youtube_url_accepts_valid(url: str) -> None:
+    assert is_supported_youtube_url(url) is True
+
+
+@pytest.mark.parametrize("url", [
+    "https://www.tiktok.com/@x/video/123",            # not YouTube
+    "https://www.youtube.com/watch?v=REPLACE_ME_01",  # placeholder, not 11 chars
+    "https://www.youtube.com/watch?v=short",          # id too short
+    "https://www.youtube.com/watch",                  # no v=
+    "https://youtu.be/",                              # no id
+    "https://example.com/watch?v=dQw4w9WgXcQ",        # wrong host
+    "not a url",
+    "",
+])
+def test_is_supported_youtube_url_rejects_invalid(url: str) -> None:
+    assert is_supported_youtube_url(url) is False

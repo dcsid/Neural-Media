@@ -290,3 +290,288 @@ describe("/single timeout boundary (P2.7)", () => {
     ).toBeInTheDocument();
   });
 });
+
+describe("/single error resilience (unbreakable demo)", () => {
+  async function predictDefault(user: ReturnType<typeof userEvent.setup>) {
+    await user.type(screen.getByLabelText(/youtube url/i), URL_A);
+    await user.click(screen.getByRole("button", { name: /^predict$/i }));
+  }
+
+  it("segment_out_of_bounds → calm message, no upload fallback", async () => {
+    api.createUrlJob.mockResolvedValue({ jobId: "job-1" });
+    api.getJob.mockResolvedValueOnce({
+      jobId: "job-1",
+      status: "failed_download",
+      error: "segment_out_of_bounds",
+      createdAt: 0,
+      elapsedSec: 1,
+    });
+    const user = userEvent.setup();
+    render(<SingleVideoPage />);
+    await predictDefault(user);
+
+    expect(
+      await screen.findByText(/past the end of the video/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByLabelText(/upload an mp4 video file/i),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /try another/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("inference failure → calm message, no stack trace", async () => {
+    api.createUrlJob.mockResolvedValue({ jobId: "job-1" });
+    api.getJob.mockResolvedValueOnce({
+      jobId: "job-1",
+      status: "failed_inference",
+      createdAt: 0,
+      elapsedSec: 1,
+    });
+    const user = userEvent.setup();
+    render(<SingleVideoPage />);
+    await predictDefault(user);
+
+    expect(
+      await screen.findByText(/couldn't finish that prediction/i),
+    ).toBeInTheDocument();
+  });
+
+  it("done with a malformed result → error panel, no crash", async () => {
+    api.createUrlJob.mockResolvedValue({ jobId: "job-1" });
+    api.getJob.mockResolvedValue({
+      jobId: "job-1",
+      status: "done",
+      resultUrl: "https://cdn/x.json",
+      createdAt: 0,
+      elapsedSec: 1,
+    });
+    api.fetchActivation.mockRejectedValue(
+      new apiV2.ApiV2Error({
+        kind: "validation",
+        url: "https://cdn/x.json",
+        message: "byRegion missing",
+      }),
+    );
+    const user = userEvent.setup();
+    render(<SingleVideoPage />);
+    await predictDefault(user);
+
+    expect(
+      await screen.findByText(/couldn't finish that prediction/i),
+    ).toBeInTheDocument();
+  });
+
+  it("done with no resultUrl → error panel", async () => {
+    api.createUrlJob.mockResolvedValue({ jobId: "job-1" });
+    api.getJob.mockResolvedValue({
+      jobId: "job-1",
+      status: "done",
+      createdAt: 0,
+      elapsedSec: 1,
+    });
+    const user = userEvent.setup();
+    render(<SingleVideoPage />);
+    await predictDefault(user);
+
+    expect(
+      await screen.findByText(/couldn't finish that prediction/i),
+    ).toBeInTheDocument();
+  });
+
+  it("maps a server create-400 error_code to friendly copy", async () => {
+    api.createUrlJob.mockRejectedValue(
+      new apiV2.ApiV2Error({
+        kind: "http",
+        url: "/v2/jobs",
+        status: 400,
+        message: "bad",
+        body: { error_code: "segment_out_of_bounds" },
+      }),
+    );
+    const user = userEvent.setup();
+    render(<SingleVideoPage />);
+    await predictDefault(user);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /past the end of the video/i,
+    );
+  });
+
+  it("never renders a raw error code or status string", async () => {
+    api.createUrlJob.mockResolvedValue({ jobId: "job-1" });
+    api.getJob.mockResolvedValueOnce({
+      jobId: "job-1",
+      status: "failed_download",
+      error: "download_blocked",
+      createdAt: 0,
+      elapsedSec: 1,
+    });
+    const user = userEvent.setup();
+    render(<SingleVideoPage />);
+    await predictDefault(user);
+
+    expect(
+      await screen.findByText(/youtube blocked our download/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/code:/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/failed_download/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/download_blocked/)).not.toBeInTheDocument();
+  });
+
+  it("does not double-submit when Predict is mashed", async () => {
+    let resolveCreate: (v: { jobId: string }) => void = () => {};
+    api.createUrlJob.mockImplementation(
+      () => new Promise<{ jobId: string }>((r) => { resolveCreate = r; }),
+    );
+    api.getJob.mockResolvedValue({
+      jobId: "job-1",
+      status: "inferring",
+      createdAt: 0,
+      elapsedSec: 1,
+    });
+    const user = userEvent.setup();
+    render(<SingleVideoPage />);
+    await user.type(screen.getByLabelText(/youtube url/i), URL_A);
+    const btn = screen.getByRole("button", { name: /^predict$/i });
+    await user.click(btn);
+    await user.click(btn).catch(() => {}); // disabled + guarded → no-op
+    resolveCreate({ jobId: "job-1" });
+
+    await vi.waitFor(() => expect(api.createUrlJob).toHaveBeenCalledTimes(1));
+  });
+
+  it("upload from the blocked panel can fail, then succeed (bulletproof)", async () => {
+    api.createUrlJob.mockResolvedValue({ jobId: "job-1" });
+    api.getJob.mockResolvedValueOnce({
+      jobId: "job-1",
+      status: "failed_download",
+      error: "download_blocked",
+      createdAt: 0,
+      elapsedSec: 1,
+    });
+    const user = userEvent.setup();
+    render(<SingleVideoPage />);
+    await predictDefault(user);
+    expect(
+      await screen.findByText(/youtube blocked our download/i),
+    ).toBeInTheDocument();
+
+    const file = new File([new Uint8Array([1])], "clip.mp4", {
+      type: "video/mp4",
+    });
+
+    // First attempt fails — the panel stays usable with an inline retry note.
+    api.createUploadJob.mockRejectedValueOnce(
+      new apiV2.ApiV2Error({
+        kind: "offline",
+        url: "/v2/jobs/upload",
+        message: "down",
+      }),
+    );
+    await user.upload(screen.getByLabelText(/upload an mp4 video file/i), file);
+    expect(await screen.findByText(/didn't go through/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/youtube blocked our download/i),
+    ).toBeInTheDocument();
+
+    // Retry succeeds → tracking.
+    api.createUploadJob.mockResolvedValue({
+      jobId: "job-2",
+      uploadUrl: "https://s3/put",
+      uploadKey: "k",
+    });
+    api.putUpload.mockResolvedValue(undefined);
+    api.confirmUpload.mockResolvedValue(undefined);
+    api.getJob.mockResolvedValue({
+      jobId: "job-2",
+      status: "inferring",
+      createdAt: 0,
+      elapsedSec: 1,
+    });
+    // A fresh File so the input's change event re-fires (re-uploading the same
+    // File object is a no-op in jsdom).
+    const retryFile = new File([new Uint8Array([2])], "clip-retry.mp4", {
+      type: "video/mp4",
+    });
+    await user.upload(
+      screen.getByLabelText(/upload an mp4 video file/i),
+      retryFile,
+    );
+    expect(
+      await screen.findByText(/predicting brain activity/i),
+    ).toBeInTheDocument();
+  });
+});
+
+describe("/single poll resilience (fake timers)", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("recovers from a transient poll failure mid-flight", async () => {
+    api.createUrlJob.mockResolvedValue({ jobId: "job-1" });
+    api.getJob
+      .mockRejectedValueOnce(
+        new apiV2.ApiV2Error({
+          kind: "offline",
+          url: "/v2/jobs/job-1",
+          message: "blip",
+        }),
+      )
+      .mockResolvedValue({
+        jobId: "job-1",
+        status: "done",
+        resultUrl: "https://cdn/x.json",
+        createdAt: 0,
+        elapsedSec: 1,
+      });
+    api.fetchActivation.mockResolvedValue(activation());
+
+    render(<SingleVideoPage />);
+    fireEvent.change(screen.getByLabelText(/youtube url/i), {
+      target: { value: URL_A },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^predict$/i }));
+
+    // tracking + immediate poll (fails once) — no error surfaced.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(50);
+    });
+    expect(screen.queryByText(/lost the connection/i)).not.toBeInTheDocument();
+
+    // next tick polls again, succeeds → result.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2600);
+    });
+    expect(screen.getByText(/of brain activity/i)).toBeInTheDocument();
+  });
+
+  it("surfaces a connection error only after a sustained failure streak", async () => {
+    api.createUrlJob.mockResolvedValue({ jobId: "job-1" });
+    api.getJob.mockRejectedValue(
+      new apiV2.ApiV2Error({
+        kind: "http",
+        url: "/v2/jobs/job-1",
+        status: 503,
+        message: "down",
+      }),
+    );
+
+    render(<SingleVideoPage />);
+    fireEvent.change(screen.getByLabelText(/youtube url/i), {
+      target: { value: URL_A },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^predict$/i }));
+
+    // Settle into tracking + the immediate (failing) poll, then let the
+    // streak build past the threshold.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(50);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(12_000);
+    });
+    expect(screen.getByText(/lost the connection/i)).toBeInTheDocument();
+  });
+});

@@ -43,8 +43,10 @@ from __future__ import annotations
 import importlib.util
 import logging
 import random
+import re
 import shutil
 import time
+import urllib.parse
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -114,6 +116,42 @@ def validate_segment(start_sec: float, end_sec: float) -> tuple[float, float]:
             f"segment is {end_sec - start_sec:.3f}s; the cap is {MAX_SEGMENT_SEC:.0f}s",
         )
     return start_sec, end_sec
+
+
+# A YouTube video id is exactly 11 chars from this alphabet — a stable
+# upstream invariant. Enforcing it (not just the host) makes the check
+# catch typos and unfilled placeholders, not only non-YouTube hosts.
+_YOUTUBE_WATCH_HOSTS = ("youtube.com", "www.youtube.com", "m.youtube.com")
+_YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+
+def is_supported_youtube_url(url: str) -> bool:
+    """True iff ``url`` is a YouTube form accepted by CONTRACTS.md §13.5.
+
+    Accepted: ``youtube.com/watch?v=<id>`` (also ``www.`` / ``m.``),
+    ``youtu.be/<id>``, and ``youtube.com/shorts/<id>``, where ``<id>`` is a
+    valid 11-char YouTube id. Anything else — a TikTok URL, a malformed
+    link, or an unfilled placeholder id — is the contract's ``invalid_url``
+    case. This is the shared validator the predictor CLI and the
+    gallery-bake ``--dry-run`` both gate on, so they agree with the real
+    download path.
+    """
+    try:
+        parts = urllib.parse.urlparse((url or "").strip())
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower()
+    path = parts.path or ""
+    if host in _YOUTUBE_WATCH_HOSTS:
+        if path == "/watch":
+            v = urllib.parse.parse_qs(parts.query or "").get("v", [""])[0]
+            return bool(_YOUTUBE_ID_RE.match(v))
+        if path.startswith("/shorts/"):
+            return bool(_YOUTUBE_ID_RE.match(path[len("/shorts/"):].split("/", 1)[0]))
+        return False
+    if host == "youtu.be":
+        return bool(_YOUTUBE_ID_RE.match(path.lstrip("/").split("/", 1)[0]))
+    return False
 
 
 # Signature any fetch implementation (real or mock) must match. The base
@@ -411,6 +449,7 @@ __all__ = [
     "SleepFn",
     "download_batch",
     "download_video",
+    "is_supported_youtube_url",
     "validate_segment",
     "yt_dlp_available",
 ]

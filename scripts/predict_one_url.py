@@ -48,7 +48,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import urllib.parse
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -84,6 +83,7 @@ from neural_media_pipeline.downloader import (  # noqa: E402
     SegmentError,
     _yt_dlp_fetch,
     download_video,
+    is_supported_youtube_url,
     validate_segment,
 )
 from neural_media_pipeline.preprocess import (  # noqa: E402
@@ -193,28 +193,6 @@ def _looks_download_blocked(err: BaseException) -> bool:
         if any(sig in msg for sig in signatures):
             return True
         cur = cur.__cause__ or cur.__context__
-    return False
-
-
-def is_supported_youtube_url(url: str) -> bool:
-    """True iff ``url`` is a YouTube form accepted by CONTRACTS.md §13.5.
-
-    Accepted: ``youtube.com/watch?v=…``, ``www.``/``m.youtube.com/watch…``,
-    ``youtu.be/<id>``, and ``youtube.com/shorts/<id>``. Anything else is
-    ``invalid_url`` — TikTok URLs are no longer accepted by this product.
-    """
-    try:
-        parts = urllib.parse.urlparse((url or "").strip())
-    except ValueError:
-        return False
-    host = (parts.hostname or "").lower()
-    path = parts.path or ""
-    if host in ("youtube.com", "www.youtube.com", "m.youtube.com"):
-        if path == "/watch":
-            return bool(urllib.parse.parse_qs(parts.query or "").get("v", [""])[0])
-        return path.startswith("/shorts/") and len(path) > len("/shorts/")
-    if host == "youtu.be":
-        return len(path) > 1  # /<id>
     return False
 
 

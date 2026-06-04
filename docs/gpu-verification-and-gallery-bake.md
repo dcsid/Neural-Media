@@ -22,6 +22,31 @@ under an hour if the pre-flight is done first.
 
 ---
 
+## The exact order (don't skip — each gate is cheaper than the next)
+
+```bash
+# (a) preflight   — CUDA, TRIBE weights + HF repos, ffmpeg/yt-dlp, disk/VRAM
+python services/inference/scripts/validate_real_mode.py
+
+# (b) smoke clip  — ONE ~5s segment end-to-end through the real pipeline
+python scripts/smoke_gpu_clip.py
+
+# (c) dry-run     — validate the whole clip list (no GPU, no network)
+python scripts/build_demo_gallery.py --dry-run
+
+# (d) full bake   — only once (a)–(c) are green
+python scripts/build_demo_gallery.py
+```
+
+Each step fails in **seconds** with an exact reason, so a bad GPU, an
+unaccepted license, or a typo'd clip URL never costs you a 10-minute bake.
+`validate_real_mode.py` runs every check and prints a ✓/✗ table; `--dry-run`
+is GPU-free (run it on the laptop too) but is listed after the smoke clip
+because the *list* only matters once you've proven *one* clip works. The
+detailed walkthrough below expands each gate.
+
+---
+
 ## Step 0 — Pre-flight (free, on your laptop, BEFORE renting)
 
 Do everything that doesn't need a GPU off the clock.
@@ -29,12 +54,14 @@ Do everything that doesn't need a GPU off the clock.
 1. **Accept the HF licenses** on your HuggingFace account: LLaMA-3.2 is the
    only gated one (TRIBE v2, V-JEPA2, Wav2Vec-BERT download freely). Have a
    **Read** access token ready.
-2. **Run the repo-reachability pre-flight** (pure HF API calls, no GPU):
+2. **Run the pre-flight.** It runs *every* check and prints a ✓/✗ table
+   (Python deps, HF auth + repo reachability, CUDA, disk/VRAM headroom,
+   ffmpeg/yt-dlp), then a consolidated remediation block. On the laptop the
+   local checks pass and the GPU/network ones tell you exactly what to fix:
    ```bash
-   python services/inference/scripts/validate_real_mode.py
+   python services/inference/scripts/validate_real_mode.py   # add --skip-network when offline
    ```
-   All four transitive repos must resolve. If one is gated/unaccepted, fix it
-   now — not on the GPU clock.
+   Fix every ✗ now — not on the GPU clock.
 3. **Wire the curated gallery clips.** The gallery is now **YouTube clip +
    timestamp segment** (see `shared/CONTRACTS.md` §13). Each entry in
    `scripts/build_demo_gallery.py` is `(YouTube URL, startSec, endSec)` with
@@ -42,11 +69,15 @@ Do everything that doesn't need a GPU off the clock.
    segments, picking varied content (visual / faces / on-screen text / music)
    so the brain maps differ clip-to-clip. *(The brain terminal usually wires
    these for you.)*
-4. **Dry-run the bake in mock mode** (catches arg/path bugs on the laptop, not
-   the GPU):
+4. **Dry-run the clip list** (no GPU, no network) — validates every entry's
+   YouTube URL + segment against the contract and prints a PASS/FAIL table.
+   It must be **all-PASS** before you bake:
    ```bash
-   python scripts/build_demo_gallery.py --mock-only
+   python scripts/build_demo_gallery.py --dry-run
    ```
+   Until you've wired real clips this FAILS on the `REPLACE_ME` placeholders —
+   that's the gate doing its job. (`--mock-only` separately proves the bake
+   tooling end-to-end with synthetic output.)
 
 ---
 
@@ -62,17 +93,25 @@ python services/inference/scripts/validate_real_mode.py   # re-confirm on the bo
 
 ---
 
-## Step 2 — One warmup inference + the three verification checks
+## Step 2 — Smoke ONE clip, then verify
 
-Run **one** real segment and watch the logs. `predict_one_url.py` is now
-segment-aware (real mode is the default; see `--help` for the exact start/end
-flags):
+First prove the per-clip pipeline works end-to-end on a single short segment
+(download → ffmpeg → TRIBE → 8-region aggregate). The first run downloads the
+TRIBE weight stack (~10 min):
 
 ```bash
-python scripts/predict_one_url.py "<a-real-youtube-url>" --start 0 --end 30 -o /tmp/verify.json
+python scripts/smoke_gpu_clip.py        # default clip + ~5s segment; prints the output shape
 ```
 
-The first run downloads the TRIBE weight stack (~10 min). Then check, in order:
+A green **"smoke OK"** (T timepoints × 8 regions, uniform series lengths)
+means weights + GPU + extractor + aggregate all work. Now run one longer real
+segment through the predictor and do the three verification checks:
+
+```bash
+python scripts/predict_one_url.py "<a-real-youtube-url>" --start-sec 0 --end-sec 30 -o /tmp/verify.json
+```
+
+Check, in order:
 
 | # | Check | How | If wrong |
 |---|-------|-----|----------|
@@ -85,12 +124,14 @@ on the first successful GPU run).
 
 ---
 
-## Step 3 — Bake the real gallery
+## Step 3 — Dry-run the list, then bake the real gallery
 
-With the verification green and your YouTube clips + segments wired in:
+With the verification green and your YouTube clips + segments wired in,
+re-validate the whole list on the box (cheap, no GPU), then bake:
 
 ```bash
-python scripts/build_demo_gallery.py     # real is default; downloads only each clip's segment via yt-dlp --download-sections
+python scripts/build_demo_gallery.py --dry-run   # must be all-PASS
+python scripts/build_demo_gallery.py             # real is default; fetches only each clip's [startSec,endSec) via yt-dlp --download-sections
 ```
 
 This writes `apps/web/public/demo-predictions/<slug>.json` + `index.json`.

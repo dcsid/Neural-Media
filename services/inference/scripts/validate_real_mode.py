@@ -2,27 +2,28 @@
 
 Run this BEFORE attempting `--no-mock`. Walks the prerequisite stack in
 the order things fail in practice: Python deps -> HF auth -> license
-gates -> GPU -> system tools -> yt-dlp share-URL extractor. Aborts on
-the first failing check with a copy-pasteable remediation command, so
-the user fixes one thing at a time instead of wading through a wall of
-red.
+gates -> GPU -> disk headroom -> system tools -> yt-dlp YouTube extractor.
+Runs **every** check and prints a ✓/✗ table, then a consolidated
+remediation block for the failures, so a pod operator sees everything to
+fix in one pass instead of fix-one-rerun-repeat. Exits nonzero if any
+check failed.
 
 Usage::
 
     python services/inference/scripts/validate_real_mode.py
 
-    # Probe yt-dlp against a specific share URL instead of the default:
+    # Probe yt-dlp against a specific YouTube URL instead of the default:
     python services/inference/scripts/validate_real_mode.py \\
-        --video-url https://www.tiktokv.com/share/video/7640163791312801054/
+        --video-url https://www.youtube.com/watch?v=dQw4w9WgXcQ
 
-    # Skip the yt-dlp network probe entirely (offline CI):
+    # Skip the network checks entirely (offline CI):
     python services/inference/scripts/validate_real_mode.py --skip-network
 
 Exit codes::
 
     0    all checks passed
-    1    a check failed (see stderr for remediation)
-    2    bad usage / internal error
+    1    one or more checks failed (see the remediation block)
+    2    an internal error while running a check
 
 This script intentionally has zero project imports: it must be runnable
 from a fresh clone before `pip install -e '.[real]'` succeeds, so it
@@ -36,19 +37,16 @@ import importlib
 import os
 import shutil
 import subprocess
-import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Callable
 
-# A real, public, indexable TikTok share-URL the data-pipeline downloader's
-# docstring already cites as the canonical share-extractor probe target
-# (see services/pipeline/neural_media_pipeline/downloader.py module
-# docstring). Using the same target keeps the two probes consistent — if
-# yt-dlp's TikTok extractor breaks on this URL, both validate_real_mode
-# and probe_share_url surface it the same way.
-_DEFAULT_PROBE_URL = "https://www.tiktokv.com/share/video/7640163791312801054/"
+# A stable, public YouTube video used to probe yt-dlp's extractor without
+# downloading (--simulate). The product is YouTube-only after the §13
+# refocus, so the probe targets YouTube (not the old TikTok share host).
+# dQw4w9WgXcQ is the canonical long-lived example used in CONTRACTS.md §13.
+_DEFAULT_PROBE_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
 # Repos TRIBE v2 pulls transitively on first use. Sources:
 #   * model card: huggingface.co/facebook/tribev2 README
@@ -70,6 +68,13 @@ _TRANSITIVE_REPOS: tuple[tuple[str, bool], ...] = (
 # a 12GB card (e.g., RTX 3060) clears but a 8GB card (e.g., RTX 3070) does
 # not. Real demo box is the 24GB RTX 3090/4090 (see docs/real-mode-setup.md).
 _MIN_VRAM_BYTES = 10 * 1024**3
+
+# TRIBE + its transitive weights (Llama-3.2-3B ~6 GB, V-JEPA2 ViT-g ~7 GB,
+# Wav2Vec-BERT ~2.4 GB, the tribev2 readout) land in the HuggingFace cache on
+# first run, on top of per-clip video tempfiles + activation outputs. 25 GB
+# free clears the weight stack with headroom; a small pod root disk that fills
+# mid-download otherwise fails with a cryptic errno 28 deep in a stack trace.
+_MIN_FREE_DISK_BYTES = 25 * 1024**3
 
 # Visual width for the check-name column. Keep aligned with the longest
 # check label below ("Gated repo accessible: meta-llama/Llama-3.2-3B").
@@ -110,27 +115,9 @@ def _emit(result: CheckResult) -> None:
     print(line, flush=True)
 
 
-def _fail(result: CheckResult) -> int:
-    """Emit a failed check + its remediation, then return exit code 1.
-
-    Everything goes to stdout (not stderr) so the checklist and the
-    failure block stay in deterministic order when both streams point
-    at the same terminal — see the buffering race that bit the first
-    run of this script.
-    """
-    _emit(result)
-    print()
-    print(f"FAIL: {result.name}")
-    if result.remediation:
-        print("Remediation:")
-        for line in result.remediation.strip("\n").splitlines():
-            print(f"  {line}")
-    return 1
-
-
 # ----------------------------------------------------------------------
-# Individual checks. Each returns a CheckResult; the runner short-circuits
-# on the first failure.
+# Individual checks. Each returns a CheckResult; the runner runs them all
+# and aggregates the failures.
 # ----------------------------------------------------------------------
 
 
@@ -337,6 +324,49 @@ def check_gpu() -> CheckResult:
     )
 
 
+def check_disk_headroom() -> CheckResult:
+    """Free disk on the filesystem that will hold the HuggingFace cache.
+
+    The weight stack is multi-GB; a small pod root disk fills mid-download
+    and torch / yt-dlp fail with a confusing errno 28 deep in a stack trace.
+    Resolves the HF cache dir (HF_HUB_CACHE / HF_HOME / the default
+    ~/.cache/huggingface), walking up to the nearest existing parent so the
+    free-space probe works before the cache dir is created."""
+    name = f"Disk headroom >= {_MIN_FREE_DISK_BYTES // 1024**3} GB (HF cache)"
+    cache_dir = (
+        os.environ.get("HF_HUB_CACHE")
+        or os.environ.get("HF_HOME")
+        or os.path.expanduser("~/.cache/huggingface")
+    )
+    probe = cache_dir
+    while not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        free = shutil.disk_usage(probe).free
+    except OSError as exc:
+        return CheckResult(
+            name=name,
+            passed=False,
+            remediation=f"# Couldn't stat the cache filesystem at {probe}: {exc}",
+        )
+    detail = f"{free / 1024**3:.1f} GB free at {probe}"
+    if free < _MIN_FREE_DISK_BYTES:
+        return CheckResult(
+            name=name,
+            passed=False,
+            detail=detail,
+            remediation=(
+                f"# Only {free / 1024**3:.1f} GB free where the HF cache lives ({probe}).\n"
+                f"# TRIBE's weight stack needs >= {_MIN_FREE_DISK_BYTES // 1024**3} GB. Mount a\n"
+                "# bigger volume or point the cache at one: export HF_HOME=/workspace/hf"
+            ),
+        )
+    return CheckResult(name=name, passed=True, detail=detail)
+
+
 def check_tool_on_path(tool: str, install_hint: str) -> CheckResult:
     """ffmpeg + yt-dlp must resolve via `shutil.which`. ffmpeg is the
     decoder TRIBE's moviepy preprocessor shells out to; yt-dlp is the
@@ -348,14 +378,14 @@ def check_tool_on_path(tool: str, install_hint: str) -> CheckResult:
     return CheckResult(name=name, passed=True, detail=path)
 
 
-def check_yt_dlp_share_url(url: str) -> CheckResult:
-    """Probe yt-dlp's TikTok share-URL extractor without downloading.
+def check_yt_dlp_extractor(url: str) -> CheckResult:
+    """Probe yt-dlp's YouTube extractor without downloading.
 
-    `--simulate` exercises the extractor without fetching media bytes,
-    so this is bandwidth-cheap and TikTok-friendly. If yt-dlp's TikTok
-    extractor breaks on the share-host form, this fires before the user
-    burns 10 minutes downloading their full history."""
-    name = "yt-dlp share-URL extractor"
+    `--simulate` exercises the extractor (and any age/bot gating) without
+    fetching media bytes, so it's bandwidth-cheap. If yt-dlp's YouTube
+    extractor is stale or the host is gating this IP, this fires here —
+    not 10 minutes into the gallery bake."""
+    name = "yt-dlp YouTube extractor"
     yt_dlp = shutil.which("yt-dlp")
     if not yt_dlp:
         return CheckResult(
@@ -425,6 +455,7 @@ def _build_checks(probe_url: str | None) -> list[Callable[[], CheckResult]]:
     for repo_id, gated in _TRANSITIVE_REPOS:
         checks.append(lambda rid=repo_id, g=gated: check_repo_accessible(rid, g))
     checks.append(check_gpu)
+    checks.append(check_disk_headroom)
     checks.append(
         lambda: check_tool_on_path(
             "ffmpeg", "apt install ffmpeg  # (or: brew install ffmpeg)"
@@ -434,7 +465,7 @@ def _build_checks(probe_url: str | None) -> list[Callable[[], CheckResult]]:
         lambda: check_tool_on_path("yt-dlp", "pip install yt-dlp  # (or: brew install yt-dlp)")
     )
     if probe_url is not None:
-        checks.append(lambda: check_yt_dlp_share_url(probe_url))
+        checks.append(lambda: check_yt_dlp_extractor(probe_url))
     return checks
 
 
@@ -480,6 +511,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         ]
         local_only.append(check_gpu)
+        local_only.append(check_disk_headroom)
         local_only.append(
             lambda: check_tool_on_path(
                 "ffmpeg", "apt install ffmpeg  # (or: brew install ffmpeg)"
@@ -494,15 +526,34 @@ def main(argv: list[str] | None = None) -> int:
     else:
         checks = _build_checks(args.video_url)
 
+    # Run EVERY check (no abort-on-first) so the operator sees the whole
+    # ✓/✗ table in one pass, then a consolidated remediation block.
+    failed: list[CheckResult] = []
+    internal_error = False
     for run in checks:
         try:
             result = run()
         except Exception as exc:  # noqa: BLE001 — surface the failure, don't crash
-            print(f"  ✗ internal error in check: {exc.__class__.__name__}: {exc}")
-            return 2
-        if not result.passed:
-            return _fail(result)
+            result = CheckResult(
+                name="internal error while running a check",
+                passed=False,
+                detail=f"{exc.__class__.__name__}: {exc}",
+            )
+            internal_error = True
         _emit(result)
+        if not result.passed:
+            failed.append(result)
+
+    if failed:
+        print()
+        print(f"{len(failed)} check(s) FAILED:")
+        for result in failed:
+            print(f"  ✗ {result.name}")
+            if result.remediation:
+                print("    Remediation:")
+                for line in result.remediation.strip("\n").splitlines():
+                    print(f"      {line}")
+        return 2 if internal_error else 1
 
     print("\nAll checks passed. Real-mode inference should run end-to-end.")
     print("Note: this script doesn't actually load TRIBE weights into VRAM — the")

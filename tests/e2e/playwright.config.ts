@@ -5,7 +5,7 @@ const MOCK_PORT = 3001;
 
 // We deliberately do NOT depend on the user's real .env. The mock server on
 // :3001 owns the entire /v2/jobs* surface; the web app is launched with
-// NEXT_PUBLIC_API_BASE_URL pointed at it.
+// NEXT_PUBLIC_API_BASE_V2 pointed at it.
 export default defineConfig({
   testDir: ".",
   testMatch: /.*\.spec\.ts$/,

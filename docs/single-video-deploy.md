@@ -255,12 +255,12 @@ aws sns subscribe --region us-east-1 --topic-arn "$TOPIC_ARN" \
 The web app is a static client bundle that talks **only** to `$API_BASE` (no
 Next.js server routes on the hot path), so it hosts cleanly on S3 + CloudFront.
 
-> **Prerequisite (frontend-owned):** static export requires
-> `output: 'export'` in `apps/web/next.config.ts` (and moving the security
-> headers to a CloudFront response-headers policy, since `headers()` is a
-> server feature). As of this writing `next.config.ts` does **not** set it —
-> coordinate with the frontend worker before this step. With `output: 'export'`,
-> `next build` writes the static site to `apps/web/out/`.
+> **Static export is wired up.** `apps/web/next.config.ts` turns on
+> `output: 'export'` when `STATIC_EXPORT=1` is set (the default build stays a
+> Next server so the e2e harness and `next start` keep working). The security
+> headers are intentionally NOT emitted in export mode — add them as a
+> CloudFront response-headers policy in step 5c. `STATIC_EXPORT=1 next build`
+> writes the static site to `apps/web/out/`.
 
 ### 5a. Build with the API base baked in
 
@@ -270,7 +270,7 @@ Next.js server routes on the hot path), so it hosts cleanly on S3 + CloudFront.
 ```bash
 cd apps/web
 pnpm install
-NEXT_PUBLIC_API_BASE_V2="$API_BASE" pnpm build    # writes ./out/
+STATIC_EXPORT=1 NEXT_PUBLIC_API_BASE_V2="$API_BASE" pnpm build    # writes ./out/
 cd -
 ```
 
@@ -287,7 +287,10 @@ aws s3 sync apps/web/out/ "s3://${WEB_BUCKET}/" --delete
 Create a CloudFront distribution with the S3 bucket as origin, locked down with
 **Origin Access Control** (keep the bucket private), default root object
 `index.html`, and a custom-error response mapping 403/404 → `/index.html` (so
-client routes resolve). There's no one-liner — follow
+client routes resolve), and a **response-headers policy** carrying the security
+headers that used to live in `next.config.ts` (`X-Frame-Options: DENY`,
+`Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`) — these are
+not emitted by the static export. There's no one-liner — follow
 <https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/getting-started-secure-static-website-cloudfront.html>.
 Budget ~30 min the first time. Note the distribution domain, e.g.
 `https://d1234abcd.cloudfront.net`.

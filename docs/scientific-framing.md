@@ -6,14 +6,14 @@ changes in this file first.
 
 ## What the tool DOES measure
 
-- **Predicted BOLD fMRI response** (cortical surface, 20,484 vertices) for
-  each watched video, from the **average** of TRIBE v2's 720 training subjects.
-- Predicted engagement in well-localized cortical regions: visual cortex,
-  auditory cortex, language network, face-selective regions.
-- Divergence and similarity **between videos** — clustering content by
-  predicted neural fingerprint.
-- Aggregate patterns over a user's watch history: time-of-day shifts,
-  content-type breakdowns, session-level variation.
+- **Predicted BOLD fMRI response** (cortical surface, 20,484 vertices) for a
+  chosen video segment of up to 90 seconds, from the **average** of TRIBE v2's
+  720 training subjects.
+- Predicted activation in eight well-localized cortical regions: V1–V4,
+  auditory cortex, the language network, FFA, and VWFA.
+- Comparative reads **between clips** — "clip A predicts higher V1 than
+  clip B" — rather than absolute magnitudes, which aren't calibrated to
+  anything physical.
 
 ## What it does NOT measure (do not claim these)
 
@@ -24,7 +24,7 @@ changes in this file first.
 - **Cumulative effects, habituation, or neuroplasticity** over time.
 - **Subjective states**: aesthetic preference, confusion, cognitive
   overload, memory encoding, satisfaction.
-- **"How TikTok is rewiring your brain"** or any rhetoric in that family.
+- **"How online video is rewiring your brain"** or any rhetoric in that family.
 
 ## Rules for copy and UI text
 
@@ -39,13 +39,17 @@ changes in this file first.
 
 ## Mock mode — what it is and what it isn't
 
-The app ships two inference backends and a `mode` toggle on `/import`:
+TRIBE needs a GPU, so two backends sit behind the same contract:
 
-- **`real`** — actually runs TRIBE v2 on the downloaded `.mp4`. Predictions
-  are grounded in the video's frames + audio.
-- **`mock`** (default in the UI) — runs `MockBackend`
-  (`services/inference/neural_media_inference/backend.py:53`), which is
-  **a sine wave per cortical vertex seeded by `SHA-256(video_id, seed)`.**
+- **`real`** — actually runs TRIBE v2 on the downloaded segment. Predictions
+  are grounded in the clip's frames + audio. This is what the deployed
+  HuggingFace Space runs.
+- **`mock`** — `MockBackend`
+  (`services/inference/neural_media_inference/backend.py`), **a sine wave per
+  cortical vertex seeded by `SHA-256(video_id, seed)`.** No GPU, no network, no
+  model weights. It powers the tests, local dev
+  (`services/hf-space/mock_local.py`), and the gallery-bake fallback when a
+  real run isn't available.
 
 In mock mode:
 
@@ -58,25 +62,25 @@ In mock mode:
 - Feeding the same URL twice produces byte-identical activations,
   regardless of whether the underlying video ever existed.
 
-This is intentional: mock mode exercises the full pipeline plumbing
-(parse → schedule → aggregate → API → UI) without yt-dlp or GPU. It is
-the right tool for testing, demos of the *system architecture*, and any
-case where the integrity of the prediction does not matter.
+This is intentional: mock mode exercises the full plumbing — fetch → infer →
+aggregate → callback → 3D render — without a GPU, and makes the example gallery
+bulletproof. It is the right tool for tests, system demos, and any case where
+the integrity of the *prediction* does not matter.
 
-It is **not** a prediction about the user's videos. Specifically:
+It is **not** a prediction about the video's actual content. Specifically:
 
-- Mock-mode region bars and brain-mesh colors are honest aggregations
-  of dishonest inputs. The reduction math is correct; the vertex values
-  being reduced are URL-hash sine waves.
-- The reproducibility envelope (CONTRACTS.md §9) still records
-  everything correctly — `model_id="tribe-v2-mock"` is the truth signal.
-  Any consumer that shows mock outputs as if they were real predictions
-  is mis-labeling.
+- Mock region bars and brain-mesh colors are honest aggregations of dishonest
+  inputs. The reduction math is correct; the vertex values being reduced are
+  URL-hash sine waves.
+- The reproducibility envelope (CONTRACTS.md §9) still records everything
+  correctly — a `modelVersion` / `model_id` beginning `tribe-v2-mock` is the
+  truth signal. Any consumer that shows mock output as a real prediction is
+  mis-labeling.
 
-**UI requirement:** wherever the dashboard or any other view renders
-data backed by an `InferenceRun` with `model_id` beginning `tribe-v2-mock`,
-the user must see a visible label saying so. The frontend-dashboard
-worker owns this label; do not strip it.
+**UI requirement:** wherever the app (the live page or a gallery entry) renders
+data produced by the mock backend — a result whose `modelVersion` / `model_id`
+begins `tribe-v2-mock` — the user must see a visible label saying so. The
+frontend owns this label; do not strip it.
 
 ## Reproducibility envelope
 
@@ -88,13 +92,18 @@ Every `InferenceRun` MUST log:
 - TRIBE configuration hash
 - wallclock timestamp (UTC)
 
-This is enforced at the runner level — see CONTRACTS.md §8.
+This is enforced at the runner level — see CONTRACTS.md §9.
 
 ## Privacy
 
-- The pipeline runs entirely on-device.
-- Watch history never leaves the machine.
-- The app does not embed analytics SDKs or telemetry. If a worker is
-  tempted to add one, instead open an issue.
-- The downloaded videos directory (`data/videos/`) is `.gitignore`d. Do
-  not commit user data.
+- No accounts, logins, or stored user history — the only input is a YouTube
+  URL and a start/end time.
+- The live path runs in the cloud: the HuggingFace Space fetches **only** the
+  selected `[startSec, endSec)` segment, runs TRIBE, and returns the small
+  per-region result. The downloaded segment lives in a temporary working
+  directory that is deleted when the job finishes; only the derived activation
+  JSON is persisted (S3 + DynamoDB) so the browser can poll for it.
+- The app embeds no analytics SDKs or telemetry. If a worker is tempted to add
+  one, open an issue instead.
+- The precomputed gallery ships no user data at all — it is static JSON baked
+  offline from a fixed set of example clips.

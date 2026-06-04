@@ -1,21 +1,22 @@
 # Real-mode setup — fresh GPU box to first inference
 
-**Audience:** the user who wants to run TRIBE v2 against their TikTok
-history without a local NVIDIA GPU, on a Linux cloud box, from scratch.
+**Audience:** the user who wants to run TRIBE v2 against a few YouTube clip
+segments — to verify the model and bake the demo gallery — without a local
+NVIDIA GPU, on a Linux cloud box, from scratch.
 
 **Time:** ~25 minutes elapsed (most of it is the HuggingFace cache warm-up
 on the first run), ~10 minutes of attention.
 
-**Estimated cost:** under \$0.30 to process a 30-video demo (1 hour of
-watch history). Hourly GPU rentals dominate; cleanup is on you.
+**Estimated cost:** under \$0.30 to verify one clip and bake an ~8-clip
+gallery. Hourly GPU rentals dominate; cleanup is on you.
 
 Before you start, verify the local-only pieces work in mock mode — see
-the root [`README.md`](../README.md). Real mode does not change the
-frontend or the importer; it only swaps the inference backend.
+the root [`README.md`](../README.md). Real mode only swaps the inference
+backend; the download → ffmpeg → aggregate path is unchanged.
 
 ## 1. Pick a cloud GPU provider
 
-TRIBE v2 needs an NVIDIA GPU with **≥ 10 GB VRAM** (`scripts/validate_real_mode.py`
+TRIBE v2 needs an NVIDIA GPU with **≥ 10 GB VRAM** (`services/inference/scripts/validate_real_mode.py`
 enforces this). The safe default for a demo is **24 GB** (RTX 3090 / 4090
 / L40 / A100), which leaves headroom for the V-JEPA 2 video encoder, the
 Wav2Vec-BERT audio encoder, and the LLaMA-3.2-3B language head co-resident.
@@ -59,8 +60,9 @@ pip install -U pip yt-dlp huggingface_hub
 ```
 
 `ffmpeg` is what TRIBE's `moviepy` preprocessor shells out to for frame
-extraction. `yt-dlp` is what the data-pipeline uses to fetch TikTok
-videos. Both are checked by `validate_real_mode.py`.
+extraction. `yt-dlp` is what the clip-fetcher uses to download each
+YouTube segment (`--download-sections`). Both are checked by
+`validate_real_mode.py`.
 
 ## 4. Clone Neural Media + install the [real] extra
 
@@ -136,81 +138,79 @@ Neural Media — real-mode pre-flight
   ✓ Public repo reachable: facebook/vjepa2-vitg-fpc64-256     HTTP 307
   ✓ Public repo reachable: facebook/w2v-bert-2.0              HTTP 307
   ✓ GPU available with >= 10 GB VRAM                          NVIDIA GeForce RTX 3090, 24.0 GB
+  ✓ Disk headroom >= 25 GB (HF cache)                         312.0 GB free at /root/.cache/huggingface
   ✓ Tool on PATH: ffmpeg                                      /usr/bin/ffmpeg
   ✓ Tool on PATH: yt-dlp                                      /usr/local/bin/yt-dlp
-  ✓ yt-dlp share-URL extractor                                exit 0 on https://www.tiktokv.com/share/video/7640163791312801054/
+  ✓ yt-dlp YouTube extractor                                  exit 0 on https://www.youtube.com/watch?v=dQw4w9WgXcQ
 
 All checks passed. Real-mode inference should run end-to-end.
 ```
 
-If a check fails the script prints a copy-pasteable remediation and
-exits non-zero. Run it again after each fix; it short-circuits on the
-first failure so you only fix one thing at a time.
+The script runs **every** check and prints the full ✓/✗ table, then a
+consolidated remediation block for any failures, and exits non-zero — so
+you see everything to fix in one pass. Add `--skip-network` for an offline
+subset (deps, GPU, disk, tools only).
 
-## 7. Run the pipeline against your TikTok export
+## 7. Smoke one clip → dry-run the list → bake
 
-Copy your `Watch History.txt` (or `user_data.json`, or the full export
-zip) onto the box via `scp`, then:
+The product is a YouTube URL + a `[startSec, endSec)` segment
+(`shared/CONTRACTS.md` §13), so there's no TikTok export to ingest. Walk
+the gates in order — each is cheaper than the next:
 
 ```bash
-make init-db
-python -m neural_media_pipeline \
-  --hours 1 \
-  --purge-after-inference \
-  --no-mock \
-  /root/Watch\ History.txt
+# (b) Smoke ONE ~5s clip end-to-end (download → ffmpeg → TRIBE → aggregate).
+#     The first run warms the HuggingFace weight cache (~12 GB, ~6 min on a
+#     1 Gbps box — that's why §6 checks for >= 25 GB free).
+python scripts/smoke_gpu_clip.py
+
+# (c) Validate the whole curated clip list (GPU-free): each entry's YouTube
+#     URL + segment against the contract. Must be all-PASS.
+python scripts/build_demo_gallery.py --dry-run
+
+# (d) Bake the real gallery — fetches only each clip's [startSec, endSec)
+#     via yt-dlp --download-sections, then runs TRIBE per segment.
+python scripts/build_demo_gallery.py
 ```
 
-What happens on the first run:
-
-1. **HuggingFace cache warms.** TRIBE downloads its weights, then the
-   transitive Llama / V-JEPA 2 / Wav2Vec-BERT weights. ~12 GB total to
-   `~/.cache/huggingface/`. **~6 minutes on a 1 Gbps box.** Provision at
-   least 30 GB of disk.
-2. **yt-dlp downloads** the videos from the time window, one every
-   ~2 seconds against TikTok's rate limit (`--hours 1` is ~30 videos =
-   ~1 minute of downloads).
-3. **TRIBE runs the forward pass** per video. Per-video wall time on a
-   24 GB 3090 is ~12 seconds (~6 minutes for 30 videos).
-4. **`--purge-after-inference`** deletes each raw and preprocessed .mp4
-   the moment its `RegionMetrics` land. Peak transient disk is ~10 MB
-   regardless of batch size; the SQLite catalogue + activation NPZs are
-   what you keep.
-
-For a 30-video demo: ~13 minutes wall clock end-to-end, ~5 GB peak GPU
-memory in use, ~12 GB of HuggingFace cache on disk (one-time, reused on
-subsequent runs).
+Per-segment wall time on a 24 GB 3090 is ~12 s of TRIBE forward pass plus
+the segment download; an 8-clip gallery is a few minutes end-to-end. The
+weight cache is one-time and reused on subsequent runs. The full
+verification checklist (output range, vertex ordering, determinism) lives
+in [`gpu-verification-and-gallery-bake.md`](gpu-verification-and-gallery-bake.md).
 
 ## 8. Verify, then tear down
 
+The bake writes `apps/web/public/demo-predictions/<slug>.json` + `index.json`.
+Confirm each carries the **real** model tag, not the mock sentinel:
+
 ```bash
-make dev-api &                          # local API on 127.0.0.1:8000
-curl http://127.0.0.1:8000/videos | jq  # confirm rows landed
+jq -r '.modelVersion' apps/web/public/demo-predictions/*.json | sort -u
+# expect a real tag (e.g. tribe-v2@<hash>), NOT tribe-v2-mock-gallery
 ```
 
-Forward the API port via SSH (`ssh -L 8000:127.0.0.1:8000 root@<ip>`)
-and load the dashboard from your laptop browser to validate the full
-trip end-to-end.
+Pull the JSON off the box (they're small — `scp`, or commit from the box),
+then locally `pnpm --dir apps/web dev` and open `/gallery` to confirm the
+brain animates against real output.
 
 When you're done **stop or destroy the instance** — GPU hours bill by
 the minute, and a forgotten 3090 is ~\$160/month. RunPod's "stop"
-preserves the volume so the next run skips step 4–5; full destroy
+preserves the volume so the next run skips steps 4–5; full destroy
 preserves nothing.
 
 ## Cost worked example
 
-A 30-video demo on a \$0.22/hr RTX 3090:
+Verifying one clip + baking an ~8-clip gallery on a \$0.22/hr RTX 3090:
 
 | Step                                  | Wall time | Cost     |
 |---------------------------------------|-----------|----------|
 | Provisioning + apt-installs           | ~3 min    | \$0.011  |
 | `pip install -e [real]` (one-time)    | ~3 min    | \$0.011  |
 | HF cache warm (one-time)              | ~6 min    | \$0.022  |
-| yt-dlp download (30 videos)           | ~1 min    | \$0.004  |
-| TRIBE forward pass (30 videos)        | ~6 min    | \$0.022  |
+| Smoke clip + yt-dlp segment fetches   | ~1 min    | \$0.004  |
+| TRIBE forward pass (~8 segments)      | ~2 min    | \$0.007  |
 | Verify + teardown                     | ~2 min    | \$0.007  |
-| **Total first run**                   | ~21 min   | **\$0.077** |
-| **Subsequent runs (HF cache reused)** | ~9 min    | **\$0.033** |
+| **Total first run**                   | ~17 min   | **\$0.062** |
+| **Subsequent runs (HF cache reused)** | ~5 min    | **\$0.018** |
 
 Realistically budget \$0.30 for the first session including the
 inevitable "wait, did I accept the license?" moment.

@@ -94,3 +94,53 @@ def test_build_mock_only_is_deterministic(gallery, tmp_path, monkeypatch) -> Non
     for demo in gallery.DEMO_ENTRIES:
         slug = gallery.slugify(demo.label)
         assert (out_a / f"{slug}.json").read_text() == (out_b / f"{slug}.json").read_text()
+
+
+# ---------------------------------------------------------------------------
+# --dry-run validation gate
+# ---------------------------------------------------------------------------
+
+def test_dry_run_fails_on_placeholders(gallery, capsys) -> None:
+    """The shipped DEMO_ENTRIES are REPLACE_ME placeholders, so --dry-run
+    must FAIL (nonzero) until the real clip list is wired — that's the gate
+    that stops a bad list reaching the GPU bake."""
+    rc = gallery.dry_run()  # default = the placeholder DEMO_ENTRIES
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "FAIL" in out
+    assert "invalid_url" in out
+
+
+def test_dry_run_passes_on_valid_entries(gallery, capsys) -> None:
+    valid = (
+        gallery.DemoEntry(
+            label="ok-watch", url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            startSec=0.0, endSec=10.0,
+        ),
+        gallery.DemoEntry(
+            label="ok-shortlink", url="https://youtu.be/dQw4w9WgXcQ",
+            startSec=5.0, endSec=20.0,
+        ),
+    )
+    rc = gallery.dry_run(valid)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "2/2 PASS" in out
+
+
+def test_dry_run_flags_bad_and_oversized_segments(gallery, capsys) -> None:
+    entries = (
+        gallery.DemoEntry(  # start >= end -> bad_segment
+            label="reversed", url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            startSec=30.0, endSec=10.0,
+        ),
+        gallery.DemoEntry(  # > 90s -> segment_too_long
+            label="too-long", url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            startSec=0.0, endSec=200.0,
+        ),
+    )
+    rc = gallery.dry_run(entries)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "bad_segment" in out
+    assert "segment_too_long" in out

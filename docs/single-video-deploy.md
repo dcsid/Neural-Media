@@ -1,172 +1,172 @@
 # Single-Video Pipeline — Deployment Runbook
 
-This is the from-scratch deploy of the **v2 single-video architecture**:
-a user pastes a TikTok URL into the web app, an AWS API Gateway routes
-the request through a Lambda chain to a HuggingFace Space that runs the
-real TRIBE model, and the results land in S3 + DynamoDB and surface back
-in the browser.
+From-scratch deploy of the **v2 single-video architecture**: a user pastes a
+**YouTube URL** and picks a **≤90-second segment**; an AWS API Gateway routes
+the request through a Lambda chain to a HuggingFace Space that runs TRIBE on
+just that window; results land in S3 + DynamoDB and surface back in the browser.
 
-**You do not need to know AWS to follow this.** Every step lists the
-exact commands or the exact console clicks. If you get stuck at a step,
-the troubleshooting block underneath usually has the answer.
+**You do not need to know AWS to follow this.** Every step is a copy-pasteable
+command. Do them **in order** — later steps consume values produced by earlier
+ones. If a step fails, its troubleshooting block usually has the fix.
 
 ```
 [Browser /single page]
-     │
-     │ POST /v2/jobs { url }
+     │  POST /v2/jobs { url, startSec, endSec }
      ▼
-[API Gateway] ──► [Lambda jobs_create] ──► [DynamoDB jobs table]
-                            │
-                            │ async invoke
-                            ▼
-                    [Lambda jobs_worker] ──► [HF Space /predict]
-                                                    │ (yt-dlp, ffmpeg, TRIBE)
-                                                    │
-[Browser polls GET /v2/jobs/{id}]                   │ POST /v2/internal/hf-callback
-                                                    ▼
-                                              [Lambda hf_callback]
-                                                    │
-                                                    ├──► [S3 results/{id}.json.gz]
-                                                    └──► [DynamoDB] mark done
+[API Gateway HTTP API] ─► [Lambda jobs_create] ─► [DynamoDB jobs table]
+                                   │ async invoke
+                                   ▼
+                           [Lambda jobs_worker] ─► [HF Space POST /predict]
+                                                        │  yt-dlp --download-sections
+                                                        │  ffmpeg + TRIBE (segment only)
+[Browser polls GET /v2/jobs/{id}]                       │  POST /v2/internal/hf-callback
+                                                        ▼      (header X-NM-Token: <secret>)
+                                                  [Lambda hf_callback]
+                                                        ├─► [S3 results/{id}.json.gz]
+                                                        └─► [DynamoDB] status=done
 ```
 
-If you only want to run this locally (no AWS account, no HuggingFace
-account) read `infra/aws/sam-local.md` instead — that path costs $0 and
-takes about 10 minutes.
+> Want the $0, no-account local loop instead? See
+> [`infra/aws/sam-local.md`](../infra/aws/sam-local.md).
 
 ---
 
 ## Prerequisites
 
-Install once. Each link is the upstream install doc; the bracketed
-command is the macOS happy path.
+| Tool | Install (macOS) | Why |
+|------|-----------------|-----|
+| AWS CLI v2 | `brew install awscli` | Provisions + queries every AWS resource |
+| SAM CLI | `brew install aws-sam-cli` | Wraps CloudFormation for the Lambda/API-Gateway stack |
+| HuggingFace CLI | `pipx install "huggingface_hub[cli]"` | Pushes the Space repo |
+| Node 20+ & pnpm | `brew install node pnpm` | Builds the web app |
+| `git`, `rsync`, `curl`, `jq` | (preinstalled / `brew install jq`) | Space staging + the smoke test |
 
-| Tool                  | Why                                                              |
-|-----------------------|------------------------------------------------------------------|
-| [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) `[brew install awscli]`           | Provisions every AWS resource below |
-| [SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html) `[brew install aws/tap/aws-sam-cli]` | Wraps CloudFormation for the Lambda + API Gateway template |
-| [HuggingFace CLI](https://huggingface.co/docs/huggingface_hub/installation) `[pipx install huggingface_hub[cli]]` | Pushes the Space repo                |
-| [pnpm](https://pnpm.io/installation) `[brew install pnpm]`                       | Builds the Next.js web app           |
-| [Vercel CLI](https://vercel.com/docs/cli) (optional) `[pnpm i -g vercel]`        | Deploys the web app                  |
-| [Docker Desktop](https://www.docker.com/products/docker-desktop/) `[brew install --cask docker]` | Required by SAM for container builds |
+Docker is **not** required — `sam build` packages these pure-Python Lambdas by
+copying source (there's no `requirements.txt`). You only need Docker for
+`sam local`.
 
-Accounts you need before starting:
-
-- **AWS** account with billing enabled. The whole demo fits in the
-  free tier; the $5 alarm in step 4 is your insurance.
-- **HuggingFace** account with at least one Space created. Free CPU tier
-  works for the mock-resolution demo; A10G or A100 is needed for full TRIBE.
-- **Vercel** account if you go with Vercel for the frontend. Skip if
-  you'd rather host on S3 + CloudFront (covered in step 5).
-
-Verify the CLI tools are wired:
+Verify your CLIs are wired up:
 
 ```bash
-aws sts get-caller-identity      # should print your account id
-sam --version                    # 1.115+ recommended
+aws sts get-caller-identity      # prints your AWS account id
+sam --version                    # 1.115+
 hf whoami                        # prints your HF username
-node --version                   # 20.x
-pnpm --version                   # 9.x
+node --version                   # v20+
+```
+
+Pick a region and **stick with it** for the whole runbook:
+
+```bash
+export AWS_REGION=us-east-1       # cheapest; the $5 billing alarm only emits here
+export STAGE=dev
+export STACK=neural-media-aws     # matches infra/aws/samconfig.toml
 ```
 
 ---
 
-## Step 1 — Create and deploy the HuggingFace Space
+## Step 1 — Deploy the HuggingFace Space (the GPU box)
 
-This is the box that actually runs TRIBE. Pushing it before AWS makes
-the AWS step simpler (the Space URL exists when you populate SSM in
-step 2).
+The Space must exist first, because its URL is a deploy parameter for AWS in
+Step 3.
 
-1. **Create the Space.** Go to <https://huggingface.co/new-space>:
-   - Owner: your username
-   - Space name: `neural-media-tribe` (or similar — note what you pick)
-   - License: cc-by-nc-4.0
-   - SDK: **Docker**
-   - Hardware: **CPU basic** to get going (free); upgrade to A10G later
-     if you want real inference speed
-   - Visibility: Public is fine for the demo. The callback secret in
-     step 2 is the auth layer.
+### 1a. Create the Space
 
-2. **Set the callback secret env var.** In the Space's *Settings →
-   Variables and secrets*:
-   - New secret, name `CALLBACK_SHARED_SECRET`, value: any 32-char
-     random string. Generate with `openssl rand -base64 24`. **Save
-     this value** — it goes into SSM in step 2.
+<https://huggingface.co/new-space>:
 
-3. **Push the code.** From the repo root:
+- **Owner**: your username
+- **Space name**: `neural-media-tribe` (note what you pick)
+- **SDK**: **Docker**
+- **Hardware**: CPU basic to start (free); upgrade to A10G for real-time TRIBE
+- **License**: `cc-by-nc-4.0`
+- **Visibility**: Public is fine — the callback secret (Step 1b) is the auth layer.
 
-   ```bash
-   cd services/hf-space
-   git init -b main                           # if not already
-   hf auth login                              # opens a browser
-   git remote add hf https://huggingface.co/spaces/<your-user>/neural-media-tribe
-   git add -A
-   git commit -m "Deploy single-video Space"
-   git push hf main
-   ```
+### 1b. Generate the shared callback secret
 
-   The Space rebuilds automatically (the first build takes ~10 min
-   because it pulls TRIBE weights). Watch the Build logs tab.
+This one value is shared by **two** parties: the AWS side stores it in SSM
+(Step 2), the Space stores it as a secret. Generate it once now:
 
-4. **Confirm it's up.** When the Build logs end with "Application
-   startup complete", visit:
+```bash
+export NM_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+echo "callback secret = $NM_SECRET"   # save it; you paste it twice
+```
 
-   ```
-   https://<your-user>-neural-media-tribe.hf.space/health
-   ```
+In the Space's **Settings → Variables and secrets**, add a **secret**:
 
-   You should see `{"status":"ok"}`. **Write down that URL** — it goes
-   into SSM in step 2 too. The shape is `https://<user>-<space>.hf.space`
-   with the `/` between user and space replaced by `-` and any uppercase
-   lowercased. Spaces will redirect from the canonical URL if you get
-   it slightly wrong.
+- Name: `CALLBACK_SHARED_SECRET`
+- Value: the `$NM_SECRET` value above
 
-If the build fails, the most common cause is a missing dependency in
-`services/hf-space/requirements.txt`. T2 owns that file — open an issue
-with the Space's build log attached.
+(The Space refuses every `/predict` request until this is set.)
 
-> **Sanity tip:** `make deploy-hf-space` prints these same commands so
-> you don't have to come back here when re-pushing.
+### 1c. Push the code
+
+The Space image needs three monorepo trees: `services/hf-space/` (app),
+`services/inference/` (the TRIBE wrapper + region masks), and `shared/` (the
+contracts package). Stage them together and push. From the monorepo root:
+
+```bash
+export HF_USER="$(hf whoami | head -1)"
+export HF_SPACE="neural-media-tribe"
+
+STAGE_DIR="$(mktemp -d)"
+rsync -a --delete services/hf-space/  "$STAGE_DIR/"
+mkdir -p "$STAGE_DIR/services"
+rsync -a --delete services/inference/ "$STAGE_DIR/services/inference/"
+rsync -a --delete shared/             "$STAGE_DIR/shared/"
+
+cd "$STAGE_DIR"
+git init -q
+hf auth login                                  # opens a browser, one-time
+git remote add space "https://huggingface.co/spaces/${HF_USER}/${HF_SPACE}"
+git add -A
+git -c user.email=deploy@neural-media -c user.name=deploy \
+    commit -q -m "deploy $(date -u +%Y%m%dT%H%M%SZ)"
+git push -f space HEAD:main
+cd -
+```
+
+HF rebuilds automatically (first build ~10 min — it pulls TRIBE weights). Watch
+the **Build logs** tab. When it ends with "Application startup complete":
+
+```bash
+export HF_SPACE_URL="https://${HF_USER}-${HF_SPACE}.hf.space"
+curl -sf "${HF_SPACE_URL}/healthz" && echo " ✓ Space is up"
+```
+
+The URL shape is `https://<user>-<space>.hf.space` (the `/` between user and
+space becomes `-`, everything lowercased). **Keep `$HF_SPACE_URL`** — Step 3
+needs it.
+
+> Build fails? Almost always a missing dep in `services/hf-space/requirements.txt`
+> (owned by the HF-Space worker). Attach the build log when you report it.
 
 ---
 
-## Step 2 — Store the callback secret in AWS Systems Manager Parameter Store
+## Step 2 — Store the callback secret in AWS SSM Parameter Store
 
-The SAM template resolves the callback secret from SSM at deploy time
-(via `{{resolve:ssm-secure:…}}`) so it never appears in the
-CloudFormation template body. The HF Space URL is different — it goes
-straight into `sam deploy` as a plain CloudFormation parameter in
-Step 3, no SSM round-trip — so this step only writes the secret.
-
-> The `Stage` parameter is a separate axis from the SSM path, so the
-> default SSM name has no `/dev/` segment. Keep one secret entry per
-> rotation generation, not per stage.
+The `jobs_worker` and `hf_callback` Lambdas fetch this secret **at cold start**
+via `ssm:GetParameter` (it is *not* baked into the template — see
+`infra/aws/lambdas/shared/__init__.py:get_callback_secret`). Write the same
+value you gave the Space:
 
 ```bash
-# Pick a region and stick with it for the whole runbook. us-east-1 is
-# cheapest and has every service we use.
-export AWS_REGION=us-east-1
-
 aws ssm put-parameter \
   --region "$AWS_REGION" \
   --name /neural-media/hf-callback-secret \
   --type SecureString \
-  --value "<the same value you set as CALLBACK_SHARED_SECRET in step 1>" \
-  --overwrite
+  --value "$NM_SECRET"
 ```
 
-`SecureString` encrypts at rest with the default `aws/ssm` KMS key — free.
-Verify:
+`SecureString` encrypts at rest with the free default `aws/ssm` KMS key. The
+**first write creates version 1** — that's the `HFCallbackSecretSsmVersion`
+you pass in Step 3. Verify:
 
 ```bash
-aws ssm get-parameter --name /neural-media/hf-callback-secret --with-decryption
+aws ssm get-parameter --region "$AWS_REGION" \
+  --name /neural-media/hf-callback-secret --with-decryption \
+  --query 'Parameter.Value' --output text     # should echo $NM_SECRET
 ```
 
-The call should return the secret in plaintext. If it does not, your IAM
-user is missing `ssm:GetParameter` + `kms:Decrypt` — add them.
-
-Note the HF Space URL from Step 1 — you'll paste it into
-`sam deploy --guided` as the `HFSpaceUrl` parameter in the next step.
+If this errors, your IAM principal is missing `ssm:GetParameter` + `kms:Decrypt`.
 
 ---
 
@@ -175,274 +175,223 @@ Note the HF Space URL from Step 1 — you'll paste it into
 ```bash
 cd infra/aws
 sam build
-sam deploy --guided
+sam deploy --guided        # first time only; saves answers to samconfig.toml
 ```
 
-The `--guided` flow asks a sequence of questions. Sensible answers:
+Answers for the `--guided` prompts:
 
-| Prompt                                          | Answer                                  |
-|-------------------------------------------------|-----------------------------------------|
-| Stack Name                                      | `neural-media-dev`                      |
-| AWS Region                                      | `us-east-1`                             |
-| Confirm changes before deploy                   | `y` (review each time)                  |
-| Allow SAM CLI IAM role creation                 | `y` (creates the Lambda execution role) |
-| Disable rollback                                | `n`                                     |
-| `Stage` parameter                               | `dev` (slug used in resource names)     |
-| `HFSpaceUrl` parameter                          | the `https://<user>-<space>.hf.space` URL from Step 1, no trailing path — `jobs_worker` appends `/predict` itself |
-| `FrontendOrigin` parameter                      | the deployed web app origin (e.g. `https://neural-media.vercel.app`); `http://localhost:3000` is always allowed in addition |
-| `HFCallbackSecretSsmName` parameter             | `/neural-media/hf-callback-secret` (the name you used in Step 2) |
-| `HFCallbackSecretSsmVersion` parameter          | `1` (bump on rotation; CFN requires an explicit version for `ssm-secure` refs) |
-| `BillingAlarmEmail` parameter                   | the email to subscribe to the $5 alarm — leave blank to skip, see Step 4 |
-| `JobsCreate` may not have authorization defined | `y` (intentional — public POST)         |
-| Save arguments to configuration file            | `y` → `samconfig.toml`                  |
+| Prompt | Answer |
+|--------|--------|
+| Stack Name | `neural-media-aws` |
+| AWS Region | `us-east-1` |
+| `Stage` | `dev` |
+| `HFSpaceUrl` | your `$HF_SPACE_URL` from Step 1 — base only, **no** `/predict` (the worker appends it) |
+| `FrontendOrigin` | the deployed web origin (Step 5). Unknown on first deploy → use `http://localhost:3000` now and re-deploy after Step 5 |
+| `HFCallbackSecretSsmName` | `/neural-media/hf-callback-secret` |
+| `HFCallbackSecretSsmVersion` | `1` (the version from Step 2; bump on rotation) |
+| `BillingAlarmEmail` | your email (or blank to subscribe later in Step 4) |
+| Confirm changes before deploy | `y` |
+| Allow SAM CLI IAM role creation | `y` |
+| `JobsCreate*` may not have authorization defined | `y` (intentional — public POST) |
+| Save arguments to configuration file | `y` |
 
-Wait ~3-5 minutes. The final output lists the resources; the bit you
-need is **Outputs.ApiEndpoint** — something like
+Deploy takes ~3–5 min. Capture the **API base URL** from the outputs:
 
+```bash
+export API_BASE="$(aws cloudformation describe-stacks --region "$AWS_REGION" \
+  --stack-name "$STACK" \
+  --query "Stacks[0].Outputs[?OutputKey=='ApiEndpoint'].OutputValue" --output text)"
+echo "API_BASE = $API_BASE"     # e.g. https://abc123.execute-api.us-east-1.amazonaws.com/dev
 ```
-https://abc123xyz.execute-api.us-east-1.amazonaws.com/dev
-```
 
-That is `$API_BASE` for the rest of the runbook.
+> **Re-deploys** after the first: `sam build && sam deploy` (no `--guided`).
 
-> **Re-deploys** after this point: `make deploy-aws` (no `--guided`).
-> The `samconfig.toml` file remembers your answers.
+This single stack creates **5 Lambdas** (`neural-media-${STAGE}-…`):
 
-If the deploy fails:
+| Function | Route | Role |
+|----------|-------|------|
+| `jobs-create` | `POST /v2/jobs` | Validate `{url,startSec,endSec}`, write the job, async-invoke the worker |
+| `jobs-upload` | `POST /v2/jobs/upload` + `…/{id}/confirm` | Presigned MP4 upload path (whole-file, no segment) |
+| `jobs-worker` | *(async-invoked)* | POST `${HF_SPACE_URL}/predict` with the segment + callback token |
+| `jobs-status` | `GET /v2/jobs/{id}` | Read DynamoDB; presign the `results/` object on `done` |
+| `hf-callback` | `POST /v2/internal/hf-callback` | Verify `X-NM-Token`, write `results/`, mark `done` |
 
-- *"Resource creation cancelled"* → CloudFormation rolled back. Run
-  `aws cloudformation describe-stack-events --stack-name neural-media-dev`
-  to find the actual error (it's the *first* FAILED event, not the
-  last one).
-- *"S3 bucket does not exist"* — SAM stages artifacts in an S3 bucket.
-  Run `sam deploy --guided` again and answer `y` to "Create managed
-  artifact bucket".
-- *"Cannot find module ..."* in a Lambda — T3's `requirements.txt`
-  is missing the dep. File a bug with the CloudWatch error.
+plus `JobsTable` (DynamoDB), `ResultsBucket` (S3), the HTTP API, and the billing
+alarm. `jobs_worker` is pointed at the Space purely by the `HFSpaceUrl`
+parameter (→ `HF_SPACE_URL` env var).
+
+**If the deploy fails:** find the *first* `FAILED` event (not the last) with
+`aws cloudformation describe-stack-events --region "$AWS_REGION" --stack-name "$STACK"`.
 
 ---
 
-## Step 4 — ⚠️ Verify the $5 billing alarm (do not skip)
+## Step 4 — Verify the $5 billing alarm (do not skip)
 
-A misconfigured Lambda or HF Space callback loop can rack up real money
-in real hours. The SAM template you deployed in Step 3 **already
-provisions** the alarm, an SNS topic, and (if you supplied
-`BillingAlarmEmail`) an email subscription:
-
-- `BillingAlarm` (CloudWatch) — fires when `AWS/Billing > EstimatedCharges` exceeds `$5` for one 6-hour period
-- `BillingAlarmTopic` (SNS) — the notification fan-out
-- `BillingAlarmEmailSubscription` (SNS) — only created when you set the `BillingAlarmEmail` parameter; otherwise subscribe by hand below
-
-> The alarm metric only emits in `us-east-1` regardless of where your
-> resources actually live. If you deployed the stack to another region,
-> the template won't have an alarm — re-run `sam deploy` with
-> `--region us-east-1` (or live with manually creating the alarm there
-> using the recipe in this doc's git history).
-
-### 4a — One-time: enable billing alerts on the account
-
-If you have never received an AWS billing alert before, flip the
-account-wide switch first: AWS Console → Billing → Billing preferences
-→ check **"Receive Billing Alerts"** → Save preferences. There is no
-CLI for this; it's an Org Billing toggle. Without it the alarm fires
-but the metric stays at `INSUFFICIENT_DATA` forever.
-
-### 4b — Verify the alarm exists
+The template already provisions a CloudWatch alarm + SNS topic. One account-wide
+toggle is required for the metric to flow: **AWS Console → Billing → Billing
+preferences → enable "Receive Billing Alerts"** (no CLI for this). Then:
 
 ```bash
-aws cloudwatch describe-alarms \
-  --region us-east-1 \
-  --alarm-names "neural-media-${STAGE:-dev}-billing-over-5-usd" \
-  --query 'MetricAlarms[0].StateValue'
+aws cloudwatch describe-alarms --region us-east-1 \
+  --alarm-names "neural-media-${STAGE}-billing-over-5-usd" \
+  --query 'MetricAlarms[0].StateValue' --output text     # OK or INSUFFICIENT_DATA
 ```
 
-Expect `"INSUFFICIENT_DATA"` (no spend yet) or `"OK"`. If the call
-returns an empty result, the deploy didn't land the alarm — re-check
-the region and the stack output.
-
-### 4c — Subscribe an email if you skipped `BillingAlarmEmail`
-
-If you left the `BillingAlarmEmail` parameter blank in Step 3, the
-SNS topic exists but has no subscribers. Add one:
+If you left `BillingAlarmEmail` blank, subscribe now:
 
 ```bash
-TOPIC_ARN=$(aws cloudformation describe-stacks \
-  --region us-east-1 \
-  --stack-name neural-media-dev \
-  --query "Stacks[0].Outputs[?OutputKey=='BillingAlarmTopicArn'].OutputValue" \
-  --output text)
-
-aws sns subscribe \
-  --region us-east-1 \
-  --topic-arn "$TOPIC_ARN" \
-  --protocol email \
-  --notification-endpoint <your-email@example.com>
+TOPIC_ARN="$(aws cloudformation describe-stacks --region us-east-1 \
+  --stack-name "$STACK" \
+  --query "Stacks[0].Outputs[?OutputKey=='BillingAlarmTopicArn'].OutputValue" --output text)"
+aws sns subscribe --region us-east-1 --topic-arn "$TOPIC_ARN" \
+  --protocol email --notification-endpoint you@example.com
+# …then click the "Confirm subscription" link in your inbox.
 ```
-
-You'll get a confirmation email. **Click the "Confirm subscription"
-link** — without it the alarm fires but no email goes out.
-
-Alternatively, re-run `sam deploy --parameter-overrides BillingAlarmEmail=<your-email@example.com>` and CFN will create the subscription for you.
 
 ---
 
-## Step 5 — Deploy the web app
+## Step 5 — Host the web app on S3 + CloudFront
 
-Two paths. Pick by which infra you'd rather pay for.
+The web app is a static client bundle that talks **only** to `$API_BASE` (no
+Next.js server routes on the hot path), so it hosts cleanly on S3 + CloudFront.
 
-### Option A — Vercel (recommended for the first deploy)
+> **Prerequisite (frontend-owned):** static export requires
+> `output: 'export'` in `apps/web/next.config.ts` (and moving the security
+> headers to a CloudFront response-headers policy, since `headers()` is a
+> server feature). As of this writing `next.config.ts` does **not** set it —
+> coordinate with the frontend worker before this step. With `output: 'export'`,
+> `next build` writes the static site to `apps/web/out/`.
 
-```bash
-cd apps/web
-cp .env.example .env.production
-# Edit .env.production: NEXT_PUBLIC_API_BASE_V2=<the ApiEndpoint from step 3>
-vercel link            # one-time, creates .vercel/project.json
-vercel deploy --prod
-```
+### 5a. Build with the API base baked in
 
-Vercel reads `apps/web/.env.production` at build time and inlines
-`NEXT_PUBLIC_*` vars into the client bundle. Output is something like
-`https://neural-media-<hash>.vercel.app`. Open that and paste a TikTok
-URL into the single-video page.
-
-> Vercel's hobby tier is free up to 100 GB/mo bandwidth, well above the
-> demo's needs.
-
-### Option B — S3 + CloudFront (AWS-only)
-
-Next.js 15 removed the standalone `next export` command. Static export
-is now produced by `next build` when `output: 'export'` is set in
-`next.config.ts`:
-
-```ts
-// apps/web/next.config.ts
-const config: NextConfig = {
-  output: 'export',
-  // images.unoptimized = true if you use next/image, otherwise omit
-};
-```
-
-Then:
+`NEXT_PUBLIC_*` vars are inlined at **build** time. The frontend reads
+**`NEXT_PUBLIC_API_BASE_V2`** (`apps/web/lib/api-v2.ts`):
 
 ```bash
 cd apps/web
 pnpm install
-NEXT_PUBLIC_API_BASE_V2=https://abc123xyz.execute-api.us-east-1.amazonaws.com/dev \
-  pnpm next build
-# next build now writes the static site to apps/web/out/
-aws s3 sync out/ s3://neural-media-web-<your-suffix>/ --delete
+NEXT_PUBLIC_API_BASE_V2="$API_BASE" pnpm build    # writes ./out/
+cd -
 ```
 
-Then create a CloudFront distribution pointing at the bucket, default
-root object `index.html`, with an Origin Access Identity. There is no
-1-liner for this — follow
-<https://docs.aws.amazon.com/AmazonS3/latest/userguide/website-hosting-cloudfront-walkthrough.html>
-end to end. Budget 30 minutes the first time.
-
-`output: 'export'` disables every server-side Next.js feature (route
-handlers, server actions, ISR, on-demand revalidation). The
-single-video flow itself works because every API call goes to
-`NEXT_PUBLIC_API_BASE_V2` (the AWS HTTP API) and not to a Next
-server route. If a future route adds server-only behaviour, switch
-back to Option A or host on Lambda@Edge.
-
----
-
-## Step 6 — Smoke test
-
-From the repo root:
+### 5b. Create the bucket + upload
 
 ```bash
-API_BASE=https://abc123xyz.execute-api.us-east-1.amazonaws.com/dev \
-  make smoke-single
+export WEB_BUCKET="neural-media-${STAGE}-web-$(aws sts get-caller-identity --query Account --output text)"
+aws s3 mb "s3://${WEB_BUCKET}" --region "$AWS_REGION"
+aws s3 sync apps/web/out/ "s3://${WEB_BUCKET}/" --delete
 ```
 
-Expected output:
+### 5c. Put CloudFront in front (HTTPS + private bucket)
 
-```
-==> API_BASE = https://abc123xyz.execute-api.us-east-1.amazonaws.com/dev
-==> sample URL = https://www.tiktok.com/@scout2015/video/6718335390845095173
-==> created jobId=01H...
-    status -> pending  (elapsedSec=0)
-    status -> downloading  (elapsedSec=2)
-    status -> inferring  (elapsedSec=12)
-    status -> done  (elapsedSec=47)
-==> fetching resultUrl
-==> result summary
-  videoDurationSec: 6.2
-  modelVersion:     tribe-v2@2.1.0
-  byRegion keys:    auditory, ffa, language, v1, v2, v3, v4, vwfa
-  timestamps[0..2]: [0,0.25,0.5]
-OK
-```
+Create a CloudFront distribution with the S3 bucket as origin, locked down with
+**Origin Access Control** (keep the bucket private), default root object
+`index.html`, and a custom-error response mapping 403/404 → `/index.html` (so
+client routes resolve). There's no one-liner — follow
+<https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/getting-started-secure-static-website-cloudfront.html>.
+Budget ~30 min the first time. Note the distribution domain, e.g.
+`https://d1234abcd.cloudfront.net`.
 
-A run typically takes 60-120s on a free-tier Space. If it errors out:
+### 5d. Close the CORS loop
 
-| Symptom                                       | Likely cause                                                                                   |
-|-----------------------------------------------|------------------------------------------------------------------------------------------------|
-| `status=failed_download` `error=tiktok_blocked` | TikTok rate-limited the Space's IP. Re-run; if persistent, configure a proxy in the Space.    |
-| Polls hit `INSUFFICIENT_DATA` / 5xx           | Check CloudWatch Logs for `jobs_create` — likely the Space URL in SSM is wrong.                |
-| `status=done` but no resultUrl                | `hf_callback` Lambda failed to write S3 — check its CloudWatch logs and IAM role permissions. |
-| Smoke times out at 180s                       | Free-tier Spaces hibernate. Hit `/health` once to warm it, then re-run.                        |
-
-The web app at the Vercel/CloudFront URL should now successfully run
-the same flow when you paste a URL in.
-
----
-
-## Rollback
-
-If you need to tear it all down:
+Re-deploy the API so its CORS allow-list includes the real frontend origin:
 
 ```bash
-# 1. AWS stack
 cd infra/aws
-sam delete --stack-name neural-media-dev          # destroys API GW, Lambdas, DynamoDB, S3 (if empty)
-
-# If S3 has objects, sam delete refuses. Empty it first:
-aws s3 rm s3://<results-bucket-name> --recursive
-sam delete --stack-name neural-media-dev
-
-# 2. SSM parameter (only the secret — the Space URL was never written to SSM)
-aws ssm delete-parameter --name /neural-media/hf-callback-secret
-
-# 3. Billing alarm + SNS topic — already gone if `sam delete` succeeded
-#    above (they're part of the stack). The block below is only for the
-#    legacy case where you created the alarm by hand from an older
-#    version of this runbook.
-# aws cloudwatch delete-alarms --region us-east-1 \
-#   --alarm-names neural-media-billing-over-5usd
-# aws sns delete-topic --region us-east-1 --topic-arn "$TOPIC_ARN"
+sam deploy --parameter-overrides \
+  "Stage=${STAGE} HFSpaceUrl=${HF_SPACE_URL} FrontendOrigin=https://d1234abcd.cloudfront.net \
+   HFCallbackSecretSsmName=/neural-media/hf-callback-secret HFCallbackSecretSsmVersion=1"
+cd -
 ```
 
-Hand-cleanup the following (no CLI for them):
-
-- **The HF Space.** huggingface.co → your Space → Settings → "Delete
-  this Space" at the bottom.
-- **The Vercel project** (if you used Option A). vercel.com → project
-  → Settings → "Delete Project".
-- **CloudWatch Logs.** Each Lambda's log group lingers. They're free
-  for the first 5 GB; delete via console or
-  `aws logs delete-log-group --log-group-name /aws/lambda/<name>`.
-
-After all of the above, your AWS bill for this project should go to
-$0.00 next month.
+(`http://localhost:3000` stays allowed in addition, for local dev.)
 
 ---
 
-## What's next
+## Step 6 — Smoke test the deployment
 
-- The doc above provisions a **dev** environment (`/dev` stage,
-  `neural-media-dev-...` resource names). A staging/prod split would
-  duplicate everything under `/neural-media/prod/...` SSM keys and a
-  `neural-media-prod` stack. Don't bother for the demo.
-- The HF Space currently auto-hibernates on the free tier — first
-  request after a quiet period takes ~30s longer. Upgrade to A10G if
-  the latency bothers you (~$0.60/hr; pause when not demoing).
-- The web app's per-request rate limit is API Gateway's default
-  (10,000 r/s account-wide, 5,000 burst). For the demo this is
-  effectively infinite. If you go public, add a usage plan with an
-  API key.
-- See `infra/aws/sam-local.md` for the iterate-faster local loop. Use
-  it instead of `sam deploy` during development — the redeploy cycle
-  on AWS is 60-90 seconds.
+One command runs the whole chain (create → poll → fetch → assert) against the
+deployed API and prints a clear ✓/✗ per check:
+
+```bash
+scripts/smoke-test-single.sh "$API_BASE"
+```
+
+Expected tail:
+
+```
+  ✓ created job 9f0c…
+    status → pending  (elapsedSec=0)
+    status → downloading  (elapsedSec=4)
+    status → inferring  (elapsedSec=11)
+    status → done  (elapsedSec=46)
+  ✓ job reached status=done
+  ✓ fetched ActivationPayload
+  ✓ videoDurationSec is a number
+  ✓ modelVersion is a string
+  ✓ timestamps is a non-empty number[] (n=120)
+  ✓ byRegion has all 8 regions
+  ✓ every region series is a number[] of length 120
+PASS — single-video pipeline healthy (job 9f0c…)
+```
+
+It exits non-zero on any failure. Tunables (env): `SAMPLE_URL`, `START_SEC`,
+`END_SEC`, `POLL_INTERVAL_SEC`, `TIMEOUT_SEC`. A real run is 60–120 s on a
+free-tier Space.
+
+| Symptom | Likely cause |
+|---------|--------------|
+| `status=failed_download error=download_blocked` | YouTube rate-limited the Space's IP. Re-run; if persistent, set a proxy in the Space. |
+| `status=rejected_duration error=segment_out_of_bounds` | `endSec` exceeds the real video length. Pick a smaller window. |
+| Polls return 5xx | Check `jobs_create` / `jobs_status` CloudWatch logs — usually a wrong `HFSpaceUrl` or a missing SSM secret. |
+| `status=done` but no `resultUrl` | `hf_callback` failed to write S3 — check its logs + IAM. |
+| Times out | Free-tier Spaces hibernate; `curl ${HF_SPACE_URL}/healthz` to warm it, then re-run. |
+
+Finally, open the CloudFront URL and run the same flow from the UI.
+
+---
+
+## Secrets & parameters you must set (checklist)
+
+| Where | Name | Value |
+|-------|------|-------|
+| HF Space secret | `CALLBACK_SHARED_SECRET` | the generated `$NM_SECRET` |
+| AWS SSM (SecureString) | `/neural-media/hf-callback-secret` | the **same** `$NM_SECRET` |
+| `sam deploy` param | `HFSpaceUrl` | `https://<user>-<space>.hf.space` |
+| `sam deploy` param | `FrontendOrigin` | the CloudFront URL (Step 5d) |
+| `sam deploy` param | `HFCallbackSecretSsmVersion` | `1` (bump on rotation) |
+| `sam deploy` param | `BillingAlarmEmail` | optional |
+| Frontend build env | `NEXT_PUBLIC_API_BASE_V2` | the `ApiEndpoint` (`$API_BASE`) |
+
+**Rotating the secret:** `aws ssm put-parameter … --overwrite` (note the new
+version), update the Space's `CALLBACK_SHARED_SECRET` to match, then
+`sam deploy --parameter-overrides HFCallbackSecretSsmVersion=<new>`. There is no
+overlap window — do both sides together.
+
+---
+
+## Rollback / teardown
+
+```bash
+# 1. Empty the results bucket (sam delete refuses a non-empty bucket):
+aws s3 rm "s3://$(aws cloudformation describe-stacks --region "$AWS_REGION" \
+  --stack-name "$STACK" \
+  --query "Stacks[0].Outputs[?OutputKey=='ResultsBucketName'].OutputValue" --output text)" --recursive
+
+# 2. Delete the AWS stack (API GW, Lambdas, DynamoDB, S3, alarm, SNS):
+sam delete --region "$AWS_REGION" --stack-name "$STACK"
+
+# 3. Empty + delete the web bucket and its CloudFront distribution:
+aws s3 rm "s3://${WEB_BUCKET}" --recursive && aws s3 rb "s3://${WEB_BUCKET}"
+#    (disable, then delete the CloudFront distribution in the console)
+
+# 4. Delete the SSM secret (not part of the stack):
+aws ssm delete-parameter --region "$AWS_REGION" --name /neural-media/hf-callback-secret
+```
+
+Hand-clean what has no `sam`/CLI hook:
+
+- **The HF Space** — Space → Settings → "Delete this Space".
+- **CloudWatch log groups** — `aws logs delete-log-group --log-group-name /aws/lambda/neural-media-${STAGE}-jobs-create` (repeat per function); free under 5 GB.
+
+After all of the above your monthly bill returns to **$0.00**.

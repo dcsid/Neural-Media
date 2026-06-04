@@ -6,10 +6,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ActivationPayload } from "@/lib/api-v2";
 import type { RegionId } from "@shared/types";
 import { DemoModeBanner } from "@/components/DemoModeBanner";
+import { BrainCanvasSkeleton } from "@/components/brain/BrainCanvasStates";
 
-// Same dynamic import pattern as /single — R3F touches browser globals
-// during mount, so SSR has to be off. The placeholder mirrors the colour
-// of the single-page idle background so the swap-in isn't jarring.
+// Same dynamic import pattern as the / hero — R3F touches browser globals
+// during mount, so SSR has to be off. The lazy-load fallback reuses the
+// shared canvas skeleton so the box reads as "loading" (not empty) before
+// the BrainMesh chunk arrives, matching what BrainMesh shows once it mounts.
 const BrainMeshLazy = dynamic(
   () =>
     import("@/components/brain/BrainMesh").then((mod) => ({
@@ -17,12 +19,7 @@ const BrainMeshLazy = dynamic(
     })),
   {
     ssr: false,
-    loading: () => (
-      <div
-        aria-hidden
-        className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(245,165,36,0.05),transparent_60%)]"
-      />
-    ),
+    loading: () => <BrainCanvasSkeleton />,
   },
 );
 
@@ -46,86 +43,69 @@ interface GalleryManifest {
   entries: GalleryEntry[];
 }
 
-// ---------------------------------------------------------------------------
-// State
-// ---------------------------------------------------------------------------
-
-interface ListState {
-  kind: "list";
-  entries: GalleryEntry[];
-}
-interface DetailLoadingState {
-  kind: "loading-detail";
-  entries: GalleryEntry[];
-  entry: GalleryEntry;
-}
-interface DetailState {
-  kind: "detail";
-  entries: GalleryEntry[];
-  entry: GalleryEntry;
+// Currently-shown prediction. Kept separate from `selected` so the brain
+// stays mounted and on-screen while the next pick loads — switching examples
+// updates props in place instead of tearing the canvas down.
+interface Detail {
+  slug: string;
   activation: ActivationPayload;
 }
-interface ErrorState {
-  kind: "error";
-  message: string;
-  entries?: GalleryEntry[];
-}
-interface InitialState {
-  kind: "initial";
-}
 
-type Phase =
-  | InitialState
-  | ListState
-  | DetailLoadingState
-  | DetailState
-  | ErrorState;
+type DetailStatus = "idle" | "loading" | "error";
 
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
 
 export default function DemoGalleryPage() {
-  const [phase, setPhase] = useState<Phase>({ kind: "initial" });
+  const [entries, setEntries] = useState<GalleryEntry[] | null>(null);
+  const [listError, setListError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<GalleryEntry | null>(null);
+  const [detail, setDetail] = useState<Detail | null>(null);
+  const [status, setStatus] = useState<DetailStatus>("idle");
+  const [detailError, setDetailError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const viewerRef = useRef<HTMLDivElement>(null);
 
+  // Load the manifest once.
   useEffect(() => {
     const controller = new AbortController();
-    abortRef.current = controller;
     (async () => {
       try {
         const res = await fetch("/demo-predictions/index.json", {
           signal: controller.signal,
           cache: "force-cache",
         });
-        if (!res.ok) {
-          throw new Error(`HTTP ${res.status}`);
-        }
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const manifest = (await res.json()) as GalleryManifest;
         if (!Array.isArray(manifest.entries)) {
           throw new Error("manifest missing `entries`");
         }
-        setPhase({ kind: "list", entries: manifest.entries });
+        setEntries(manifest.entries);
       } catch (err) {
         if (controller.signal.aborted) return;
-        setPhase({
-          kind: "error",
-          message:
-            err instanceof Error
-              ? `Couldn't load the gallery (${err.message}).`
-              : "Couldn't load the gallery.",
-        });
+        setListError(
+          err instanceof Error
+            ? `Couldn't load the gallery (${err.message}).`
+            : "Couldn't load the gallery.",
+        );
       }
     })();
     return () => controller.abort();
   }, []);
 
-  const openEntry = useCallback(
-    async (entry: GalleryEntry, entries: GalleryEntry[]) => {
-      abortRef.current?.abort();
-      const controller = new AbortController();
-      abortRef.current = controller;
-      setPhase({ kind: "loading-detail", entries, entry });
+  const openEntry = useCallback((entry: GalleryEntry) => {
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setSelected(entry);
+    setStatus("loading");
+    setDetailError(null);
+    // On a narrow viewport the viewer sits below the grid; nudge it into
+    // view on selection. `block: "nearest"` is a no-op when it's already
+    // visible (the sticky desktop pane), so desktop never jumps.
+    viewerRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    (async () => {
       try {
         const res = await fetch(`/demo-predictions/${entry.slug}.json`, {
           signal: controller.signal,
@@ -133,255 +113,402 @@ export default function DemoGalleryPage() {
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const activation = (await res.json()) as ActivationPayload;
-        setPhase({ kind: "detail", entries, entry, activation });
+        if (controller.signal.aborted) return;
+        setDetail({ slug: entry.slug, activation });
+        setStatus("idle");
       } catch (err) {
         if (controller.signal.aborted) return;
-        setPhase({
-          kind: "error",
-          entries,
-          message:
-            err instanceof Error
-              ? `Couldn't load ${entry.label} (${err.message}).`
-              : `Couldn't load ${entry.label}.`,
-        });
+        setStatus("error");
+        setDetailError(
+          err instanceof Error
+            ? `Couldn't load ${entry.label} (${err.message}).`
+            : `Couldn't load ${entry.label}.`,
+        );
       }
-    },
-    [],
-  );
-
-  const backToList = useCallback(() => {
-    abortRef.current?.abort();
-    abortRef.current = null;
-    setPhase((p) => {
-      if (p.kind === "detail" || p.kind === "loading-detail") {
-        return { kind: "list", entries: p.entries };
-      }
-      if (p.kind === "error" && p.entries) {
-        return { kind: "list", entries: p.entries };
-      }
-      return p;
-    });
+    })();
   }, []);
 
   return (
-    <main className="mx-auto max-w-[1280px] px-8 pb-16 pt-12">
+    <main className="mx-auto max-w-[1280px] px-5 pb-16 pt-12 sm:px-8">
       <DemoModeBanner cta={{ href: "/", label: "Predict your own clip →" }}>
         These predictions are precomputed and ship with the build — curated
         short clips run through the pipeline in mock mode. Nothing is fetched
         or inferred live.
       </DemoModeBanner>
-      <header className="motion-fade-in flex items-baseline justify-between gap-6">
+
+      <header className="motion-fade-in flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2">
         <div>
           <p className="eyebrow">Demo gallery</p>
-          <h1 className="mt-2 font-serif text-[28px] leading-tight tracking-tightish text-ink-50">
+          <h1 className="mt-2 font-serif text-[26px] leading-tight tracking-tightish text-ink-50 sm:text-[28px]">
             Precomputed brains
           </h1>
           <p className="mt-3 max-w-[64ch] text-[14px] leading-relaxed text-ink-200">
-            Curated short-clip predictions you can browse offline. No fetch, no
-            inference, no AWS — these JSONs ship with the build.
+            Curated short-clip predictions you can browse offline. Pick any
+            example — its predicted cortical activation loads instantly, no
+            fetch or inference.
           </p>
         </div>
         <Link
           href="/"
-          className="font-mono text-[11px] uppercase tracking-[0.08em] text-ink-300 hover:text-accent"
+          className="font-mono text-[11px] uppercase tracking-[0.08em] text-ink-300 transition-colors hover:text-accent"
         >
           ← back
         </Link>
       </header>
 
-      {(phase.kind === "initial" || phase.kind === "list") && (
-        <GridView
-          entries={phase.kind === "list" ? phase.entries : null}
-          onOpen={(e) => {
-            if (phase.kind === "list") openEntry(e, phase.entries);
-          }}
-        />
-      )}
-
-      {(phase.kind === "loading-detail" || phase.kind === "detail") && (
-        <DetailView phase={phase} onBack={backToList} />
-      )}
-
-      {phase.kind === "error" && (
-        <section className="mt-10 border border-accent/40 bg-surface/40 p-6">
-          <p className="eyebrow text-accent">Gallery error</p>
-          <p className="mt-2 max-w-[60ch] text-[13px] leading-relaxed text-ink-200">
-            {phase.message}
-          </p>
-          {phase.entries && (
-            <button
-              type="button"
-              onClick={backToList}
-              className="mt-4 border border-line px-4 py-2 font-mono text-[12px] uppercase tracking-[0.08em] text-ink-200 transition-colors hover:border-accent hover:text-accent"
-            >
-              Back to gallery
-            </button>
-          )}
-        </section>
+      {listError ? (
+        <ErrorBanner message={listError} />
+      ) : (
+        <div className="mt-10 grid items-start gap-8 lg:grid-cols-[minmax(0,1fr)_minmax(0,468px)]">
+          <ExamplesGrid
+            entries={entries}
+            selectedSlug={selected?.slug ?? null}
+            onOpen={openEntry}
+          />
+          <div ref={viewerRef} className="lg:sticky lg:top-6">
+            <Viewer
+              selected={selected}
+              detail={detail}
+              status={status}
+              error={detailError}
+              onRetry={() => selected && openEntry(selected)}
+            />
+          </div>
+        </div>
       )}
     </main>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Grid view
+// Examples grid (master)
 // ---------------------------------------------------------------------------
 
-interface GridViewProps {
+function ExamplesGrid({
+  entries,
+  selectedSlug,
+  onOpen,
+}: {
   entries: GalleryEntry[] | null;
+  selectedSlug: string | null;
   onOpen: (entry: GalleryEntry) => void;
-}
-
-function GridView({ entries, onOpen }: GridViewProps) {
-  if (entries === null) {
-    return (
-      <section
-        aria-busy
-        className="mt-10 grid gap-4 sm:grid-cols-2 lg:grid-cols-3"
-      >
-        {[0, 1, 2, 3, 4, 5].map((i) => (
-          <div
-            key={i}
-            className="motion-fade-in h-[112px] animate-pulse border border-line bg-surface/40"
-          />
-        ))}
-      </section>
-    );
-  }
-  if (entries.length === 0) {
-    return (
-      <p className="mt-10 max-w-[60ch] text-[13px] text-ink-300">
-        The manifest is empty. Run{" "}
-        <code className="font-mono text-ink-100">
-          python scripts/build_demo_gallery.py
-        </code>{" "}
-        to populate it.
-      </p>
-    );
-  }
+}) {
   return (
-    <section className="mt-10 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-      {entries.map((entry) => (
-        <GalleryCard key={entry.slug} entry={entry} onOpen={onOpen} />
-      ))}
+    <section aria-labelledby="examples-heading">
+      <h2 id="examples-heading" className="eyebrow mb-3">
+        {entries ? `${entries.length} examples` : "Examples"}
+      </h2>
+
+      {entries === null ? (
+        <ul
+          aria-busy
+          aria-label="Loading examples"
+          className="grid gap-3 sm:grid-cols-2"
+        >
+          {[0, 1, 2, 3, 4, 5].map((i) => (
+            <li
+              key={i}
+              className="motion-fade-in h-[104px] animate-pulse border border-line bg-surface/40"
+            />
+          ))}
+        </ul>
+      ) : entries.length === 0 ? (
+        <p className="max-w-[60ch] text-[13px] text-ink-300">
+          The manifest is empty. Run{" "}
+          <code className="font-mono text-ink-100">
+            python scripts/build_demo_gallery.py
+          </code>{" "}
+          to populate it.
+        </p>
+      ) : (
+        <ul className="grid gap-3 sm:grid-cols-2">
+          {entries.map((entry) => (
+            <li key={entry.slug}>
+              <GalleryCard
+                entry={entry}
+                selected={entry.slug === selectedSlug}
+                onOpen={onOpen}
+              />
+            </li>
+          ))}
+        </ul>
+      )}
     </section>
   );
 }
 
+// Split "NASA — Aurora over the Arctic" into a source eyebrow + title. Labels
+// without the " — " separator (e.g. test fixtures) render whole as the title.
+function splitLabel(label: string): { source: string | null; title: string } {
+  const sep = label.indexOf(" — ");
+  if (sep === -1) return { source: null, title: label };
+  return { source: label.slice(0, sep), title: label.slice(sep + 3) };
+}
+
 function GalleryCard({
   entry,
+  selected,
   onOpen,
 }: {
   entry: GalleryEntry;
+  selected: boolean;
   onOpen: (entry: GalleryEntry) => void;
 }) {
   // Contract check, matching MockModeBadge + InferenceRun.model_id: a mock
   // backend stamps modelVersion with the "tribe-v2-mock" prefix. (.includes
   // would also match an unrelated substring.)
   const isMock = entry.modelVersion.startsWith("tribe-v2-mock");
+  const { source, title } = splitLabel(entry.label);
   return (
     <button
       type="button"
       onClick={() => onOpen(entry)}
+      aria-pressed={selected}
+      aria-label={`Show predicted brain for ${entry.label}`}
       className={[
-        "motion-fade-in group flex h-full flex-col items-start gap-3 border border-line bg-surface/40 p-4 text-left",
-        "transition-colors hover:border-accent",
-        "focus-visible:border-accent focus-visible:outline-none",
+        "motion-fade-in group flex h-full w-full flex-col items-start gap-2 p-4 text-left",
+        "border bg-surface/40 transition-colors",
+        "hover:border-accent focus-visible:outline-none",
+        selected ? "border-accent bg-accent/[0.06]" : "border-line",
       ].join(" ")}
     >
-      <p className="font-serif text-[15px] leading-snug text-ink-50 group-hover:text-accent">
-        {entry.label}
-      </p>
-      <p className="font-mono text-[10px] uppercase tracking-[0.08em] text-ink-400">
-        {entry.durationSec.toFixed(1)}s · {isMock ? "mock prediction" : "real prediction"}
-      </p>
-      <p
-        title={entry.modelVersion}
-        className="mt-auto truncate font-mono text-[10px] text-ink-400"
+      {source && (
+        <span
+          className={[
+            "font-mono text-[10px] uppercase tracking-[0.08em]",
+            selected ? "text-accent" : "text-ink-400 group-hover:text-ink-300",
+          ].join(" ")}
+        >
+          {source}
+        </span>
+      )}
+      <span
+        className={[
+          "font-serif text-[15px] leading-snug",
+          selected ? "text-accent" : "text-ink-50 group-hover:text-accent",
+        ].join(" ")}
       >
-        {entry.modelVersion}
-      </p>
+        {title}
+      </span>
+      <span className="mt-auto flex items-center gap-1.5 pt-1 font-mono text-[10px] uppercase tracking-[0.08em] text-ink-400">
+        <span className="tabular-nums">{entry.durationSec.toFixed(1)}s</span>
+        <span aria-hidden className="text-ink-600">
+          ·
+        </span>
+        <span>{isMock ? "mock prediction" : "real prediction"}</span>
+      </span>
     </button>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Detail view
+// Viewer (detail)
 // ---------------------------------------------------------------------------
 
-function DetailView({
-  phase,
-  onBack,
-}: {
-  phase: DetailLoadingState | DetailState;
-  onBack: () => void;
-}) {
-  const activation = phase.kind === "detail" ? phase.activation : null;
+interface ViewerProps {
+  selected: GalleryEntry | null;
+  detail: Detail | null;
+  status: DetailStatus;
+  error: string | null;
+  onRetry: () => void;
+}
+
+function Viewer({
+  selected,
+  detail,
+  status,
+  error,
+  onRetry,
+}: ViewerProps) {
+  const activation = detail?.activation ?? null;
+  const showFirstLoadSkeleton =
+    selected !== null && detail === null && status === "loading";
+  const showFirstLoadError =
+    selected !== null && detail === null && status === "error";
+
   return (
-    <section className="mt-10 grid gap-8 md:grid-cols-[minmax(0,1fr)_minmax(0,460px)]">
-      <div className="relative aspect-[5/4] w-full overflow-hidden border border-line bg-canvas">
-        {activation ? (
+    <section
+      aria-labelledby="viewer-heading"
+      className="flex flex-col gap-4"
+    >
+      <h2 id="viewer-heading" className="sr-only">
+        Predicted brain
+      </h2>
+
+      <div
+        aria-busy={status === "loading"}
+        className="relative aspect-[5/4] w-full overflow-hidden border border-line bg-canvas"
+      >
+        {selected === null && <EmptyViewer />}
+
+        {/* Brain stays mounted once we have any detail, so switching
+            examples just updates its props (no canvas teardown). */}
+        {activation && (
           <BrainMeshLazy
             activation={meanFromActivation(activation)}
-            keyframeVertices={
-              activation.byRegion as Record<RegionId, number[]>
-            }
+            keyframeVertices={activation.byRegion as Record<RegionId, number[]>}
             timestamps={activation.timestamps}
             playheadSec={0}
           />
-        ) : (
-          <BrainMeshLazy activation={0} />
+        )}
+
+        {showFirstLoadSkeleton && <BrainCanvasSkeleton />}
+        {showFirstLoadError && (
+          <ViewerError message={error} onRetry={onRetry} />
+        )}
+
+        {/* Switching to a new pick while a previous brain is shown. */}
+        {detail && status === "loading" && (
+          <span className="pointer-events-none absolute right-3 top-3 z-30 border border-line bg-surface/95 px-2 py-1 font-mono text-[10px] uppercase tracking-[0.08em] text-ink-300 backdrop-blur-sm">
+            Loading…
+          </span>
+        )}
+        {detail && status === "error" && (
+          <ViewerErrorPill message={error} onRetry={onRetry} />
         )}
       </div>
 
-      <div className="flex min-h-full flex-col gap-4 border border-line bg-surface/40 p-6">
-        <p className="eyebrow">Demo · {phase.entry.slug}</p>
-        <p className="font-serif text-[18px] leading-tight text-ink-50">
-          {phase.entry.label}
+      <ViewerMeta selected={selected} detail={detail} status={status} />
+    </section>
+  );
+}
+
+function EmptyViewer() {
+  return (
+    <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-6 text-center">
+      <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(245,165,36,0.05),transparent_62%)]" />
+      <p className="relative font-mono text-[11px] uppercase tracking-[0.08em] text-ink-300">
+        No example selected
+      </p>
+      <p className="relative max-w-[32ch] text-[12px] leading-relaxed text-ink-400">
+        Pick a clip from the list to load its predicted cortical activation.
+      </p>
+    </div>
+  );
+}
+
+function ViewerError({
+  message,
+  onRetry,
+}: {
+  message: string | null;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center">
+      <p className="font-mono text-[11px] uppercase tracking-[0.08em] text-accent">
+        Couldn&rsquo;t load
+      </p>
+      <p className="max-w-[34ch] text-[12px] leading-relaxed text-ink-300">
+        {message ?? "Something went wrong."}
+      </p>
+      <button
+        type="button"
+        onClick={onRetry}
+        className="border border-line px-4 py-2 font-mono text-[11px] uppercase tracking-[0.08em] text-ink-200 transition-colors hover:border-accent hover:text-accent"
+      >
+        Try again
+      </button>
+    </div>
+  );
+}
+
+function ViewerErrorPill({
+  message,
+  onRetry,
+}: {
+  message: string | null;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="absolute inset-x-3 bottom-3 z-30 flex items-center justify-between gap-3 border border-accent/40 bg-surface/95 px-3 py-2 backdrop-blur-sm">
+      <p className="truncate text-[11px] leading-snug text-ink-200" title={message ?? undefined}>
+        {message ?? "Couldn't load that one."}
+      </p>
+      <button
+        type="button"
+        onClick={onRetry}
+        className="shrink-0 font-mono text-[10px] uppercase tracking-[0.08em] text-accent hover:underline"
+      >
+        Retry
+      </button>
+    </div>
+  );
+}
+
+function ViewerMeta({
+  selected,
+  detail,
+  status,
+}: {
+  selected: GalleryEntry | null;
+  detail: Detail | null;
+  status: DetailStatus;
+}) {
+  if (selected === null) {
+    return (
+      <p className="text-[12px] leading-relaxed text-ink-400">
+        Predictions are precomputed and shipped with the build — re-generate
+        via{" "}
+        <code className="font-mono text-ink-300">
+          python scripts/build_demo_gallery.py
+        </code>
+        .
+      </p>
+    );
+  }
+
+  const { source, title } = splitLabel(selected.label);
+  // Only show readings once the loaded detail matches the selection.
+  const a = detail && detail.slug === selected.slug ? detail.activation : null;
+
+  return (
+    <div className="border border-line bg-surface/40 p-5">
+      {source && <p className="eyebrow">{source}</p>}
+      <p className="mt-1 font-serif text-[17px] leading-tight text-ink-50">
+        {title}
+      </p>
+      {a ? (
+        <dl className="mt-4 grid grid-cols-2 gap-x-6 gap-y-2 text-[12px]">
+          <dt className="text-ink-400">Duration</dt>
+          <dd className="font-mono tabular-nums text-ink-100">
+            {a.videoDurationSec.toFixed(2)}s
+          </dd>
+          <dt className="text-ink-400">Timepoints</dt>
+          <dd className="font-mono tabular-nums text-ink-100">
+            {a.timestamps.length}
+          </dd>
+          <dt className="text-ink-400">Model</dt>
+          <dd className="truncate font-mono text-ink-100" title={a.modelVersion}>
+            {a.modelVersion}
+          </dd>
+          <dt className="text-ink-400">Regions</dt>
+          <dd className="font-mono tabular-nums text-ink-100">
+            {Object.keys(a.byRegion).length}
+          </dd>
+        </dl>
+      ) : (
+        <p className="mt-4 font-mono text-[11px] uppercase tracking-[0.08em] text-ink-300">
+          {status === "error" ? "Couldn't load readings." : "Loading readings…"}
         </p>
-        {activation ? (
-          <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-[12px]">
-            <dt className="text-ink-400">Duration</dt>
-            <dd className="font-mono tabular-nums text-ink-100">
-              {activation.videoDurationSec.toFixed(2)}s
-            </dd>
-            <dt className="text-ink-400">Timepoints</dt>
-            <dd className="font-mono tabular-nums text-ink-100">
-              {activation.timestamps.length}
-            </dd>
-            <dt className="text-ink-400">Model</dt>
-            <dd className="font-mono text-ink-100">{activation.modelVersion}</dd>
-            <dt className="text-ink-400">Regions</dt>
-            <dd className="font-mono tabular-nums text-ink-100">
-              {Object.keys(activation.byRegion).length}
-            </dd>
-          </dl>
-        ) : (
-          <p className="font-mono text-[11px] uppercase tracking-[0.08em] text-ink-300">
-            Loading prediction…
-          </p>
-        )}
-        <p className="text-[12px] leading-relaxed text-ink-300">
-          These are precomputed and shipped with the build. Re-generate via{" "}
-          <code className="font-mono text-ink-100">
-            python scripts/build_demo_gallery.py
-          </code>
-          .
-        </p>
-        <button
-          type="button"
-          onClick={onBack}
-          className="mt-auto w-full border border-line px-4 py-2 font-mono text-[12px] uppercase tracking-[0.08em] text-ink-200 transition-colors hover:border-accent hover:text-accent"
-        >
-          Back to gallery
-        </button>
-      </div>
+      )}
+    </div>
+  );
+}
+
+function ErrorBanner({ message }: { message: string }) {
+  return (
+    <section className="mt-10 border border-accent/40 bg-surface/40 p-6">
+      <p className="eyebrow text-accent">Gallery error</p>
+      <p className="mt-2 max-w-[60ch] text-[13px] leading-relaxed text-ink-200">
+        {message}
+      </p>
     </section>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Helpers (mirrors apps/web/app/single/page.tsx)
+// Helpers (mirrors apps/web/app/page.tsx)
 // ---------------------------------------------------------------------------
 
 function meanFromActivation(a: ActivationPayload): number {

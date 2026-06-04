@@ -6,7 +6,7 @@ Target resolution / FPS / audio sample rate are NOT defined here.
 data-pipeline literally cannot drift from the values TRIBE expects.
 The same dict is echoed into ``run_inference``'s ``extra_params`` by
 the orchestrator so it lands in the reproducibility envelope
-(CONTRACTS.md §8).
+(CONTRACTS.md §9).
 
 All ffmpeg invocations go through one seam (``_ffmpeg_run``); tests
 inject a fake to avoid spawning subprocesses or requiring ffmpeg on

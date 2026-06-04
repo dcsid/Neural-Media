@@ -65,7 +65,7 @@ that hits the network on purpose; run it by hand, not in CI.
 
 Privacy: no module ever logs a full source URL — the stable id (a hash of
 the URL) is the only handle that appears in logs. State-changing log lines
-follow the `event=<name> key=value` convention (`CONTRACTS.md §12`).
+follow the `event=<name> key=value` convention.
 
 ## Testing
 

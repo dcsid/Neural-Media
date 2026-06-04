@@ -48,9 +48,9 @@ export interface BrainMeshProps {
   keyframeVertices?: Record<string, number[]>;
   timestamps?: number[];
   playheadSec?: number;
-  // Set to true when /api/v1/videos/{id}/activation returned 404 because
-  // the per-vertex .npz was purged after region_metrics were aggregated
-  // (a tier-b cleanup path). Visual consequence: BrainMesh renders the
+  // Set to true when the prediction carries only region-level series and no
+  // per-vertex keyframes (the wire payload is downsampled — it never ships
+  // the full 20k-vertex array). Visual consequence: BrainMesh renders the
   // low-poly **placeholder** mesh (coloured per-region from `byRegion`)
   // INSTEAD of the per-vertex cortical surface — an honest signal that
   // vertex resolution is gone — and overlays an "Aggregated only" banner

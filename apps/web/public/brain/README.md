@@ -102,18 +102,15 @@ Roughly four hovers in five land on unassigned cortex (255). The mesh
 itself is drawn in full because the LUT also paints unassigned vertices
 at activation = 0 (the dark end of cividis); only the tooltip suppresses.
 
-### Why this lives in `/public/` and not behind `/api/v1/regions`
+### Why the region mask lives in `/public/`
 
-The current `/api/v1/regions` endpoint only returns `(region_id,
-description)` pairs — no vertex masks (see
-`services/api/neural_media_api/main.py` and `shared/schemas.py:RegionDef`).
-Asking the API for the mask would require a coordinated change to the
-shared schemas. Until that lands, brain-viz ships the mask alongside the
-geometry so hover works offline. The frontend caches it module-globally
-via `useRegionMask()` so the fetch happens at most once per session.
-
-When `/api/v1/regions` does start returning masks, this file can be
-deleted and the hook can swap to the endpoint without other changes.
+There is no backend in this product — it's a static app whose only network
+call is to the AWS job API for predictions, and those carry region-level
+series, never the per-vertex masks. So the mask (vertex → region) is baked
+offline and shipped alongside the geometry as a static asset, and
+hover/tooltip work entirely client-side. The frontend caches it
+module-globally via `useRegionMask()` so the fetch happens at most once per
+session.
 
 ## Rebuild
 

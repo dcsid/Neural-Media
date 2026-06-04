@@ -3,7 +3,7 @@ import type { Metadata } from "next";
 export const metadata: Metadata = {
   title: "About — Neural Media",
   description:
-    "What Neural Media does and does not measure. Predicted average cortical fMRI response from Meta FAIR TRIBE v2. Local-first, non-commercial.",
+    "What Neural Media does and does not measure. Predicted average cortical fMRI response to a YouTube video segment, from Meta FAIR TRIBE v2. Non-commercial.",
 };
 
 // Plain-text framing page. Mirrors docs/scientific-framing.md so the
@@ -42,13 +42,13 @@ export default function AboutPage() {
               face-selective regions.
             </li>
             <li>
-              Divergence and similarity{" "}
-              <span className="text-ink-50">between videos</span> — content
-              clustered by predicted neural fingerprint.
+              How predicted engagement{" "}
+              <span className="text-ink-50">rises and falls across the segment</span>{" "}
+              — a per-region time-course, not just a single number.
             </li>
             <li>
-              Aggregate patterns across the watch history: time-of-day
-              shifts, content-type breakdowns, session-level variation.
+              Differences <span className="text-ink-50">between clips</span> —
+              compare what you paste against the curated gallery examples.
             </li>
           </ul>
         </div>
@@ -108,16 +108,25 @@ export default function AboutPage() {
         <div>
           <p className="eyebrow mb-3">Privacy</p>
           <ul className="space-y-3 text-[13px] leading-relaxed text-ink-200">
-            <li>The pipeline runs entirely on-device.</li>
-            <li>Your watch history never leaves the machine.</li>
             <li>
-              No analytics SDKs, no telemetry, no remote logging. The app
-              makes no outbound requests beyond your local API.
+              <span className="text-ink-50">
+                No account, no sign-in, no tracking
+              </span>{" "}
+              — paste a link, get a prediction.
             </li>
             <li>
-              Downloaded videos live in{" "}
-              <code className="font-mono text-ink-100">data/videos/</code>{" "}
-              and are git-ignored.
+              Analysis runs on a cloud GPU that fetches{" "}
+              <span className="text-ink-50">only your chosen segment</span> to a
+              temporary directory it deletes after inference — the full video is
+              never stored.
+            </li>
+            <li>
+              Only the small result (the predicted region activations) persists
+              — in AWS S3 / DynamoDB — and auto-expires.
+            </li>
+            <li>
+              No analytics SDKs, no telemetry. The curated gallery is
+              precomputed static JSON: no inference, no network.
             </li>
           </ul>
         </div>

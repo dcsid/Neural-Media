@@ -71,7 +71,6 @@ git clone https://github.com/<your-fork>/Neural-Media.git
 cd Neural-Media
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -e 'services/pipeline'
-pip install -e 'services/api'
 pip install -e 'services/inference[real]'  # pulls torch + tribev2 + transitive deps
 ```
 

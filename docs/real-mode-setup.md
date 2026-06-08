@@ -70,8 +70,8 @@ YouTube segment (`--download-sections`). Both are checked by
 git clone https://github.com/<your-fork>/Neural-Media.git
 cd Neural-Media
 python3.11 -m venv .venv && source .venv/bin/activate
+pip install -e 'services/inference[real]'  # pulls torch + tribev2; install FIRST (pipeline depends on it)
 pip install -e 'services/pipeline'
-pip install -e 'services/inference[real]'  # pulls torch + tribev2 + transitive deps
 ```
 
 This last step downloads ~3 GB of Python wheels (torch + CUDA runtime +

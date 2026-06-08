@@ -27,6 +27,11 @@ real = [
   # `python -m neural_media_inference.scripts.validate_real_mode` (or
   # `services/inference/scripts/validate_real_mode.py`) to confirm gates.
   "tribev2 @ git+https://github.com/facebookresearch/tribev2",
+  # exca 0.5.26 (2026-06-03) removed `exca.steps.base.NoValue`, which TRIBE's
+  # `neuralset` still imports -> `import tribev2` raises AttributeError. neuralset
+  # only floors exca>=0.5.20, so pip otherwise grabs the broken latest. Cap it
+  # until upstream neuralset/exca reconcile (verified working on a GPU box).
+  "exca<0.5.26",
 ]
 atlas-build = [
   # Build-time only — used by scripts/build_region_masks.py to (re)generate

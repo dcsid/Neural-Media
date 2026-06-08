@@ -32,6 +32,11 @@ real = [
   # only floors exca>=0.5.20, so pip otherwise grabs the broken latest. Cap it
   # until upstream neuralset/exca reconcile (verified working on a GPU box).
   "exca<0.5.26",
+  # transformers 5.x (integrations/finegrained_fp8) imports torch.float8_e8m0fnu,
+  # a dtype only present in torch>=2.7 — but tribev2 pins torch<2.7, so 5.x fails
+  # to import Wav2Vec2BertModel (the audio encoder). tribev2 leaves transformers
+  # unpinned; cap to the 4.x line it was built against. (GPU-run finding.)
+  "transformers<5",
 ]
 atlas-build = [
   # Build-time only — used by scripts/build_region_masks.py to (re)generate

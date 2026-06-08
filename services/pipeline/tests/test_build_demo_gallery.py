@@ -100,15 +100,17 @@ def test_build_mock_only_is_deterministic(gallery, tmp_path, monkeypatch) -> Non
 # --dry-run validation gate
 # ---------------------------------------------------------------------------
 
-def test_dry_run_fails_on_placeholders(gallery, capsys) -> None:
-    """The shipped DEMO_ENTRIES are REPLACE_ME placeholders, so --dry-run
-    must FAIL (nonzero) until the real clip list is wired — that's the gate
-    that stops a bad list reaching the GPU bake."""
-    rc = gallery.dry_run()  # default = the placeholder DEMO_ENTRIES
+def test_shipped_entries_pass_dry_run(gallery, capsys) -> None:
+    """The shipped DEMO_ENTRIES are real, wired clips now, so --dry-run must
+    PASS (rc 0) — every shipped clip is a valid YouTube URL + an in-bounds
+    segment. (Before the clips were wired this asserted the REPLACE_ME
+    placeholders FAILED; that gate has served its purpose.)"""
+    rc = gallery.dry_run()  # default = the shipped DEMO_ENTRIES
     out = capsys.readouterr().out
-    assert rc == 1
-    assert "FAIL" in out
-    assert "invalid_url" in out
+    assert rc == 0
+    assert "FAIL" not in out
+    n = len(gallery.DEMO_ENTRIES)
+    assert f"{n}/{n} PASS" in out
 
 
 def test_dry_run_passes_on_valid_entries(gallery, capsys) -> None:

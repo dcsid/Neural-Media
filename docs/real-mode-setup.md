@@ -107,7 +107,7 @@ gated:
 4. Authenticate on the box:
 
    ```bash
-   huggingface-cli login   # paste the token at the prompt
+   hf auth login   # paste the token at the prompt (huggingface_hub >= 1.x; the old `huggingface-cli` is gone)
    # or, non-interactively:
    export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
    ```

@@ -153,8 +153,14 @@ class TribeBackend:
         self._model = self._deps.TribeModel.from_pretrained(
             _DEFAULT_REPO_ID, **cache_kw
         )
-        self._model.to(self._device)
-        self._model.eval()
+        # TribeModel is a high-level wrapper, not a raw nn.Module — depending on
+        # the upstream version it may not expose .to()/.eval() (it manages device
+        # placement + eval mode internally, loading onto CUDA when available).
+        # Call them only if present so we work across upstream API drift.
+        if hasattr(self._model, "to"):
+            self._model.to(self._device)
+        if hasattr(self._model, "eval"):
+            self._model.eval()
 
     # ------------------------------------------------------------------
     # Reproducibility envelope contributions

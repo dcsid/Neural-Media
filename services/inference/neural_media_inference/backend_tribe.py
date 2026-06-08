@@ -146,8 +146,12 @@ class TribeBackend:
         self.model_version: str = self._resolved_sha
 
         cache_kw = {"cache_folder": str(self._cache_dir)} if self._cache_dir else {}
+        # tribev2's TribeModel.from_pretrained() does not accept `revision`
+        # (upstream API drift). The sha is still resolved + recorded above via
+        # HfApi for the reproducibility envelope; the model loads from the
+        # current default revision, which is the sha we just recorded.
         self._model = self._deps.TribeModel.from_pretrained(
-            _DEFAULT_REPO_ID, revision=self._resolved_sha, **cache_kw
+            _DEFAULT_REPO_ID, **cache_kw
         )
         self._model.to(self._device)
         self._model.eval()

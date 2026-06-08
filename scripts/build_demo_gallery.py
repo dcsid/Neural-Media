@@ -217,9 +217,12 @@ def _try_real_cli(entry: DemoEntry, output_path: Path) -> tuple[bool, str | None
                 "--output", str(output_path),
             ],
             cwd=str(REPO_ROOT),
-            capture_output=True,
-            text=True,
-            timeout=300,
+            # Stream the per-clip pipeline output (weight downloads, the
+            # "Extracting words from audio" bar, encoding) straight to the
+            # terminal — a real bake is long and otherwise looks frozen.
+            # 30-min cap: clip 1 pulls ~17GB of weights + WhisperX on first use;
+            # the old 5-min timeout silently fell back to MOCK on every clip.
+            timeout=1800,
         )
     except subprocess.TimeoutExpired:
         return False, "predict_one_url.py timed out (300s)"
@@ -305,9 +308,15 @@ def build(force_mock: bool) -> int:
     real = 0
     mock = 0
 
-    for entry in DEMO_ENTRIES:
+    total = len(DEMO_ENTRIES)
+    for i, entry in enumerate(DEMO_ENTRIES, 1):
         slug = slugify(entry.label)
         output_path = OUTPUT_DIR / f"{slug}.json"
+        print(
+            f"\n[{i}/{total}] baking: {entry.label}  "
+            f"[{entry.startSec:g},{entry.endSec:g})",
+            flush=True,
+        )
 
         used_real = False
         cli_skip_reason: str | None = None

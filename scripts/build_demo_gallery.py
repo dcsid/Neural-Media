@@ -115,44 +115,44 @@ class DemoEntry:
 # ─────────────────────────────────────────────────────────────────────────
 DEMO_ENTRIES: tuple[DemoEntry, ...] = (
     DemoEntry(
-        label="NASA — Aurora over the Arctic",
-        url="https://www.youtube.com/watch?v=REPLACE_ME_01",
-        startSec=5.0, endSec=23.0,
+        label="NASA — Pillars of Creation (3D)",
+        url="https://www.youtube.com/watch?v=fWdqRH1tucc",
+        startSec=20.0, endSec=110.0,
     ),
     DemoEntry(
-        label="NASA — Mars dust storm timelapse",
-        url="https://www.youtube.com/watch?v=REPLACE_ME_02",
-        startSec=10.0, endSec=32.0,
+        label="National Portrait Gallery — Portrait & interview",
+        url="https://www.youtube.com/watch?v=lmdQ6QRDDdI",
+        startSec=10.0, endSec=100.0,
     ),
     DemoEntry(
-        label="NatGeo — Octopus camouflage",
-        url="https://www.youtube.com/watch?v=REPLACE_ME_03",
-        startSec=0.0, endSec=15.0,
+        label="TED-Ed — Why is English so confusing?",
+        url="https://www.youtube.com/watch?v=XFhY4Vy3IHc",
+        startSec=25.0, endSec=115.0,
     ),
     DemoEntry(
-        label="NatGeo — Lions at sunset",
-        url="https://www.youtube.com/watch?v=REPLACE_ME_04",
-        startSec=8.0, endSec=35.0,
+        label="TED — How language shapes thought",
+        url="https://www.youtube.com/watch?v=RKK7wGAYP6k",
+        startSec=70.0, endSec=160.0,
     ),
     DemoEntry(
-        label="BBC Earth — Hummingbird (slow-mo)",
-        url="https://www.youtube.com/watch?v=REPLACE_ME_05",
-        startSec=2.0, endSec=14.5,
+        label="NPR Tiny Desk — Yo-Yo Ma",
+        url="https://www.youtube.com/watch?v=3uiUHvET_jg",
+        startSec=45.0, endSec=135.0,
     ),
     DemoEntry(
-        label="Khan Academy — Pythagoras visual proof",
-        url="https://www.youtube.com/watch?v=REPLACE_ME_06",
-        startSec=0.0, endSec=33.0,
+        label="Red Bull — FPV drone mountain biking",
+        url="https://www.youtube.com/watch?v=ctEksNz7tqg",
+        startSec=10.0, endSec=100.0,
     ),
     DemoEntry(
-        label="Smithsonian — T-Rex skull tour",
-        url="https://www.youtube.com/watch?v=REPLACE_ME_07",
-        startSec=12.0, endSec=32.0,
+        label="BBC Earth — Nature in 4K",
+        url="https://www.youtube.com/watch?v=No45YnGEwPI",
+        startSec=30.0, endSec=120.0,
     ),
     DemoEntry(
-        label="Duolingo — 'thank you' in five languages",
-        url="https://www.youtube.com/watch?v=REPLACE_ME_08",
-        startSec=0.0, endSec=14.0,
+        label="PBS NewsHour — AI & science",
+        url="https://www.youtube.com/watch?v=93aptpAYc8w",
+        startSec=15.0, endSec=105.0,
     ),
 )
 

@@ -450,15 +450,23 @@ def _region_means_per_timepoint(activations: np.ndarray, job_id: str) -> dict[st
     return {row["region_id"]: row["timeseries"] for row in rows}
 
 
-def _build_timestamps(num_timepoints: int) -> list[float]:
-    """Frame timestamps in seconds.  TRIBE samples at 1.5 Hz (CONTRACTS §4)."""
+def _build_timestamps(num_timepoints: int, duration_sec: float) -> list[float]:
+    """Frame timestamps in seconds, evenly spread over ``[0, duration_sec]``.
+
+    Spread over the clip duration so ``timestamps[-1] == duration_sec``. TRIBE's
+    emitted frame count isn't ``duration * 1.5`` (per-clip segment drops vary),
+    so a fixed 1.5 Hz step overshoots real video time — deriving the step from
+    the duration keeps the axis honest (the gallery syncs video<->brain 1:1).
+    """
     if num_timepoints <= 0:
         return []
-    dt = 1.0 / 1.5
+    if num_timepoints == 1:
+        return [0.0]
+    step = duration_sec / (num_timepoints - 1)
     # 3dp matches the wire convention the local scripts use
     # (neural_media_inference.WIRE_TIMESTAMP_DECIMALS), so every producer of an
     # ActivationPayload rounds the time axis identically.
-    return [round(i * dt, 3) for i in range(num_timepoints)]
+    return [round(i * step, 3) for i in range(num_timepoints)]
 
 
 @_gpu_decorator
@@ -599,7 +607,7 @@ async def _run_job(req: PredictRequest) -> None:
         # 5. Region aggregation.
         by_region = _region_means_per_timepoint(activations, req.jobId)
         T = activations.shape[0]
-        timestamps = _build_timestamps(T)
+        timestamps = _build_timestamps(T, float(duration))
 
         # 6. Pack + compress.
         activation_payload = {

@@ -141,22 +141,24 @@ def _ffprobe_duration(path: Path) -> float:
         raise RuntimeError(f"ffprobe returned non-numeric duration: {proc.stdout!r}") from exc
 
 
-def _build_timestamps(num_timepoints: int) -> list[float]:
-    """One timestamp per timepoint, in seconds — length ``num_timepoints``.
+def _build_timestamps(num_timepoints: int, duration_sec: float) -> list[float]:
+    """One timestamp per timepoint, evenly spread over ``[0, duration_sec]``.
 
-    Derived from the actual timepoint count the backend produced so this
-    array is always the same length as each ``byRegion`` series (the
-    invariant apps/web/lib/api-v2.ts enforces). Rounded to the shared
-    ``WIRE_TIMESTAMP_DECIMALS`` so the two offline scripts (this one and
-    build_demo_gallery.py) emit identical precision. The field *shape*
-    matches services/hf-space/app.py's callback payload; its deployed
-    counterpart happens to round wider, which is cosmetic — the frontend
-    validates lengths and types, not decimal places.
+    Length stays ``num_timepoints`` (the invariant apps/web/lib/api-v2.ts
+    enforces) and ``timestamps[-1] == duration_sec``. We spread over the clip
+    duration rather than assuming a fixed 1.5 Hz step: TRIBE's emitted frame
+    count is NOT ``duration * 1.5`` (per-clip segment drops vary), so a fixed
+    step overshoots real video time (a 90s clip produced a 124–140s axis).
+    Deriving the step from the duration keeps the axis honest and lets the
+    gallery sync video<->brain 1:1. Rounded to the shared
+    ``WIRE_TIMESTAMP_DECIMALS`` so every ActivationPayload producer matches.
     """
     if num_timepoints <= 0:
         return []
-    dt = 1.0 / SAMPLE_RATE_HZ
-    return [round(i * dt, WIRE_TIMESTAMP_DECIMALS) for i in range(num_timepoints)]
+    if num_timepoints == 1:
+        return [0.0]
+    step = duration_sec / (num_timepoints - 1)
+    return [round(i * step, WIRE_TIMESTAMP_DECIMALS) for i in range(num_timepoints)]
 
 
 def _seed_from_url(url: str) -> int:
@@ -310,7 +312,7 @@ def _run_pipeline(
         #    services/hf-space/app.py:_run_job → activation_payload.
         return {
             "videoDurationSec": float(duration_s),
-            "timestamps": _build_timestamps(int(activations.shape[0])),
+            "timestamps": _build_timestamps(int(activations.shape[0]), float(duration_s)),
             "byRegion": by_region,
             "modelVersion": str(backend.model_version),
         }

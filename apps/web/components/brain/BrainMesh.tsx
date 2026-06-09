@@ -408,11 +408,13 @@ export function BrainMesh({
       {/* Tour button — same chrome aesthetic as the other overlays. Gated
           on the same `hasKeyframes` predicate the legend uses so it never
           appears in Dashboard hero mode where the scrubber + region
-          spotlight have nothing to drive. Sits to the LEFT of the legend
-          (RegionLegend is right-3 with w-[200px], so its left edge is
-          ~203px from the right; we anchor at right-[212px] for a small
-          gap). data-tour-button lets the canvas-level pointer-down
-          cancellation skip clicks on this button. */}
+          spotlight have nothing to drive. When the legend is shown it tucks
+          just LEFT of it (legend is right-3 w-[200px] → ~203px from the right,
+          so right-[212px] leaves a small gap). When the legend is HIDDEN
+          (gallery + live result) there's nothing to sit beside, so it takes the
+          top-right corner instead of floating at right-[212px] into the centred
+          tour caption (the region readout box). data-tour-button lets the
+          canvas-level pointer-down cancellation skip clicks on this button. */}
       {hasKeyframes && (
         <button
           type="button"
@@ -432,7 +434,9 @@ export function BrainMesh({
             e.stopPropagation();
           }}
           className={[
-            "pointer-events-auto absolute right-[212px] top-3 z-10",
+            "pointer-events-auto absolute top-3 z-10",
+            // Legend hidden → corner; legend shown → just left of it (see above).
+            hideLegend ? "right-3" : "right-[212px]",
             "border border-line bg-surface/95 px-2.5 py-1 text-[11px]",
             "font-mono uppercase tracking-[0.08em] text-ink-200 backdrop-blur-sm",
             "transition-colors hover:border-accent hover:text-accent",

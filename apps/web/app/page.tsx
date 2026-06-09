@@ -129,6 +129,12 @@ const POLL_INTERVAL_MS = 2000;
 const POLL_TIMEOUT_MS = 180_000;
 const TYPICAL_LATENCY_SEC = 30;
 
+// Stage 1 (the static gallery deploy) ships WITHOUT the live-inference backend
+// (HF Space + Lambda). Until that's live (Stage 2), the home page shows a
+// "coming soon" panel that points at the precomputed gallery, instead of a form
+// that would POST /v2/jobs to nothing. Flip to true once the backend is up.
+const LIVE_INFERENCE_ENABLED: boolean = false;
+
 // A single failed status poll (a 5xx blip, a dropped packet) shouldn't kill
 // the run — keep ticking and recover on the next success. Surface a connection
 // error only after this many in a row; the 180s cap is the ultimate backstop.
@@ -428,7 +434,9 @@ export default function SingleVideoPage() {
         <p className="mt-3 max-w-[64ch] text-[14px] leading-relaxed text-ink-200">
           {phase.kind === "result"
             ? "Predicted average cortical response for your segment, rendered on the fsaverage5 surface below."
-            : `Paste a YouTube link, choose up to ${MAX_SEGMENT_SEC} seconds, and watch the predicted cortical response light up the 3D brain.`}
+            : LIVE_INFERENCE_ENABLED
+              ? `Paste a YouTube link, choose up to ${MAX_SEGMENT_SEC} seconds, and watch the predicted cortical response light up the 3D brain.`
+              : "Soon you'll paste a YouTube link and watch the predicted cortical response light up the 3D brain. For now, explore real precomputed predictions in the gallery."}
         </p>
       </header>
 
@@ -447,14 +455,17 @@ export default function SingleVideoPage() {
         </div>
 
         <div className="flex min-h-full flex-col">
-          {phase.kind === "idle" && (
-            <IdlePanel
-              state={phase}
-              onChange={(next) => setPhase(next)}
-              onSubmitUrl={submitUrl}
-              onSubmitUpload={submitUpload}
-            />
-          )}
+          {phase.kind === "idle" &&
+            (LIVE_INFERENCE_ENABLED ? (
+              <IdlePanel
+                state={phase}
+                onChange={(next) => setPhase(next)}
+                onSubmitUrl={submitUrl}
+                onSubmitUpload={submitUpload}
+              />
+            ) : (
+              <ComingSoonPanel />
+            ))}
 
           {phase.kind === "tracking" && <TrackingPanel state={phase} />}
 
@@ -674,6 +685,32 @@ function IdlePanel({
           )}
         </>
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Coming-soon panel (Stage 1 — no live backend yet)
+// ---------------------------------------------------------------------------
+
+function ComingSoonPanel() {
+  return (
+    <div className="motion-fade-in flex h-full flex-col gap-4 border border-line bg-surface/40 p-6">
+      <p className="eyebrow text-accent">Live prediction — coming soon</p>
+      <p className="font-serif text-[18px] leading-tight text-ink-50">
+        Paste-your-own-clip prediction is on the way
+      </p>
+      <p className="max-w-[44ch] text-[13px] leading-relaxed text-ink-200">
+        Running TRIBE live on a clip you choose needs a GPU backend we&rsquo;re
+        still wiring up. Meanwhile, every example in the gallery is a real,
+        precomputed TRIBE prediction you can explore right now.
+      </p>
+      <Link
+        href="/gallery"
+        className="mt-auto inline-flex w-full items-center justify-center border border-accent bg-accent/10 px-4 py-2 font-mono text-[12px] uppercase tracking-[0.08em] text-accent transition-colors hover:bg-accent/20"
+      >
+        Explore the gallery →
+      </Link>
     </div>
   );
 }

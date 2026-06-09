@@ -55,7 +55,7 @@ WORKDIR /app
 # shared as siblings).
 COPY shared/             /app/shared/
 COPY services/inference/ /app/services/inference/
-COPY services/hf-space/requirements.txt /app/requirements.txt
+COPY requirements.txt /app/requirements.txt
 
 RUN pip install --upgrade pip \
  && pip install -r /app/requirements.txt
@@ -67,7 +67,7 @@ RUN pip install --upgrade pip \
 RUN pip install uv
 
 # Now bring in the Space code.
-COPY services/hf-space/app.py /app/app.py
+COPY app.py /app/app.py
 
 # HF Spaces exposes the container on $PORT, default 7860.  The
 # uvicorn command honours $PORT when set.

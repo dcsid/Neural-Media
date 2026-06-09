@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 import { Header } from "@/components/Header";
 import { Footer } from "@/components/Footer";
+import { SessionProvider } from "@/lib/session";
 
 export const metadata: Metadata = {
   title: "Neural Media",
@@ -23,7 +24,9 @@ export default function RootLayout({
         <div className="flex min-h-screen flex-col">
           <Header />
           <div id="main" className="flex-1">
-            {children}
+            {/* In-memory store (lib/session): keeps the current upload + result
+                across / ↔ /gallery navigation; resets on full reload. */}
+            <SessionProvider>{children}</SessionProvider>
           </div>
           <Footer />
         </div>

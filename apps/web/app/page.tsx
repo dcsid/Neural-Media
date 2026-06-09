@@ -21,12 +21,17 @@ import {
   MAX_SEGMENT_SEC,
   putUpload,
   validateSegment,
-  type ActivationPayload,
   type JobStatus,
   type JobStatusResponse,
-  type TerminalFailureStatus,
 } from "@/lib/api-v2";
 import { LiveResultViewer } from "@/components/brain/LiveResultViewer";
+import {
+  freshIdle,
+  useSessionPhase,
+  type ErrorState,
+  type IdleState,
+  type TrackingState,
+} from "@/lib/session";
 
 // Re-uses the existing BrainMesh component. Dynamic with ssr:false
 // matches BrainMeshSlot/AutoPlayingBrain — R3F's runtime touches browser-
@@ -50,68 +55,11 @@ const BrainMeshLazy = dynamic(
 // ---------------------------------------------------------------------------
 // State machine
 //
-// The product is upload-only: YouTube-by-URL is blocked from datacenter IPs
-// (yt-dlp → 403 from AWS/HF), so the live path is "drop an MP4, pick a ≤90s
-// window, watch the synced video+brain". The URL form is retired (the lib
-// keeps createUrlJob/looksLikeYouTubeUrl dormant for a future re-add).
+// The phase types (IdleState/TrackingState/ResultState/ErrorState/Phase) + the
+// in-memory session store live in lib/session.tsx, so the current upload +
+// result survive client navigation (/ ↔ /gallery) without re-uploading or
+// re-running inference. The page reads/writes `phase` via useSessionPhase().
 // ---------------------------------------------------------------------------
-
-interface IdleState {
-  kind: "idle";
-  // The uploaded MP4 (null until the user picks one → dropzone shown).
-  file: File | null;
-  // Duration read from the file's own metadata (null while probing / no file).
-  // Bounds the picker's End so we never request a window past the file's end.
-  fileDurationSec: number | null;
-  // Inline message if the picked file's metadata couldn't be read.
-  fileError?: string;
-  // Segment window as raw input strings so the number fields can be cleared /
-  // partially typed; parsed + validated (CONTRACTS §13.2/§13.4) at submit.
-  startInput: string;
-  endInput: string;
-  // Submission-time error (create/put/confirm 4xx, network). Shown inline.
-  submitError?: string;
-  // Set while the create→put→confirm chain is in flight.
-  submitting?: boolean;
-}
-
-interface TrackingState {
-  kind: "tracking";
-  jobId: string;
-  status: JobStatus;
-  elapsedSec: number;
-  // Wall-clock ms at which polling started. Enforces the overall cap
-  // independently of whatever elapsedSec the server reports.
-  startedAtMs: number;
-  // Carried from the upload so the result can play the LOCAL file (never
-  // re-downloaded), trimmed to the analyzed [startSec, endSec) window.
-  file: File;
-  startSec: number;
-  endSec: number;
-}
-
-// Specific failure modes the UI cares about. "network" covers polling fetches
-// that died with no actionable server status; "timeout" fires when the overall
-// budget elapses without reaching a terminal status.
-type ErrorKind = TerminalFailureStatus | "network" | "timeout";
-
-interface ErrorState {
-  kind: "error";
-  errorKind: ErrorKind;
-  // Server-supplied machine-readable error code — drives copy, never shown raw.
-  errorCode?: string;
-}
-
-interface ResultState {
-  kind: "result";
-  jobId: string;
-  activation: ActivationPayload;
-  // The local upload + where its analyzed window starts, for the synced player.
-  file: File;
-  startSec: number;
-}
-
-type Phase = IdleState | TrackingState | ResultState | ErrorState;
 
 // ---------------------------------------------------------------------------
 // Polling
@@ -181,13 +129,9 @@ function readVideoDuration(file: File): Promise<number> {
 // ---------------------------------------------------------------------------
 
 export default function SingleVideoPage() {
-  const [phase, setPhase] = useState<Phase>({
-    kind: "idle",
-    file: null,
-    fileDurationSec: null,
-    startInput: "0",
-    endInput: "0",
-  });
+  // Phase lives in the layout-level session store (lib/session) so the current
+  // upload + result survive / ↔ /gallery navigation; a full reload resets it.
+  const { phase, setPhase } = useSessionPhase();
 
   // Top-level AbortController for any in-flight fetch (polling loop, result
   // download). Refreshed each time we enter a phase that owns requests.
@@ -293,14 +237,8 @@ export default function SingleVideoPage() {
     abortRef.current?.abort();
     abortRef.current = null;
     inFlightRef.current = false;
-    setPhase({
-      kind: "idle",
-      file: null,
-      fileDurationSec: null,
-      startInput: "0",
-      endInput: "0",
-    });
-  }, []);
+    setPhase(freshIdle());
+  }, [setPhase]);
 
   // ----- TRACKING: polling -----------------------------------------------
 

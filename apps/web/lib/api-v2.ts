@@ -286,8 +286,13 @@ export async function createUploadJob(
   >("/v2/jobs/upload", { filename, contentType }, opts);
 }
 
+// Confirm the upload landed and kick the worker. An optional [startSec, endSec)
+// segment (CONTRACTS §13.4) trims the uploaded file to that window before TRIBE
+// runs — same ≤90s cap as the URL path, re-validated server-side. Omit it to
+// analyze the whole file.
 export async function confirmUpload(
   jobId: string,
+  segment?: Segment,
   opts: RequestOpts = {},
 ): Promise<void> {
   const url = `${apiV2Base()}/v2/jobs/upload/${encodeURIComponent(jobId)}/confirm`;
@@ -295,7 +300,16 @@ export async function confirmUpload(
   try {
     response = await fetch(url, {
       method: "POST",
-      headers: { Accept: "application/json" },
+      headers: {
+        Accept: "application/json",
+        ...(segment ? { "Content-Type": "application/json" } : {}),
+      },
+      body: segment
+        ? JSON.stringify({
+            startSec: segment.startSec,
+            endSec: segment.endSec,
+          })
+        : undefined,
       signal: opts.signal,
       cache: "no-store",
     });

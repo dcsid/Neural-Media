@@ -5,7 +5,7 @@ colorFrom: indigo
 colorTo: pink
 sdk: docker
 app_port: 7860
-hardware: zero-a10g
+hardware: a10g-small
 license: cc-by-nc-4.0
 pinned: false
 short_description: TRIBE v2 inference for single-video brain-prediction requests

@@ -2,11 +2,20 @@
 
 import dynamic from "next/dynamic";
 import Link from "next/link";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ActivationPayload } from "@/lib/api-v2";
 import type { RegionId } from "@shared/types";
 import { DemoModeBanner } from "@/components/DemoModeBanner";
 import { BrainCanvasSkeleton } from "@/components/brain/BrainCanvasStates";
+import { TimelineScrubber } from "@/components/brain/TimelineScrubber";
+import { useReducedMotion } from "@/components/brain/hooks/useReducedMotion";
+// Temporary local stub of T3's controlled <GalleryVideo>. Swap to
+// `@/components/gallery/GalleryVideo` (delete GalleryVideoStub.tsx) when it lands.
+import { GalleryVideo } from "./GalleryVideoStub";
+
+// Demo clip asset convention (no manifest change): mp4 + poster keyed by slug.
+const clipSrc = (slug: string) => `/demo-clips/${slug}.mp4`;
+const posterSrc = (slug: string) => `/demo-clips/${slug}.jpg`;
 
 // Same dynamic import pattern as the / hero — R3F touches browser globals
 // during mount, so SSR has to be off. The lazy-load fallback reuses the
@@ -321,52 +330,205 @@ function Viewer({
   onRetry,
 }: ViewerProps) {
   const activation = detail?.activation ?? null;
+  const slug = selected?.slug ?? null;
+  // Video-seconds is the canonical playback space (entry.durationSec, ~90s).
+  const durationSec = selected?.durationSec ?? 0;
+  const reduceMotion = useReducedMotion();
+
   const showFirstLoadSkeleton =
     selected !== null && detail === null && status === "loading";
   const showFirstLoadError =
     selected !== null && detail === null && status === "error";
 
+  // --- sync: `videoSec` is the single source of truth -----------------------
+  const [videoSec, setVideoSec] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [seekReq, setSeekReq] = useState<{ sec: number; nonce: number }>({
+    sec: 0,
+    nonce: 0,
+  });
+  // null = probing the asset, true/false = clip available? (missing → brain-only)
+  const [hasClip, setHasClip] = useState<boolean | null>(null);
+  const scrubbingRef = useRef(false);
+
+  const timestamps = activation?.timestamps ?? [];
+  const tsMax = timestamps.length > 0 ? timestamps[timestamps.length - 1] : 0;
+  // The brain timeline overshoots the video, so this is deliberately NOT 1:1.
+  const brainPlayheadSec =
+    durationSec > 0 ? (videoSec / durationSec) * tsMax : 0;
+  // Rescale the dense timepoints from brain-seconds → video-seconds so the
+  // scrubber draws its ticks in its own (video) coordinate space.
+  const tickSeconds = useMemo(
+    () =>
+      tsMax > 0 ? timestamps.map((t) => (t * durationSec) / tsMax) : timestamps,
+    [timestamps, durationSec, tsMax],
+  );
+
+  // Reset the playhead and probe for the clip whenever the selection changes.
+  useEffect(() => {
+    setVideoSec(0);
+    setPlaying(false);
+    setSeekReq({ sec: 0, nonce: 0 });
+    if (!slug) {
+      setHasClip(null);
+      return;
+    }
+    setHasClip(null);
+    const controller = new AbortController();
+    (async () => {
+      try {
+        const res = await fetch(clipSrc(slug), {
+          method: "HEAD",
+          signal: controller.signal,
+        });
+        if (!controller.signal.aborted) setHasClip(res.ok);
+      } catch {
+        if (!controller.signal.aborted) setHasClip(false);
+      }
+    })();
+    return () => controller.abort();
+  }, [slug]);
+
+  // Optional: gently auto-play the muted clip once it's confirmed present.
+  // Respect prefers-reduced-motion by staying paused on the poster.
+  useEffect(() => {
+    if (hasClip === true && !reduceMotion) setPlaying(true);
+  }, [hasClip, reduceMotion]);
+
+  // User scrub: drives videoSec + requests a video seek. Implicitly pauses.
+  const handleSeek = useCallback(
+    (sec: number) => {
+      setPlaying(false);
+      const clamped = Math.max(0, Math.min(durationSec, sec));
+      setVideoSec(clamped);
+      setSeekReq((r) => ({ sec: clamped, nonce: r.nonce + 1 }));
+    },
+    [durationSec],
+  );
+  const handleScrubStart = useCallback(() => {
+    scrubbingRef.current = true;
+    setPlaying(false);
+  }, []);
+  const handleScrubEnd = useCallback(() => {
+    scrubbingRef.current = false;
+  }, []);
+
+  // Native video playback is the clock: mirror currentTime into videoSec
+  // (which drives the brain + scrubber). Crucially, do NOT re-seek the video.
+  const handleTime = useCallback(
+    (sec: number) => {
+      if (scrubbingRef.current) return;
+      setVideoSec(Math.max(0, Math.min(durationSec, sec)));
+    },
+    [durationSec],
+  );
+
+  const atEnd = durationSec > 0 && videoSec >= durationSec - 1e-3;
+  const togglePlay = useCallback(() => {
+    setPlaying((p) => {
+      const next = !p;
+      if (next && atEnd) {
+        setVideoSec(0);
+        setSeekReq((r) => ({ sec: 0, nonce: r.nonce + 1 }));
+      }
+      return next;
+    });
+  }, [atEnd]);
+
+  const showVideo = hasClip === true && activation !== null;
+  const hasTimeline = activation !== null && durationSec > 0;
+
   return (
-    <section
-      aria-labelledby="viewer-heading"
-      className="flex flex-col gap-4"
-    >
+    <section aria-labelledby="viewer-heading" className="flex flex-col gap-4">
       <h2 id="viewer-heading" className="sr-only">
         Predicted brain
       </h2>
 
-      <div
-        aria-busy={status === "loading"}
-        className="relative aspect-[5/4] w-full overflow-hidden border border-line bg-canvas"
-      >
-        {selected === null && <EmptyViewer />}
-
-        {/* Brain stays mounted once we have any detail, so switching
-            examples just updates its props (no canvas teardown). */}
-        {activation && (
-          <BrainMeshLazy
-            activation={meanFromActivation(activation)}
-            keyframeVertices={activation.byRegion as Record<RegionId, number[]>}
-            timestamps={activation.timestamps}
-            playheadSec={0}
-          />
+      {/* Video beside the brain on desktop, stacked on mobile. */}
+      <div className={["grid gap-3", showVideo ? "sm:grid-cols-2" : ""].join(" ")}>
+        {showVideo && slug && (
+          <div className="relative aspect-[5/4] w-full overflow-hidden border border-line bg-black">
+            <GalleryVideo
+              src={clipSrc(slug)}
+              poster={posterSrc(slug)}
+              playing={playing}
+              seekRequest={seekReq}
+              onTime={handleTime}
+              onEnded={() => setPlaying(false)}
+              muted
+              className="h-full w-full object-cover"
+            />
+          </div>
         )}
 
-        {showFirstLoadSkeleton && <BrainCanvasSkeleton />}
-        {showFirstLoadError && (
-          <ViewerError message={error} onRetry={onRetry} />
-        )}
+        <div
+          aria-busy={status === "loading"}
+          className="relative aspect-[5/4] w-full overflow-hidden border border-line bg-canvas"
+        >
+          {selected === null && <EmptyViewer />}
 
-        {/* Switching to a new pick while a previous brain is shown. */}
-        {detail && status === "loading" && (
-          <span className="pointer-events-none absolute right-3 top-3 z-30 border border-line bg-surface/95 px-2 py-1 font-mono text-[10px] uppercase tracking-[0.08em] text-ink-300 backdrop-blur-sm">
-            Loading…
-          </span>
-        )}
-        {detail && status === "error" && (
-          <ViewerErrorPill message={error} onRetry={onRetry} />
-        )}
+          {/* Brain stays mounted once we have any detail, so switching
+              examples just updates its props (no canvas teardown). */}
+          {activation && (
+            <BrainMeshLazy
+              activation={meanFromActivation(activation)}
+              keyframeVertices={activation.byRegion as Record<RegionId, number[]>}
+              timestamps={activation.timestamps}
+              playheadSec={brainPlayheadSec}
+            />
+          )}
+
+          {showFirstLoadSkeleton && <BrainCanvasSkeleton />}
+          {showFirstLoadError && (
+            <ViewerError message={error} onRetry={onRetry} />
+          )}
+
+          {detail && status === "loading" && (
+            <span className="pointer-events-none absolute right-3 top-3 z-30 border border-line bg-surface/95 px-2 py-1 font-mono text-[10px] uppercase tracking-[0.08em] text-ink-300 backdrop-blur-sm">
+              Loading…
+            </span>
+          )}
+          {detail && status === "error" && (
+            <ViewerErrorPill message={error} onRetry={onRetry} />
+          )}
+        </div>
       </div>
+
+      {/* One shared transport drives both panes. The reused TimelineScrubber
+          supplies the track; its bundled play button is hidden ([&_button])
+          so this single play/pause is the only control. */}
+      {hasTimeline && (
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            aria-label={playing ? "Pause" : "Play"}
+            aria-pressed={playing}
+            onClick={togglePlay}
+            className="flex h-6 w-6 shrink-0 items-center justify-center border border-line bg-surface text-ink-200 transition-colors hover:border-accent hover:text-accent focus-visible:border-accent focus-visible:text-accent focus-visible:outline-none"
+          >
+            {playing ? (
+              <svg width="9" height="10" viewBox="0 0 9 10" aria-hidden>
+                <rect x="0.5" y="0.5" width="2.5" height="9" fill="currentColor" />
+                <rect x="6" y="0.5" width="2.5" height="9" fill="currentColor" />
+              </svg>
+            ) : (
+              <svg width="9" height="10" viewBox="0 0 9 10" aria-hidden>
+                <path d="M1 0.5 L8.5 5 L1 9.5 Z" fill="currentColor" />
+              </svg>
+            )}
+          </button>
+          <div className="min-w-0 flex-1 [&_button]:hidden">
+            <TimelineScrubber
+              timestamps={tickSeconds}
+              duration={durationSec}
+              playheadSec={videoSec}
+              onSeek={handleSeek}
+              onScrubStart={handleScrubStart}
+              onScrubEnd={handleScrubEnd}
+            />
+          </div>
+        </div>
+      )}
 
       <ViewerMeta selected={selected} detail={detail} status={status} />
     </section>

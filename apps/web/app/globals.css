@@ -89,3 +89,28 @@ body {
   animation: motion-fade-in 320ms ease-out both;
 }
 
+/* Indeterminate "working" bar for the live-job tracker (TrackingPanel). The GPU
+   run is multi-minute with no real percentage to show, so a constantly sweeping
+   highlight reads as "alive, not stuck" without inventing a number. Under
+   reduced motion the rule above freezes animations, so fall back to a calm
+   static accent bar (the per-second elapsed clock carries the liveness signal). */
+@keyframes nm-indeterminate {
+  0% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(420%);
+  }
+}
+.nm-indeterminate {
+  animation: nm-indeterminate 1.5s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .nm-indeterminate {
+    animation: none !important;
+    transform: none;
+    width: 100%;
+    opacity: 0.5;
+  }
+}
+

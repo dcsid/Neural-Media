@@ -213,7 +213,11 @@ Resources:
       FunctionName: !Sub "neural-media-${Stage}-jobs-worker"
       CodeUri: lambdas/
       Handler: jobs_worker.handler.lambda_handler
-      Timeout: 30
+      # Long enough to cold-boot a sleeping HF Space (HF_WAKE_BUDGET_SEC=180s)
+      # via /healthz polling, then POST /predict — with margin. Warm jobs return
+      # in ~1s; only a cold gcTimeout wake blocks. Async-invoked, so the
+      # occasional wait costs nothing meaningful.
+      Timeout: 240
       Environment:
         Variables:
           # The HF Space POSTs results back here. Built at deploy time so

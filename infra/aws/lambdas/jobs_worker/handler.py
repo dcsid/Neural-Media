@@ -6,14 +6,15 @@ the Space, which acknowledges immediately and then runs yt-dlp + ffmpeg +
 TRIBE in the background. When the Space finishes it POSTs the result to
 /v2/internal/hf-callback, which writes S3 + flips status to done.
 
-For YouTube-URL jobs the analysis window (startSec/endSec) rides along to the
-Space's /predict call; uploads carry no segment and are analyzed in full
-(CONTRACTS §13.4 / §13.5).
+The analysis window (startSec/endSec) rides along to the Space's /predict call
+for BOTH url and upload jobs when present — the Space trims to it; absent (a
+whole-file upload) means no segment (CONTRACTS §13.4 / §13.5).
 """
 from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 
@@ -30,9 +31,17 @@ from shared import (
 HF_SPACE_URL = os.environ["HF_SPACE_URL"].rstrip("/")
 CALLBACK_URL = os.environ["CALLBACK_URL"]
 
-# The HF Space's /predict acks immediately, so 10s is plenty for the round-trip
-# even with a cold Space spin-up. Real inference time goes through the callback.
-HF_KICK_TIMEOUT_SEC = 10
+# The Space's /predict acks immediately — but ONLY once the Space is awake. A
+# sleeping Space (gcTimeout sleep) cold-boots in ~1-2 min, during which HF holds
+# the connection open with no response; a short timeout there marks perfectly
+# healthy jobs `hf_space_unreachable`. So we wake + confirm readiness via
+# /healthz polling (cold start tolerated) BEFORE POSTing /predict to the ready
+# Space. NB: the worker Lambda's Timeout must exceed
+# HF_WAKE_BUDGET_SEC + HF_KICK_TIMEOUT_SEC (see template.yaml).
+HF_KICK_TIMEOUT_SEC = 15      # POST /predict round-trip once the Space is up
+HF_WAKE_BUDGET_SEC = 180      # total time allowed to cold-boot a sleeping Space
+HF_HEALTH_TIMEOUT_SEC = 10    # per /healthz probe
+HF_HEALTH_INTERVAL_SEC = 5    # pause between probes
 
 
 def _predict_payload(
@@ -53,7 +62,36 @@ def _predict_payload(
     }
 
 
+def _space_is_healthy() -> bool:
+    """One /healthz probe. The first probe to a sleeping Space triggers HF's
+    cold boot; this returns False (timeout / 5xx) until the app is actually up."""
+    try:
+        with urllib.request.urlopen(
+            f"{HF_SPACE_URL}/healthz", timeout=HF_HEALTH_TIMEOUT_SEC
+        ) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return False
+
+
+def _ensure_space_awake() -> None:
+    """Block until /healthz is 200 or the wake budget elapses. Tolerates a cold
+    gcTimeout wake (~1-2 min) so the subsequent /predict lands on a ready Space
+    instead of timing out mid-boot. Raises TimeoutError if it never comes up."""
+    deadline = time.monotonic() + HF_WAKE_BUDGET_SEC
+    while not _space_is_healthy():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Space not ready after {HF_WAKE_BUDGET_SEC}s (cold start)"
+            )
+        time.sleep(HF_HEALTH_INTERVAL_SEC)
+
+
 def _kick_hf_space(job_id: str, source_payload: dict, segment: dict) -> None:
+    # Wake + confirm the Space is up before POSTing, so a cold gcTimeout sleep
+    # doesn't time out the /predict kick (the bug that wrongly marked warm-able
+    # jobs hf_space_unreachable).
+    _ensure_space_awake()
     body = json.dumps(
         # callbackToken is resolved at cold start from SSM SecureString and
         # memoised for the warm container's lifetime (see shared/).
@@ -106,8 +144,8 @@ def lambda_handler(event: dict, _context):
         )
         return {"ok": False, "error": "unknown_source"}
 
-    # Segment selection applies to the YouTube-URL path only; uploads are
-    # analyzed in full (CONTRACTS §13.4). startSec/endSec come back from
+    # The analysis window applies to both url and upload jobs (the Space trims
+    # the upload to it); absent → whole file. startSec/endSec come back from
     # DynamoDB as Decimal — cast to float for the JSON /predict body.
     segment: dict = {}
     if job.get("startSec") is not None and job.get("endSec") is not None:

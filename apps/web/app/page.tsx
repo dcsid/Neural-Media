@@ -861,6 +861,7 @@ function ErrorPanel({
   state: ErrorState;
   onReset: () => void;
 }) {
+  const isWaking = (state.errorCode ?? "").startsWith("hf_space_unreachable");
   const isOutOfBounds = state.errorCode === "segment_out_of_bounds";
   const isRejectedDuration = state.errorKind === "rejected_duration";
   const isTimeout = state.errorKind === "timeout";
@@ -872,6 +873,10 @@ function ErrorPanel({
     heading = "That window is past the end of the clip";
     body =
       "Your segment runs past where the clip ends. Pick an earlier window and try again.";
+  } else if (isWaking) {
+    heading = "The model was waking up";
+    body =
+      "The GPU had gone to sleep and didn't answer in time. It's warming up now — give it a moment and try again; the next run should go straight through.";
   } else if (isRejectedDuration) {
     heading = "Segment too long";
     body = `Segments longer than ${MAX_SEGMENT_SEC} seconds aren't supported. Pick a shorter window.`;
@@ -905,7 +910,7 @@ function ErrorPanel({
         onClick={onReset}
         className="mt-auto w-full border border-line px-4 py-2 font-mono text-[12px] uppercase tracking-[0.08em] text-ink-200 transition-colors hover:border-accent hover:text-accent"
       >
-        Start over
+        {isWaking || isNetwork || isTimeout ? "Try again" : "Start over"}
       </button>
     </div>
   );

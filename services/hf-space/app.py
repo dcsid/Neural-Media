@@ -288,19 +288,32 @@ def _ffprobe_duration(path: Path) -> float:
         raise PipelineError("failed_download", f"ffprobe returned non-numeric duration: {proc.stdout!r}") from e
 
 
-def _preprocess(src: Path, dest: Path) -> None:
-    """Normalise to TRIBE's input shape.
+def _preprocess(
+    src: Path, dest: Path, *, start: float | None = None, end: float | None = None
+) -> None:
+    """Normalise to TRIBE's input shape; optionally trim to ``[start, end)``.
 
     Mirror of services/pipeline/.../preprocess.py:build_ffmpeg_args with
     the constants pinned at module load (see VIDEO_RES, VIDEO_FPS,
     AUDIO_SR).  Re-encodes both streams — `-c copy` would defeat the
     resolution / fps change.
+
+    When ``start``/``end`` are given (the upload segment path) we input-seek
+    to ``start`` and take exactly ``end - start`` seconds; the re-encode makes
+    the cut clean from the seek point. The YouTube path passes neither —
+    yt-dlp already downloaded only the window.
     """
     ffmpeg = _which_or_raise("ffmpeg")
     w, h = (int(x) for x in VIDEO_RES.lower().split("x"))
+    trim = (
+        ["-ss", f"{start:g}", "-t", f"{end - start:g}"]
+        if start is not None and end is not None
+        else []
+    )
     proc = subprocess.run(
         [
             ffmpeg, "-y", "-loglevel", "error",
+            *trim,
             "-i", str(src),
             "-vf", f"scale={w}:{h}:flags=bicubic",
             "-r", str(VIDEO_FPS),
@@ -574,30 +587,60 @@ async def _run_job(req: PredictRequest) -> None:
             # The analyzed length IS the requested window (§13.3), regardless of
             # any keyframe padding in the downloaded file.
             duration = end - start
+            seg_start = seg_end = None  # yt-dlp already trimmed; don't re-cut
             _log.info(
                 "job=%s segment [%.2f, %.2f) of %.1fs video",
                 req.jobId, start, end, real_duration,
             )
         else:
-            # Upload path: whole file, segment ignored, hard 90 s cap, no trim.
+            # Upload path. If the caller supplied a [start, end) window, trim to
+            # it (same ≤90s cap as the YouTube path); otherwise analyze the whole
+            # file. The frontend's segment picker always sends a window now.
             raw_path = await _download_s3(req.source.value, raw_dir)
-            duration = _ffprobe_duration(raw_path)
-            _log.info("job=%s uploaded %.1fs", req.jobId, duration)
-            if duration > MAX_DURATION_SEC:
-                await _post_callback(req.callbackUrl, req.callbackToken, {
-                    "jobId": req.jobId,
-                    "status": "rejected_duration",
-                    "durationSec": duration,
-                    "error": f"video is {duration:.1f}s; max accepted is {MAX_DURATION_SEC:.0f}s",
-                })
-                return
+            file_duration = _ffprobe_duration(raw_path)
+            if req.startSec is not None and req.endSec is not None:
+                start, end = float(req.startSec), float(req.endSec)
+                if not (0.0 <= start < end):
+                    await _post_callback(req.callbackUrl, req.callbackToken, {
+                        "jobId": req.jobId, "status": "failed_inference",
+                        "error": f"bad_segment: need 0 <= startSec < endSec (got {start}, {end})",
+                    })
+                    return
+                if end - start > MAX_DURATION_SEC:
+                    await _post_callback(req.callbackUrl, req.callbackToken, {
+                        "jobId": req.jobId, "status": "rejected_duration",
+                        "durationSec": end - start,
+                        "error": f"segment is {end - start:.1f}s; max is {MAX_DURATION_SEC:.0f}s",
+                    })
+                    return
+                if end > file_duration:
+                    await _post_callback(req.callbackUrl, req.callbackToken, {
+                        "jobId": req.jobId, "status": "rejected_duration",
+                        "durationSec": file_duration, "error": "segment_out_of_bounds",
+                    })
+                    return
+                duration = end - start
+                seg_start, seg_end = start, end
+                _log.info("job=%s upload segment [%.2f, %.2f) of %.1fs file",
+                          req.jobId, start, end, file_duration)
+            else:
+                duration = file_duration
+                seg_start = seg_end = None
+                _log.info("job=%s uploaded %.1fs (whole file)", req.jobId, duration)
+                if duration > MAX_DURATION_SEC:
+                    await _post_callback(req.callbackUrl, req.callbackToken, {
+                        "jobId": req.jobId, "status": "rejected_duration",
+                        "durationSec": duration,
+                        "error": f"video is {duration:.1f}s; max is {MAX_DURATION_SEC:.0f}s",
+                    })
+                    return
 
         # 3-4. Preprocess + inference.  Name the preprocessed file after
         #      the jobId so TribeBackend's video_id-based resolver picks it up.
         proc_dir = workdir / "proc"
         proc_dir.mkdir()
         proc_path = proc_dir / f"{req.jobId}.mp4"
-        await asyncio.to_thread(_preprocess, raw_path, proc_path)
+        await asyncio.to_thread(_preprocess, raw_path, proc_path, start=seg_start, end=seg_end)
 
         # Seed derived from the jobId so identical inputs produce identical
         # outputs (TRIBE wrapper z-seeds torch + numpy + cuda from this).

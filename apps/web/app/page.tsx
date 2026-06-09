@@ -5,7 +5,6 @@ import Link from "next/link";
 import {
   useCallback,
   useEffect,
-  useMemo,
   useRef,
   useState,
   type ChangeEvent,
@@ -115,18 +114,8 @@ interface ResultState {
 type Phase = IdleState | TrackingState | ResultState | ErrorState;
 
 // ---------------------------------------------------------------------------
-// Status copy
+// Polling
 // ---------------------------------------------------------------------------
-
-const STATUS_COPY: Record<JobStatus, string> = {
-  pending: "Queueing your job...",
-  downloading: "Fetching your clip...",
-  inferring: "Predicting brain activity...",
-  done: "Loading results...",
-  failed_download: "We couldn't read that clip.",
-  failed_inference: "The model couldn't process that segment.",
-  rejected_duration: "Segment too long.",
-};
 
 const POLL_INTERVAL_MS = 2000;
 // Real TRIBE forward pass is ~12s/segment on the A10G, but the FIRST request
@@ -134,9 +123,6 @@ const POLL_INTERVAL_MS = 2000;
 // weights). 10 minutes covers a cold start + a long 90s clip without
 // false-timing-out a job that's actually still running.
 const POLL_TIMEOUT_MS = 600_000;
-// Progress-bar anchor (warm-path latency). Longer real waits just park the bar
-// near its 95% cap — it's a "working…" indicator, not a real ETA.
-const TYPICAL_LATENCY_SEC = 90;
 
 // Live inference is wired up (Stage 2: HF Space + Lambda). Set false to fall
 // back to the coming-soon panel pointing at the precomputed gallery.
@@ -710,47 +696,157 @@ function ComingSoonPanel() {
 }
 
 // ---------------------------------------------------------------------------
-// Tracking panel
+// Tracking panel — honest stage stepper (L1)
+//
+// The raw job status barely moves (it sits on "downloading" for the whole
+// multi-minute GPU run), so instead of a fake percentage we show: the real
+// coarse phase as a stepper, a per-second elapsed clock (the clearest
+// "not stuck" signal — and it ticks even under reduced motion), and an
+// indeterminate bar for constant motion. We deliberately DON'T claim a
+// sub-stage (transcribe / encode / predict) we can't observe from the browser
+// — that's the future L3 work, fed by real progress pings from the Space.
 // ---------------------------------------------------------------------------
 
+const TRACK_STEPS: { key: string; label: string }[] = [
+  { key: "uploaded", label: "Clip uploaded" },
+  { key: "queued", label: "Queued" },
+  { key: "running", label: "Running on the GPU" },
+  { key: "result", label: "Result ready" },
+];
+
+// Map the raw job status onto a stepper index. downloading + inferring both
+// just mean "the Space has it and is working" → the single "Running on the GPU"
+// step (the status itself mislabels this whole phase as "downloading").
+function trackStepIndex(status: JobStatus): number {
+  if (status === "pending") return 1;
+  if (status === "downloading" || status === "inferring") return 2;
+  if (status === "done") return 3;
+  return 2; // terminal failures render in ErrorPanel, not here
+}
+
+function formatElapsed(totalSec: number): string {
+  const m = Math.floor(Math.max(0, totalSec) / 60);
+  const s = Math.max(0, totalSec) % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
 function TrackingPanel({ state }: { state: TrackingState }) {
-  // A vague progress hint — we don't know the true fraction, but anchoring on
-  // TYPICAL_LATENCY_SEC keeps the bar moving even when status doesn't change.
-  // Cap at 95% so it never visually finishes ahead of the actual result.
-  const progress = useMemo(
-    () =>
-      Math.min(95, Math.round((state.elapsedSec / TYPICAL_LATENCY_SEC) * 100)),
-    [state.elapsedSec],
+  // Per-second clock, independent of the 2s status poll, so the timer visibly
+  // ticks every second. Driven by JS state (not a CSS animation), so it keeps
+  // moving even under prefers-reduced-motion — the primary "not stuck" signal.
+  const [nowMs, setNowMs] = useState(() => state.startedAtMs);
+  useEffect(() => {
+    setNowMs(Date.now());
+    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+  const elapsedSec = Math.max(
+    state.elapsedSec,
+    Math.floor((nowMs - state.startedAtMs) / 1000),
   );
+
+  const cur = trackStepIndex(state.status);
   const segLen = Math.max(0, state.endSec - state.startSec);
+
   return (
-    <div className="motion-fade-in flex h-full flex-col gap-4 border border-line bg-surface/40 p-6">
-      <p className="eyebrow">Job {shortId(state.jobId)}</p>
-      <p className="font-serif text-[18px] leading-tight text-ink-50">
-        {STATUS_COPY[state.status]}
-      </p>
-      <div
-        role="progressbar"
-        aria-valuemin={0}
-        aria-valuemax={100}
-        aria-valuenow={progress}
-        className="relative h-[3px] w-full overflow-hidden bg-line"
-      >
-        <div
-          className="absolute inset-y-0 left-0 bg-accent transition-[width] duration-500 ease-out"
-          style={{ width: `${progress}%` }}
-        />
+    <div className="motion-fade-in flex h-full flex-col gap-5 border border-line bg-surface/40 p-6">
+      <div className="flex items-baseline justify-between gap-3">
+        <p className="eyebrow">Job {shortId(state.jobId)}</p>
+        <p
+          className="font-mono text-[12px] tabular-nums text-ink-200"
+          aria-label={`${elapsedSec} seconds elapsed`}
+        >
+          {formatElapsed(elapsedSec)}
+        </p>
       </div>
-      <p className="font-mono text-[11px] tabular-nums text-ink-300">
-        {state.elapsedSec}s elapsed · {segLen.toFixed(0)}s segment
+      <p className="font-serif text-[18px] leading-tight text-ink-50">
+        {cur <= 1
+          ? "Getting your job in line…"
+          : "Predicting your brain response…"}
       </p>
-      <p className="mt-auto max-w-[40ch] text-[12px] leading-relaxed text-ink-400">
-        Predicting on a real GPU. This usually takes a minute or two — the first
-        run after the service has been idle can take several minutes while the
-        model warms up. Your clip and its predicted brain appear together, on one
-        timeline, the moment results land.
+
+      <ol className="flex flex-col gap-3">
+        {TRACK_STEPS.map((step, i) => {
+          const stepState = i < cur ? "done" : i === cur ? "active" : "todo";
+          const isRunning = step.key === "running" && stepState === "active";
+          return (
+            <li
+              key={step.key}
+              className="flex flex-col gap-2"
+              aria-current={stepState === "active" ? "step" : undefined}
+            >
+              <div className="flex items-center gap-3">
+                <StepDot state={stepState} />
+                <span
+                  className={[
+                    "font-mono text-[12px]",
+                    stepState === "done"
+                      ? "text-ink-300"
+                      : stepState === "active"
+                        ? "text-ink-50"
+                        : "text-ink-500",
+                  ].join(" ")}
+                >
+                  {step.label}
+                </span>
+              </div>
+              {isRunning && (
+                <div className="ml-[27px] flex flex-col gap-2">
+                  <div
+                    role="progressbar"
+                    aria-label="Working"
+                    className="relative h-[3px] w-full overflow-hidden bg-line"
+                  >
+                    <div className="nm-indeterminate absolute inset-y-0 w-1/3 bg-accent" />
+                  </div>
+                  <p className="max-w-[40ch] text-[12px] leading-relaxed text-ink-400">
+                    Transcribing the audio, encoding the video, and running TRIBE
+                    on a real GPU. Usually a few minutes — the first run after the
+                    model&rsquo;s been idle is the slowest.
+                  </p>
+                </div>
+              )}
+            </li>
+          );
+        })}
+      </ol>
+
+      <p className="mt-auto font-mono text-[11px] tabular-nums text-ink-500">
+        {segLen.toFixed(0)}s segment · your clip + brain appear the moment it lands
       </p>
     </div>
+  );
+}
+
+function StepDot({ state }: { state: "done" | "active" | "todo" }) {
+  if (state === "done") {
+    return (
+      <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full border border-accent/50 bg-accent/15 text-accent">
+        <svg width="8" height="8" viewBox="0 0 8 8" aria-hidden>
+          <path
+            d="M1 4.2 L3 6.2 L7 1.6"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.4"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+      </span>
+    );
+  }
+  if (state === "active") {
+    return (
+      <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full border border-accent">
+        <span className="h-1.5 w-1.5 rounded-full bg-accent animate-pulse" />
+      </span>
+    );
+  }
+  return (
+    <span
+      className="h-4 w-4 shrink-0 rounded-full border border-line"
+      aria-hidden
+    />
   );
 }
 

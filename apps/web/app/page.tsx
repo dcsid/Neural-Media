@@ -16,11 +16,9 @@ import {
   ApiV2Error,
   confirmUpload,
   createUploadJob,
-  createUrlJob,
   fetchActivation,
   getJob,
   isFailureStatus,
-  looksLikeYouTubeUrl,
   MAX_SEGMENT_SEC,
   putUpload,
   validateSegment,
@@ -29,6 +27,7 @@ import {
   type JobStatusResponse,
   type TerminalFailureStatus,
 } from "@/lib/api-v2";
+import { LiveResultViewer } from "@/components/brain/LiveResultViewer";
 
 // Re-uses the existing BrainMesh component. Dynamic with ssr:false
 // matches BrainMeshSlot/AutoPlayingBrain — R3F's runtime touches browser-
@@ -51,24 +50,29 @@ const BrainMeshLazy = dynamic(
 
 // ---------------------------------------------------------------------------
 // State machine
+//
+// The product is upload-only: YouTube-by-URL is blocked from datacenter IPs
+// (yt-dlp → 403 from AWS/HF), so the live path is "drop an MP4, pick a ≤90s
+// window, watch the synced video+brain". The URL form is retired (the lib
+// keeps createUrlJob/looksLikeYouTubeUrl dormant for a future re-add).
 // ---------------------------------------------------------------------------
-
-type SubmitMode = "url" | "upload";
 
 interface IdleState {
   kind: "idle";
-  mode: SubmitMode;
-  url: string;
-  // Segment window as raw input strings so the number fields can be cleared
-  // / partially typed; parsed + validated (CONTRACTS.md §13.2) at submit.
-  // Applies to the URL path only — uploads are analyzed in full (§13.4).
+  // The uploaded MP4 (null until the user picks one → dropzone shown).
+  file: File | null;
+  // Duration read from the file's own metadata (null while probing / no file).
+  // Bounds the picker's End so we never request a window past the file's end.
+  fileDurationSec: number | null;
+  // Inline message if the picked file's metadata couldn't be read.
+  fileError?: string;
+  // Segment window as raw input strings so the number fields can be cleared /
+  // partially typed; parsed + validated (CONTRACTS §13.2/§13.4) at submit.
   startInput: string;
   endInput: string;
-  // Submission-time errors (e.g. POST /v2/jobs returned 4xx, file too large).
-  // Re-renders the idle form with the error inline.
+  // Submission-time error (create/put/confirm 4xx, network). Shown inline.
   submitError?: string;
-  // Set while POST /v2/jobs (or the create-upload chain) is in flight, so
-  // we can disable the Predict button without dropping the user's input.
+  // Set while the create→put→confirm chain is in flight.
   submitting?: boolean;
 }
 
@@ -77,35 +81,35 @@ interface TrackingState {
   jobId: string;
   status: JobStatus;
   elapsedSec: number;
-  // Wall-clock ms at which polling started. Used to enforce the 180s
-  // overall cap independently of whatever elapsedSec the server reports
-  // (which might lag or reset).
+  // Wall-clock ms at which polling started. Enforces the overall cap
+  // independently of whatever elapsedSec the server reports.
   startedAtMs: number;
+  // Carried from the upload so the result can play the LOCAL file (never
+  // re-downloaded), trimmed to the analyzed [startSec, endSec) window.
+  file: File;
+  startSec: number;
+  endSec: number;
 }
 
-// Specific failure modes the UI cares about. "network" covers polling
-// fetches that died with no actionable server status (e.g. server went
-// down mid-job). "timeout" fires when the 180s budget elapses without
-// reaching a terminal status.
+// Specific failure modes the UI cares about. "network" covers polling fetches
+// that died with no actionable server status; "timeout" fires when the overall
+// budget elapses without reaching a terminal status.
 type ErrorKind = TerminalFailureStatus | "network" | "timeout";
 
 interface ErrorState {
   kind: "error";
   errorKind: ErrorKind;
-  // Server-supplied machine-readable error code (e.g. "download_blocked",
-  // "segment_out_of_bounds"). Drives the upload-fallback / out-of-bounds
-  // branches — never shown raw in the UI.
+  // Server-supplied machine-readable error code — drives copy, never shown raw.
   errorCode?: string;
-  // Set while an upload from the download-blocked fallback is in flight; holds
-  // an inline message if that upload itself fails (so the panel stays usable).
-  uploading?: boolean;
-  uploadError?: string;
 }
 
 interface ResultState {
   kind: "result";
   jobId: string;
   activation: ActivationPayload;
+  // The local upload + where its analyzed window starts, for the synced player.
+  file: File;
+  startSec: number;
 }
 
 type Phase = IdleState | TrackingState | ResultState | ErrorState;
@@ -116,40 +120,40 @@ type Phase = IdleState | TrackingState | ResultState | ErrorState;
 
 const STATUS_COPY: Record<JobStatus, string> = {
   pending: "Queueing your job...",
-  downloading:
-    "Fetching that segment from YouTube... (this can fail — we'll let you know)",
+  downloading: "Fetching your clip...",
   inferring: "Predicting brain activity...",
   done: "Loading results...",
-  failed_download: "We couldn't fetch that video.",
+  failed_download: "We couldn't read that clip.",
   failed_inference: "The model couldn't process that segment.",
   rejected_duration: "Segment too long.",
 };
 
 const POLL_INTERVAL_MS = 2000;
-const POLL_TIMEOUT_MS = 180_000;
-const TYPICAL_LATENCY_SEC = 30;
+// Real TRIBE forward pass is ~12s/segment on the A10G, but the FIRST request
+// after the Space has been idle pays a cold-start weight warm-up (~17GB lazy
+// weights). 10 minutes covers a cold start + a long 90s clip without
+// false-timing-out a job that's actually still running.
+const POLL_TIMEOUT_MS = 600_000;
+// Progress-bar anchor (warm-path latency). Longer real waits just park the bar
+// near its 95% cap — it's a "working…" indicator, not a real ETA.
+const TYPICAL_LATENCY_SEC = 90;
 
-// Stage 1 (the static gallery deploy) ships WITHOUT the live-inference backend
-// (HF Space + Lambda). Until that's live (Stage 2), the home page shows a
-// "coming soon" panel that points at the precomputed gallery, instead of a form
-// that would POST /v2/jobs to nothing. Flip to true once the backend is up.
-const LIVE_INFERENCE_ENABLED: boolean = false;
+// Live inference is wired up (Stage 2: HF Space + Lambda). Set false to fall
+// back to the coming-soon panel pointing at the precomputed gallery.
+const LIVE_INFERENCE_ENABLED: boolean = true;
 
-// A single failed status poll (a 5xx blip, a dropped packet) shouldn't kill
-// the run — keep ticking and recover on the next success. Surface a connection
-// error only after this many in a row; the 180s cap is the ultimate backstop.
+// A single failed status poll (a 5xx blip, a dropped packet) shouldn't kill the
+// run — keep ticking and recover on the next success. Surface a connection
+// error only after this many in a row; the timeout cap is the ultimate backstop.
 const MAX_CONSECUTIVE_POLL_FAILURES = 5;
 
-// User-facing copy for the contract error_codes (CONTRACTS.md §13.2). Shared
-// by the picker's inline validation, the create-time 400 fallback, and the
-// error panel.
+// User-facing copy for the contract error_codes (CONTRACTS.md §13.2). Shared by
+// the picker's inline validation, the confirm-time 400 fallback, and the error
+// panel.
 const ERROR_CODE_COPY: Record<string, string> = {
-  invalid_url: "That doesn't look like a YouTube URL.",
   bad_segment: "Pick a start and end with the start before the end.",
   segment_too_long: `Keep the window to ${MAX_SEGMENT_SEC} seconds or less.`,
-  segment_out_of_bounds:
-    "That window runs past the end of the video — pick an earlier one.",
-  download_blocked: "YouTube blocked the download for that video.",
+  segment_out_of_bounds: "That window runs past the end of your clip — pick an earlier one.",
 };
 
 // Read the contract `error_code` off an ApiV2Error's parsed 400 body.
@@ -161,6 +165,31 @@ function errorCodeFromBody(body: unknown): string | undefined {
   return undefined;
 }
 
+// Probe a local video File's duration without keeping the element around. Used
+// to bound the segment picker at the real file length. Rejects on a file we
+// can't decode (so the UI can ask for a standard MP4).
+function readVideoDuration(file: File): Promise<number> {
+  return new Promise((resolve, reject) => {
+    if (typeof document === "undefined") {
+      reject(new Error("no document"));
+      return;
+    }
+    const url = URL.createObjectURL(file);
+    const v = document.createElement("video");
+    v.preload = "metadata";
+    const done = (fn: () => void) => {
+      URL.revokeObjectURL(url);
+      fn();
+    };
+    v.onloadedmetadata = () => {
+      const d = Number.isFinite(v.duration) ? v.duration : 0;
+      done(() => (d > 0 ? resolve(d) : reject(new Error("zero duration"))));
+    };
+    v.onerror = () => done(() => reject(new Error("decode error")));
+    v.src = url;
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
@@ -168,21 +197,18 @@ function errorCodeFromBody(body: unknown): string | undefined {
 export default function SingleVideoPage() {
   const [phase, setPhase] = useState<Phase>({
     kind: "idle",
-    mode: "url",
-    url: "",
+    file: null,
+    fileDurationSec: null,
     startInput: "0",
-    endInput: "30",
+    endInput: "0",
   });
 
-  // Top-level AbortController for any in-flight fetch (polling loop,
-  // result download). Refreshed each time we enter a new phase that
-  // owns requests; aborted on unmount or on phase transition.
+  // Top-level AbortController for any in-flight fetch (polling loop, result
+  // download). Refreshed each time we enter a phase that owns requests.
   const abortRef = useRef<AbortController | null>(null);
 
   // Guards double-submit / resubmit-while-in-flight (a recruiter mashing
-  // Predict or dropping two files): any create chain in progress short-circuits
-  // a second until it settles. A ref so it updates synchronously, before React
-  // re-renders the disabled button.
+  // Predict or dropping two files). A ref so it updates synchronously.
   const inFlightRef = useRef(false);
 
   useEffect(() => {
@@ -191,27 +217,54 @@ export default function SingleVideoPage() {
     };
   }, []);
 
-  // ----- IDLE: submit handlers -------------------------------------------
+  // ----- IDLE: pick a file + probe its duration --------------------------
 
-  const submitUrl = useCallback(
-    async (url: string, startSec: number, endSec: number) => {
-      if (inFlightRef.current) return; // double-submit / resubmit-in-flight
-      const trimmed = url.trim();
-      if (!looksLikeYouTubeUrl(trimmed)) {
+  const onFileSelected = useCallback((file: File) => {
+    if (inFlightRef.current) return; // create-chain in flight
+    // Show the file immediately in a "reading…" state; probe its duration so
+    // the picker can bound End at the real file length.
+    setPhase({
+      kind: "idle",
+      file,
+      fileDurationSec: null,
+      startInput: "0",
+      endInput: "0",
+    });
+    readVideoDuration(file)
+      .then((dur) => {
+        // Default to the first ≤30s of the clip — short enough to keep the
+        // demo snappy, the user can extend to the 90s cap.
+        const end = Math.min(dur, 30);
         setPhase((p) =>
-          p.kind === "idle"
-            ? { ...p, submitError: ERROR_CODE_COPY.invalid_url }
+          p.kind === "idle" && p.file === file
+            ? {
+                ...p,
+                fileDurationSec: dur,
+                startInput: "0",
+                endInput: String(Math.round(end)),
+              }
             : p,
         );
-        return;
-      }
-      const segErr = validateSegment(startSec, endSec);
-      if (segErr) {
+      })
+      .catch(() => {
         setPhase((p) =>
-          p.kind === "idle" ? { ...p, submitError: ERROR_CODE_COPY[segErr] } : p,
+          p.kind === "idle" && p.file === file
+            ? {
+                ...p,
+                file: null,
+                fileDurationSec: null,
+                fileError: "Couldn't read that video. Try a standard MP4 (H.264).",
+              }
+            : p,
         );
-        return;
-      }
+      });
+  }, []);
+
+  // ----- IDLE: start the prediction --------------------------------------
+
+  const startPrediction = useCallback(
+    async (file: File, startSec: number, endSec: number) => {
+      if (inFlightRef.current) return; // double-submit / resubmit-in-flight
       inFlightRef.current = true;
       setPhase((p) =>
         p.kind === "idle"
@@ -219,26 +272,29 @@ export default function SingleVideoPage() {
           : p,
       );
       try {
-        const { jobId } = await createUrlJob(trimmed, { startSec, endSec });
+        const created = await createUploadJob(file.name, file.type || "video/mp4");
+        await putUpload(created.uploadUrl, file);
+        await confirmUpload(created.jobId, { startSec, endSec });
         setPhase({
           kind: "tracking",
-          jobId,
+          jobId: created.jobId,
           status: "pending",
           elapsedSec: 0,
           startedAtMs: Date.now(),
+          file,
+          startSec,
+          endSec,
         });
       } catch (err) {
-        // Server re-validates (§13.2): map a known error_code to friendly copy;
-        // otherwise a calm, non-technical fallback (never a raw code/status).
+        // Confirm re-validates the segment (§13.2): map a known error_code to
+        // friendly copy; else a calm fallback (never a raw code/status).
         const code =
           err instanceof ApiV2Error ? errorCodeFromBody(err.body) : undefined;
         const msg =
           (code && ERROR_CODE_COPY[code]) ??
-          "Couldn't start the job. Check your connection and try again.";
+          "Upload failed. Check your connection and try again.";
         setPhase((p) =>
-          p.kind === "idle"
-            ? { ...p, submitting: false, submitError: msg }
-            : p,
+          p.kind === "idle" ? { ...p, submitting: false, submitError: msg } : p,
         );
       } finally {
         inFlightRef.current = false;
@@ -247,76 +303,24 @@ export default function SingleVideoPage() {
     [],
   );
 
-  const submitUpload = useCallback(async (file: File) => {
-    if (inFlightRef.current) return; // double-drop / resubmit-in-flight
-    inFlightRef.current = true;
-    // Mark busy without losing the user's place: from idle, show the form
-    // spinner; from the error panel, show the dropzone's uploading state.
-    setPhase((p) => {
-      if (p.kind === "idle") {
-        return { ...p, submitting: true, submitError: undefined };
-      }
-      if (p.kind === "error") {
-        return { ...p, uploading: true, uploadError: undefined };
-      }
-      return p;
-    });
-    try {
-      const created = await createUploadJob(
-        file.name,
-        file.type || "video/mp4",
-      );
-      await putUpload(created.uploadUrl, file);
-      await confirmUpload(created.jobId);
-      setPhase({
-        kind: "tracking",
-        jobId: created.jobId,
-        status: "pending",
-        elapsedSec: 0,
-        startedAtMs: Date.now(),
-      });
-    } catch {
-      // Stay where the user is and offer a clean retry — from idle, inline on
-      // the form; from the download-blocked panel, inline on the dropzone.
-      setPhase((p) => {
-        if (p.kind === "idle") {
-          return { ...p, submitting: false, submitError: "Upload failed. Try again." };
-        }
-        if (p.kind === "error") {
-          return {
-            ...p,
-            uploading: false,
-            uploadError: "That upload didn't go through — try again.",
-          };
-        }
-        return p;
-      });
-    } finally {
-      inFlightRef.current = false;
-    }
-  }, []);
-
   const reset = useCallback(() => {
     abortRef.current?.abort();
     abortRef.current = null;
     inFlightRef.current = false;
     setPhase({
       kind: "idle",
-      mode: "url",
-      url: "",
+      file: null,
+      fileDurationSec: null,
       startInput: "0",
-      endInput: "30",
+      endInput: "0",
     });
   }, []);
 
   // ----- TRACKING: polling -----------------------------------------------
 
-  // Hoisted, referentially-stable primitives so the polling effect depends
-  // on exactly the job identity (jobId + startedAtMs). The per-tick status /
-  // elapsed updates keep the same identity, so they must NOT re-run the
-  // effect and restart polling; pulling these out of the dependency array
-  // (rather than inlining ternaries) also keeps the deps statically
-  // verifiable by react-hooks/exhaustive-deps.
+  // Hoisted, referentially-stable primitives so the polling effect depends on
+  // exactly the job identity (jobId + startedAtMs). Per-tick status/elapsed
+  // updates keep the same identity, so they must NOT restart polling.
   const trackingJobId = phase.kind === "tracking" ? phase.jobId : null;
   const trackingStartedAtMs =
     phase.kind === "tracking" ? phase.startedAtMs : null;
@@ -340,7 +344,7 @@ export default function SingleVideoPage() {
         if (controller.signal.aborted) return;
         // Transient failure (offline, 5xx, parse): don't kill the run on a
         // blip — the next tick retries. Surface a connection error only after
-        // a sustained streak; the 180s cap is the ultimate backstop.
+        // a sustained streak; the timeout cap is the ultimate backstop.
         consecutiveFailures += 1;
         if (consecutiveFailures >= MAX_CONSECUTIVE_POLL_FAILURES && !cancelled) {
           setPhase({ kind: "error", errorKind: "network" });
@@ -359,7 +363,19 @@ export default function SingleVideoPage() {
             signal: controller.signal,
           });
           if (cancelled) return;
-          setPhase({ kind: "result", jobId, activation });
+          // Carry the local file + segment start from the tracking phase into
+          // the result so the synced player can trim playback to the window.
+          setPhase((p) =>
+            p.kind === "tracking" && p.jobId === jobId
+              ? {
+                  kind: "result",
+                  jobId,
+                  activation,
+                  file: p.file,
+                  startSec: p.startSec,
+                }
+              : p,
+          );
         } catch (err) {
           if (controller.signal.aborted) return;
           if (!cancelled) {
@@ -384,8 +400,7 @@ export default function SingleVideoPage() {
       }
 
       // Still in flight — update status + elapsed. Prefer the server's
-      // elapsedSec if it's monotonically newer; otherwise compute from
-      // wall clock so the meter ticks while we wait for the next poll.
+      // elapsedSec if it's monotonically newer; else compute from wall clock.
       const wallSec = Math.floor((Date.now() - startedAtMs) / 1000);
       setPhase((p) =>
         p.kind === "tracking" && p.jobId === jobId
@@ -398,9 +413,6 @@ export default function SingleVideoPage() {
       );
     }
 
-    // Fire immediately, then on an interval. Wrap the wall-clock cap
-    // check inside the interval so we don't fire-and-leak a final poll
-    // past the cap.
     poll();
     const interval = window.setInterval(() => {
       if (cancelled || controller.signal.aborted) return;
@@ -429,229 +441,127 @@ export default function SingleVideoPage() {
         <h1 className="mt-2 font-serif text-[28px] leading-tight tracking-tightish text-ink-50">
           {phase.kind === "result"
             ? "Your brain on that video"
-            : "See your brain on a YouTube clip"}
+            : "See your brain on a video clip"}
         </h1>
         <p className="mt-3 max-w-[64ch] text-[14px] leading-relaxed text-ink-200">
           {phase.kind === "result"
-            ? "Predicted average cortical response for your segment, rendered on the fsaverage5 surface below."
+            ? "Predicted average cortical response for your segment, rendered on the fsaverage5 surface — your clip and brain share one timeline below."
             : LIVE_INFERENCE_ENABLED
-              ? `Paste a YouTube link, choose up to ${MAX_SEGMENT_SEC} seconds, and watch the predicted cortical response light up the 3D brain.`
-              : "Soon you'll paste a YouTube link and watch the predicted cortical response light up the 3D brain. For now, explore real precomputed predictions in the gallery."}
+              ? `Upload a clip, choose up to ${MAX_SEGMENT_SEC} seconds, and watch the predicted cortical response light up the 3D brain beside your video.`
+              : "Soon you'll upload a clip and watch the predicted cortical response light up the 3D brain. For now, explore real precomputed predictions in the gallery."}
         </p>
       </header>
 
-      <section className="mt-10 grid gap-8 md:grid-cols-[minmax(0,1fr)_minmax(0,460px)]">
-        <div className="relative aspect-[5/4] w-full overflow-hidden border border-line bg-canvas">
-          {phase.kind === "result" ? (
-            <BrainMeshLazy
-              activation={meanFromActivation(phase.activation)}
-              keyframeVertices={phase.activation.byRegion}
-              timestamps={phase.activation.timestamps}
-              playheadSec={0}
-            />
-          ) : (
+      {phase.kind === "result" ? (
+        <div className="mt-10">
+          <LiveResultViewer
+            file={phase.file}
+            startOffsetSec={phase.startSec}
+            activation={phase.activation}
+            jobId={phase.jobId}
+            onReset={reset}
+          />
+        </div>
+      ) : (
+        <section className="mt-10 grid gap-8 md:grid-cols-[minmax(0,1fr)_minmax(0,460px)]">
+          <div className="relative aspect-[5/4] w-full overflow-hidden border border-line bg-canvas">
             <BrainMeshLazy activation={0} />
-          )}
-        </div>
+          </div>
 
-        <div className="flex min-h-full flex-col">
-          {phase.kind === "idle" &&
-            (LIVE_INFERENCE_ENABLED ? (
-              <IdlePanel
-                state={phase}
-                onChange={(next) => setPhase(next)}
-                onSubmitUrl={submitUrl}
-                onSubmitUpload={submitUpload}
-              />
-            ) : (
-              <ComingSoonPanel />
-            ))}
+          <div className="flex min-h-full flex-col">
+            {phase.kind === "idle" &&
+              (LIVE_INFERENCE_ENABLED ? (
+                <IdlePanel
+                  state={phase}
+                  onChange={(next) => setPhase(next)}
+                  onFileSelected={onFileSelected}
+                  onPredict={startPrediction}
+                />
+              ) : (
+                <ComingSoonPanel />
+              ))}
 
-          {phase.kind === "tracking" && <TrackingPanel state={phase} />}
+            {phase.kind === "tracking" && <TrackingPanel state={phase} />}
 
-          {phase.kind === "result" && (
-            <ResultPanel state={phase} onReset={reset} />
-          )}
-
-          {phase.kind === "error" && (
-            <ErrorPanel
-              state={phase}
-              onReset={reset}
-              onSubmitUpload={submitUpload}
-            />
-          )}
-        </div>
-      </section>
+            {phase.kind === "error" && (
+              <ErrorPanel state={phase} onReset={reset} />
+            )}
+          </div>
+        </section>
+      )}
     </main>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Idle panel
+// Idle panel — upload + segment picker
 // ---------------------------------------------------------------------------
 
 interface IdlePanelProps {
   state: IdleState;
   onChange: (next: IdleState) => void;
-  onSubmitUrl: (url: string, startSec: number, endSec: number) => void;
-  onSubmitUpload: (file: File) => void;
+  onFileSelected: (file: File) => void;
+  onPredict: (file: File, startSec: number, endSec: number) => void;
 }
 
 function IdlePanel({
   state,
   onChange,
-  onSubmitUrl,
-  onSubmitUpload,
+  onFileSelected,
+  onPredict,
 }: IdlePanelProps) {
-  const urlValid = looksLikeYouTubeUrl(state.url);
+  const { file, fileDurationSec } = state;
+  const reading = file !== null && fileDurationSec === null;
+  const ready = file !== null && fileDurationSec !== null;
+
   const startSec = Number.parseFloat(state.startInput);
   const endSec = Number.parseFloat(state.endInput);
-  const segmentError = validateSegment(startSec, endSec);
-  const canSubmit = urlValid && segmentError === null && !state.submitting;
+  // Base segment rules (start<end, ≤90s) + the file-length bound: End can't run
+  // past the clip (the Space would reject it as segment_out_of_bounds).
+  const baseErr = validateSegment(startSec, endSec);
+  const overRun =
+    ready && Number.isFinite(endSec) && endSec > (fileDurationSec ?? 0) + 1e-3;
+  const segmentError: string | null =
+    baseErr ?? (overRun ? "segment_out_of_bounds" : null);
+  const canSubmit = ready && segmentError === null && !state.submitting;
 
-  const onUrlChange = (e: ChangeEvent<HTMLInputElement>) => {
-    onChange({ ...state, url: e.target.value, submitError: undefined });
-  };
-  const onStartChange = (e: ChangeEvent<HTMLInputElement>) => {
+  const onStartChange = (e: ChangeEvent<HTMLInputElement>) =>
     onChange({ ...state, startInput: e.target.value, submitError: undefined });
-  };
-  const onEndChange = (e: ChangeEvent<HTMLInputElement>) => {
+  const onEndChange = (e: ChangeEvent<HTMLInputElement>) =>
     onChange({ ...state, endInput: e.target.value, submitError: undefined });
-  };
 
-  const onUrlSubmit = (e: FormEvent<HTMLFormElement>) => {
+  const clearFile = () =>
+    onChange({
+      ...state,
+      file: null,
+      fileDurationSec: null,
+      fileError: undefined,
+      submitError: undefined,
+    });
+
+  const onSubmit = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    if (!canSubmit) return;
-    onSubmitUrl(state.url, startSec, endSec);
+    if (!canSubmit || !file) return;
+    onPredict(file, startSec, endSec);
   };
-
-  const switchToUpload = () =>
-    onChange({ ...state, mode: "upload", submitError: undefined });
-  const switchToUrl = () =>
-    onChange({ ...state, mode: "url", submitError: undefined });
 
   return (
     <div className="motion-fade-in flex h-full flex-col gap-6 border border-line bg-surface/40 p-6">
-      {state.mode === "url" ? (
+      {!ready ? (
         <>
-          <form onSubmit={onUrlSubmit} className="space-y-3">
-            <label className="eyebrow block" htmlFor="single-youtube-url">
-              YouTube URL
-            </label>
-            <input
-              id="single-youtube-url"
-              type="url"
-              inputMode="url"
-              autoComplete="off"
-              spellCheck={false}
-              required
-              aria-required="true"
-              placeholder="https://www.youtube.com/watch?v=..."
-              value={state.url}
-              onChange={onUrlChange}
-              disabled={state.submitting}
-              className={[
-                "w-full border border-line bg-canvas px-3 py-2 font-mono text-[13px]",
-                "text-ink-100 placeholder:text-ink-400",
-                "focus-visible:border-accent focus-visible:outline-none",
-              ].join(" ")}
-            />
-            {state.url.length > 0 && !urlValid && (
-              <p role="alert" className="text-[12px] text-accent">
-                {ERROR_CODE_COPY.invalid_url}
-              </p>
-            )}
-
-            <fieldset className="space-y-2" disabled={state.submitting}>
-              <legend className="eyebrow">
-                Segment to analyze (≤{MAX_SEGMENT_SEC}s)
-              </legend>
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label
-                    htmlFor="single-start-sec"
-                    className="block text-[11px] text-ink-300"
-                  >
-                    Start (s)
-                  </label>
-                  <input
-                    id="single-start-sec"
-                    type="number"
-                    min={0}
-                    step={1}
-                    inputMode="decimal"
-                    value={state.startInput}
-                    onChange={onStartChange}
-                    aria-describedby="single-segment-hint"
-                    className="mt-1 w-full border border-line bg-canvas px-3 py-2 font-mono text-[13px] tabular-nums text-ink-100 focus-visible:border-accent focus-visible:outline-none"
-                  />
-                </div>
-                <div>
-                  <label
-                    htmlFor="single-end-sec"
-                    className="block text-[11px] text-ink-300"
-                  >
-                    End (s)
-                  </label>
-                  <input
-                    id="single-end-sec"
-                    type="number"
-                    min={0}
-                    step={1}
-                    inputMode="decimal"
-                    value={state.endInput}
-                    onChange={onEndChange}
-                    aria-describedby="single-segment-hint"
-                    className="mt-1 w-full border border-line bg-canvas px-3 py-2 font-mono text-[13px] tabular-nums text-ink-100 focus-visible:border-accent focus-visible:outline-none"
-                  />
-                </div>
-              </div>
-              <p
-                id="single-segment-hint"
-                className="font-mono text-[11px] text-ink-400"
-              >
-                {segmentError ? (
-                  <span role="alert" className="text-accent">
-                    {ERROR_CODE_COPY[segmentError]}
-                  </span>
-                ) : (
-                  `${(endSec - startSec).toFixed(0)}s selected · up to ${MAX_SEGMENT_SEC}s`
-                )}
-              </p>
-            </fieldset>
-
-            <button
-              type="submit"
-              disabled={!canSubmit}
-              className={[
-                "w-full border px-4 py-2 font-mono text-[12px]",
-                "uppercase tracking-[0.08em] transition-colors",
-                canSubmit
-                  ? "border-accent bg-accent/10 text-accent hover:bg-accent/20"
-                  : "cursor-not-allowed border-line bg-surface/40 text-ink-500",
-              ].join(" ")}
-            >
-              {state.submitting ? "Submitting..." : "Predict"}
-            </button>
-            {state.submitError && (
-              <p role="alert" className="text-[12px] text-accent">
-                {state.submitError}
-              </p>
-            )}
-          </form>
-
-          <div className="text-[12px] leading-relaxed text-ink-300">
-            Or{" "}
-            <button
-              type="button"
-              onClick={switchToUpload}
-              className="text-accent underline underline-offset-2 transition-opacity hover:opacity-80"
-            >
-              upload an MP4 directly
-            </button>{" "}
-            — useful when YouTube blocks the download.
-          </div>
-          <div className="text-[12px] leading-relaxed text-ink-300">
+          <p className="eyebrow">Upload a clip</p>
+          <UploadDropzone disabled={reading} onFile={onFileSelected} prominent />
+          {reading && (
+            <p className="font-mono text-[11px] uppercase tracking-[0.08em] text-ink-300">
+              Reading video…
+            </p>
+          )}
+          {state.fileError && (
+            <p role="alert" className="text-[12px] text-accent">
+              {state.fileError}
+            </p>
+          )}
+          <div className="mt-auto text-[12px] leading-relaxed text-ink-300">
             No clip handy?{" "}
             <Link
               href="/gallery"
@@ -663,34 +573,118 @@ function IdlePanel({
           </div>
         </>
       ) : (
-        <>
-          <div className="flex items-center justify-between">
-            <p className="eyebrow">Upload MP4</p>
+        <form onSubmit={onSubmit} className="flex h-full flex-col gap-5">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <p className="eyebrow">Your clip</p>
+              <p
+                className="truncate font-mono text-[12px] text-ink-100"
+                title={file?.name}
+              >
+                {file?.name}
+              </p>
+              <p className="font-mono text-[11px] tabular-nums text-ink-400">
+                {(fileDurationSec ?? 0).toFixed(1)}s long
+              </p>
+            </div>
             <button
               type="button"
-              onClick={switchToUrl}
-              className="font-mono text-[11px] uppercase tracking-[0.08em] text-ink-300 hover:text-accent"
+              onClick={clearFile}
+              disabled={state.submitting}
+              className="shrink-0 font-mono text-[11px] uppercase tracking-[0.08em] text-ink-300 transition-colors hover:text-accent disabled:cursor-not-allowed disabled:opacity-50"
             >
-              ← back to URL
+              change
             </button>
           </div>
-          <UploadDropzone
-            disabled={state.submitting === true}
-            onFile={onSubmitUpload}
-          />
+
+          <fieldset className="space-y-2" disabled={state.submitting}>
+            <legend className="eyebrow">
+              Segment to analyze (≤{MAX_SEGMENT_SEC}s)
+            </legend>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label
+                  htmlFor="seg-start-sec"
+                  className="block text-[11px] text-ink-300"
+                >
+                  Start (s)
+                </label>
+                <input
+                  id="seg-start-sec"
+                  type="number"
+                  min={0}
+                  max={fileDurationSec ?? undefined}
+                  step={1}
+                  inputMode="decimal"
+                  value={state.startInput}
+                  onChange={onStartChange}
+                  aria-describedby="seg-hint"
+                  className="mt-1 w-full border border-line bg-canvas px-3 py-2 font-mono text-[13px] tabular-nums text-ink-100 focus-visible:border-accent focus-visible:outline-none"
+                />
+              </div>
+              <div>
+                <label
+                  htmlFor="seg-end-sec"
+                  className="block text-[11px] text-ink-300"
+                >
+                  End (s)
+                </label>
+                <input
+                  id="seg-end-sec"
+                  type="number"
+                  min={0}
+                  max={fileDurationSec ?? undefined}
+                  step={1}
+                  inputMode="decimal"
+                  value={state.endInput}
+                  onChange={onEndChange}
+                  aria-describedby="seg-hint"
+                  className="mt-1 w-full border border-line bg-canvas px-3 py-2 font-mono text-[13px] tabular-nums text-ink-100 focus-visible:border-accent focus-visible:outline-none"
+                />
+              </div>
+            </div>
+            <p id="seg-hint" className="font-mono text-[11px] text-ink-400">
+              {segmentError ? (
+                <span role="alert" className="text-accent">
+                  {ERROR_CODE_COPY[segmentError]}
+                </span>
+              ) : (
+                `${(endSec - startSec).toFixed(0)}s selected · up to ${MAX_SEGMENT_SEC}s of a ${(fileDurationSec ?? 0).toFixed(0)}s clip`
+              )}
+            </p>
+          </fieldset>
+
+          <button
+            type="submit"
+            disabled={!canSubmit}
+            className={[
+              "w-full border px-4 py-2 font-mono text-[12px]",
+              "uppercase tracking-[0.08em] transition-colors",
+              canSubmit
+                ? "border-accent bg-accent/10 text-accent hover:bg-accent/20"
+                : "cursor-not-allowed border-line bg-surface/40 text-ink-500",
+            ].join(" ")}
+          >
+            {state.submitting ? "Submitting…" : "Predict"}
+          </button>
           {state.submitError && (
             <p role="alert" className="text-[12px] text-accent">
               {state.submitError}
             </p>
           )}
-        </>
+
+          <div className="mt-auto text-[12px] leading-relaxed text-ink-400">
+            We analyze only the window you pick — your file is uploaded over a
+            one-time link and auto-deleted after a day.
+          </div>
+        </form>
       )}
     </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Coming-soon panel (Stage 1 — no live backend yet)
+// Coming-soon panel (used only when LIVE_INFERENCE_ENABLED is false)
 // ---------------------------------------------------------------------------
 
 function ComingSoonPanel() {
@@ -698,7 +692,7 @@ function ComingSoonPanel() {
     <div className="motion-fade-in flex h-full flex-col gap-4 border border-line bg-surface/40 p-6">
       <p className="eyebrow text-accent">Live prediction — coming soon</p>
       <p className="font-serif text-[18px] leading-tight text-ink-50">
-        Paste-your-own-clip prediction is on the way
+        Upload-your-own-clip prediction is on the way
       </p>
       <p className="max-w-[44ch] text-[13px] leading-relaxed text-ink-200">
         Running TRIBE live on a clip you choose needs a GPU backend we&rsquo;re
@@ -720,14 +714,15 @@ function ComingSoonPanel() {
 // ---------------------------------------------------------------------------
 
 function TrackingPanel({ state }: { state: TrackingState }) {
-  // A vague progress hint — we don't actually know how far through the
-  // job is, but anchoring against TYPICAL_LATENCY_SEC keeps the bar
-  // moving even when status doesn't change. Cap at 95% so it never
-  // visually finishes ahead of the actual result.
+  // A vague progress hint — we don't know the true fraction, but anchoring on
+  // TYPICAL_LATENCY_SEC keeps the bar moving even when status doesn't change.
+  // Cap at 95% so it never visually finishes ahead of the actual result.
   const progress = useMemo(
-    () => Math.min(95, Math.round((state.elapsedSec / TYPICAL_LATENCY_SEC) * 100)),
+    () =>
+      Math.min(95, Math.round((state.elapsedSec / TYPICAL_LATENCY_SEC) * 100)),
     [state.elapsedSec],
   );
+  const segLen = Math.max(0, state.endSec - state.startSec);
   return (
     <div className="motion-fade-in flex h-full flex-col gap-4 border border-line bg-surface/40 p-6">
       <p className="eyebrow">Job {shortId(state.jobId)}</p>
@@ -747,57 +742,14 @@ function TrackingPanel({ state }: { state: TrackingState }) {
         />
       </div>
       <p className="font-mono text-[11px] tabular-nums text-ink-300">
-        {state.elapsedSec}s elapsed · usually ~{TYPICAL_LATENCY_SEC}s
+        {state.elapsedSec}s elapsed · {segLen.toFixed(0)}s segment
       </p>
       <p className="mt-auto max-w-[40ch] text-[12px] leading-relaxed text-ink-400">
-        The brain on the left is the placeholder. It animates in with the
-        prediction the moment results land.
+        Predicting on a real GPU. This usually takes a minute or two — the first
+        run after the service has been idle can take several minutes while the
+        model warms up. Your clip and its predicted brain appear together, on one
+        timeline, the moment results land.
       </p>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Result panel
-// ---------------------------------------------------------------------------
-
-function ResultPanel({
-  state,
-  onReset,
-}: {
-  state: ResultState;
-  onReset: () => void;
-}) {
-  const { activation } = state;
-  return (
-    <div className="motion-fade-in flex h-full flex-col gap-4 border border-line bg-surface/40 p-6">
-      <p className="eyebrow">Result · {shortId(state.jobId)}</p>
-      <p className="font-serif text-[18px] leading-tight text-ink-50">
-        {activation.videoDurationSec.toFixed(1)}s of brain activity
-      </p>
-      <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-[12px]">
-        <dt className="text-ink-400">Duration</dt>
-        <dd className="font-mono tabular-nums text-ink-100">
-          {activation.videoDurationSec.toFixed(2)}s
-        </dd>
-        <dt className="text-ink-400">Timepoints</dt>
-        <dd className="font-mono tabular-nums text-ink-100">
-          {activation.timestamps.length}
-        </dd>
-        <dt className="text-ink-400">Model</dt>
-        <dd className="font-mono text-ink-100">{activation.modelVersion}</dd>
-      </dl>
-      <p className="text-[12px] leading-relaxed text-ink-300">
-        Predicted average BOLD response across {Object.keys(activation.byRegion).length}
-        {" "}regions of the fsaverage5 cortical surface — not your individual brain.
-      </p>
-      <button
-        type="button"
-        onClick={onReset}
-        className="mt-auto w-full border border-line px-4 py-2 font-mono text-[12px] uppercase tracking-[0.08em] text-ink-200 transition-colors hover:border-accent hover:text-accent"
-      >
-        Try another
-      </button>
     </div>
   );
 }
@@ -806,16 +758,13 @@ function ResultPanel({
 // Error panel
 // ---------------------------------------------------------------------------
 
-interface ErrorPanelProps {
+function ErrorPanel({
+  state,
+  onReset,
+}: {
   state: ErrorState;
   onReset: () => void;
-  onSubmitUpload: (file: File) => void;
-}
-
-function ErrorPanel({ state, onReset, onSubmitUpload }: ErrorPanelProps) {
-  const isDownloadBlocked =
-    state.errorKind === "failed_download" &&
-    state.errorCode === "download_blocked";
+}) {
   const isOutOfBounds = state.errorCode === "segment_out_of_bounds";
   const isRejectedDuration = state.errorKind === "rejected_duration";
   const isTimeout = state.errorKind === "timeout";
@@ -823,25 +772,21 @@ function ErrorPanel({ state, onReset, onSubmitUpload }: ErrorPanelProps) {
 
   let heading = "Something went wrong";
   let body = "Something tripped up on our end. Start over and give it another go.";
-  if (isDownloadBlocked) {
-    heading = "YouTube blocked our download";
+  if (isOutOfBounds) {
+    heading = "That window is past the end of the clip";
     body =
-      "Save the video to your device and drop it here — we'll run the prediction on the upload.";
-  } else if (isOutOfBounds) {
-    heading = "That window is past the end of the video";
-    body =
-      "Your segment runs past where the video ends. Pick an earlier window and try again.";
+      "Your segment runs past where the clip ends. Pick an earlier window and try again.";
   } else if (isRejectedDuration) {
     heading = "Segment too long";
     body = `Segments longer than ${MAX_SEGMENT_SEC} seconds aren't supported. Pick a shorter window.`;
-  } else if (state.errorKind === "failed_download") {
-    heading = "We couldn't fetch that video";
-    body =
-      "YouTube wouldn't serve it. If you have the file locally, upload it and we'll run the prediction directly.";
   } else if (state.errorKind === "failed_inference") {
     heading = "We couldn't finish that prediction";
     body =
       "The run didn't complete — usually a transient hiccup. Start over and try again.";
+  } else if (state.errorKind === "failed_download") {
+    heading = "We couldn't read that clip";
+    body =
+      "The upload didn't process. Re-pick the file (a standard H.264 MP4 works best) and try again.";
   } else if (isNetwork) {
     heading = "We lost the connection";
     body =
@@ -849,14 +794,8 @@ function ErrorPanel({ state, onReset, onSubmitUpload }: ErrorPanelProps) {
   } else if (isTimeout) {
     heading = "This is taking longer than expected";
     body =
-      "We stopped checking after 3 minutes. The job may still finish — try again, or come back in a moment.";
+      "We stopped checking after 10 minutes. The job may still finish — try again, or come back in a moment.";
   }
-
-  // Upload fallback only helps when the download itself was blocked — not for
-  // an out-of-bounds segment (a timestamp fix) or a dropped connection.
-  const showUploadFallback =
-    state.errorKind === "failed_download" && !isOutOfBounds;
-  const tryAnother = isRejectedDuration || isTimeout || isOutOfBounds;
 
   return (
     <div className="motion-fade-in flex h-full flex-col gap-4 border border-accent/40 bg-surface/40 p-6">
@@ -865,33 +804,12 @@ function ErrorPanel({ state, onReset, onSubmitUpload }: ErrorPanelProps) {
       <p className="max-w-[44ch] text-[13px] leading-relaxed text-ink-200">
         {body}
       </p>
-
-      {showUploadFallback && (
-        <>
-          <UploadDropzone
-            disabled={state.uploading === true}
-            onFile={onSubmitUpload}
-            prominent
-          />
-          {state.uploading && (
-            <p className="font-mono text-[11px] uppercase tracking-[0.08em] text-ink-300">
-              Uploading…
-            </p>
-          )}
-          {state.uploadError && (
-            <p role="alert" className="text-[12px] text-accent">
-              {state.uploadError}
-            </p>
-          )}
-        </>
-      )}
-
       <button
         type="button"
         onClick={onReset}
         className="mt-auto w-full border border-line px-4 py-2 font-mono text-[12px] uppercase tracking-[0.08em] text-ink-200 transition-colors hover:border-accent hover:text-accent"
       >
-        {tryAnother ? "Try another" : "Start over"}
+        Start over
       </button>
     </div>
   );
@@ -959,11 +877,9 @@ function UploadDropzone({ disabled, onFile, prominent }: UploadDropzoneProps) {
       <span className="font-mono text-[11px] uppercase tracking-[0.08em] text-ink-300">
         Drop MP4 here
       </span>
-      <span className="text-[13px] text-ink-100">
-        or click to choose a file
-      </span>
+      <span className="text-[13px] text-ink-100">or click to choose a file</span>
       <span className="font-mono text-[10px] text-ink-400">
-        up to 90s, MP4 preferred
+        you&rsquo;ll pick a ≤{MAX_SEGMENT_SEC}s window next · MP4 preferred
       </span>
     </label>
   );
@@ -975,20 +891,4 @@ function UploadDropzone({ disabled, onFile, prominent }: UploadDropzoneProps) {
 
 function shortId(id: string): string {
   return id.length > 10 ? `${id.slice(0, 8)}…` : id;
-}
-
-function meanFromActivation(a: ActivationPayload): number {
-  let sum = 0;
-  let count = 0;
-  for (const series of Object.values(a.byRegion)) {
-    if (series.length === 0) continue;
-    sum += series[0] ?? 0;
-    count += 1;
-  }
-  if (count === 0) return 0;
-  // Clamp to [0,1] for BrainMesh's scalar activation prop. The brief
-  // says playheadSec=0, so use the first frame's mean across regions
-  // as the global scalar — it's the honest single-number rendering of
-  // the moment the mesh is showing.
-  return Math.max(0, Math.min(1, sum / count));
 }

@@ -49,6 +49,13 @@ data/imports/*
 data/processed/*
 !data/processed/.gitkeep
 
+# --- Self-hosted demo clips (script-generated; third-party content) ---------
+# Built by scripts/build_demo_clips.py for the "video beside the brain" feature.
+# This repo is PUBLIC and these are third-party clips — never commit the media.
+apps/web/public/demo-clips/*
+!apps/web/public/demo-clips/.gitkeep
+!apps/web/public/demo-clips/README.md
+
 # --- Misc -------------------------------------------------------------------
 *.log
 coverage/

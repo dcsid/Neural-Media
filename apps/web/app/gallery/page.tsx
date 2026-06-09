@@ -9,9 +9,7 @@ import { DemoModeBanner } from "@/components/DemoModeBanner";
 import { BrainCanvasSkeleton } from "@/components/brain/BrainCanvasStates";
 import { TimelineScrubber } from "@/components/brain/TimelineScrubber";
 import { useReducedMotion } from "@/components/brain/hooks/useReducedMotion";
-// Temporary local stub of T3's controlled <GalleryVideo>. Swap to
-// `@/components/gallery/GalleryVideo` (delete GalleryVideoStub.tsx) when it lands.
-import { GalleryVideo } from "./GalleryVideoStub";
+import { GalleryVideo } from "@/components/gallery/GalleryVideo";
 
 // Demo clip asset convention (no manifest change): mp4 + poster keyed by slug.
 const clipSrc = (slug: string) => `/demo-clips/${slug}.mp4`;

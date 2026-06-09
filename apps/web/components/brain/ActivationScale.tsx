@@ -8,6 +8,10 @@ interface ActivationScaleProps {
   // Orientation. Vertical bar (default) sits next to the brain mesh;
   // horizontal version is for narrow viewports / cards.
   orientation?: "vertical" | "horizontal";
+  // When true, note that the colour scale is contrast-stretched per clip (the
+  // mesh maps the clip's value range across the full ramp) rather than an
+  // absolute 0..1. Default false. See lut.ts:computeDisplayRange.
+  normalized?: boolean;
 }
 
 // Renders the cortical-mesh colormap as a labelled gradient bar so
@@ -25,11 +29,15 @@ export function ActivationScale({
   lowLabel = "Low activity",
   highLabel = "High activity",
   orientation = "vertical",
+  normalized = false,
 }: ActivationScaleProps) {
   const stops = cividisCssStops(48);
   const gradient = `linear-gradient(${
     orientation === "vertical" ? "to top" : "to right"
   }, ${stops.join(", ")})`;
+  const scaleLabel = normalized
+    ? "Activation colour scale (normalized per clip)"
+    : "Activation colour scale";
 
   if (orientation === "horizontal") {
     return (
@@ -38,9 +46,14 @@ export function ActivationScale({
         <div
           className="h-2 flex-1 rounded-sm"
           style={{ background: gradient }}
-          aria-label="Activation colour scale"
+          aria-label={scaleLabel}
         />
         <span>{highLabel}</span>
+        {normalized && (
+          <span className="normal-case tracking-normal text-ink-400">
+            normalized
+          </span>
+        )}
       </div>
     );
   }
@@ -51,9 +64,14 @@ export function ActivationScale({
       <div
         className="w-3 flex-1 rounded-sm"
         style={{ background: gradient }}
-        aria-label="Activation colour scale"
+        aria-label={scaleLabel}
       />
       <span className="text-ink-200">{lowLabel}</span>
+      {normalized && (
+        <span className="normal-case tracking-normal text-ink-400">
+          normalized
+        </span>
+      )}
     </div>
   );
 }

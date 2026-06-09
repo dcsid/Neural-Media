@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef } from "react";
 import { NUM_VERTICES, REGION_IDS, type RegionId } from "@shared/types";
+import { computeDisplayRange, IDENTITY_RANGE, type DisplayRange } from "../lut";
 
 // Resolves the per-region (and optionally per-vertex) activation values to
 // render at a given playhead.
@@ -43,6 +44,10 @@ export interface RegionFrame {
   // available. CorticalSurface uses this to colour the mesh per-vertex
   // and to look up the exact activation at the hovered vertex.
   perVertex: Float32Array | null;
+  // Clip-wide robust value range for the display contrast stretch. Computed
+  // once per clip; identity (0..1) in the single-scalar hero path. The mesh
+  // and legend stretch colours across this — the numbers stay raw.
+  range: DisplayRange;
 }
 
 function clamp01(x: number): number {
@@ -186,7 +191,35 @@ export function useActivationFrame(
     return sortKeyframes(keyframeVertices);
   }, [keyframeVertices]);
 
-  return useMemo(() => {
+  // Clip-wide display range for the contrast stretch. Computed once per clip
+  // (memoised on keyframeVertices/sorted) over the SAME values the surface
+  // colours — the region series for shape (a), the per-vertex keyframes for
+  // shape (b). The single-scalar hero path (no keyframes) stays identity.
+  const range = useMemo<DisplayRange>(() => {
+    if (!keyframeVertices) return IDENTITY_RANGE;
+    if (isRegionKeyed(keyframeVertices)) {
+      const vals: number[] = [];
+      for (const r of REGION_IDS) {
+        const s = keyframeVertices[r];
+        if (s) for (let i = 0; i < s.length; i++) vals.push(s[i]);
+      }
+      return vals.length > 0 ? computeDisplayRange(vals) : IDENTITY_RANGE;
+    }
+    if (sorted) {
+      let total = 0;
+      for (const slice of sorted.values) total += slice.length;
+      if (total === 0) return IDENTITY_RANGE;
+      const vals = new Float64Array(total);
+      let o = 0;
+      for (const slice of sorted.values) {
+        for (let i = 0; i < slice.length; i++) vals[o++] = slice[i];
+      }
+      return computeDisplayRange(vals);
+    }
+    return IDENTITY_RANGE;
+  }, [keyframeVertices, sorted]);
+
+  const frameCore = useMemo(() => {
     const baseGlobal = clamp01(activation);
     const byRegion = Object.fromEntries(
       REGION_IDS.map((r) => [r, baseGlobal]),
@@ -317,4 +350,9 @@ export function useActivationFrame(
     regionMask,
     regionOrder,
   ]);
+
+  return useMemo<RegionFrame>(
+    () => ({ ...frameCore, range }),
+    [frameCore, range],
+  );
 }

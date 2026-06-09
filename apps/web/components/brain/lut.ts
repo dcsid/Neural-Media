@@ -93,3 +93,126 @@ export function cividisCssStops(samples = 32): string[] {
   }
   return stops;
 }
+
+// ---------------------------------------------------------------------------
+// Display-time contrast stretch
+// ---------------------------------------------------------------------------
+//
+// Real TRIBE predictions occupy a narrow band — after the sigmoid + region
+// averaging the per-region means cluster within ~0.01 of 0.50 (≈0.43–0.57
+// across a clip). Fed raw into the [0,1] LUT every region renders the same
+// mid-tone and temporal change is invisible. We contrast-stretch at DISPLAY
+// time only: map the clip's robust value range onto the full ramp.
+//
+// This is a monotonic, order-preserving display normalization — the standard
+// brain-viz move. It never reorders regions or invents structure; the legend
+// is relabelled with the absolute range the colours now span, and the numbers
+// shown anywhere (tooltip, region readings) stay raw.
+
+export interface DisplayRange {
+  lo: number;
+  hi: number;
+}
+
+// Identity range — no stretch (the single-scalar hero path uses this).
+export const IDENTITY_RANGE: DisplayRange = { lo: 0, hi: 1 };
+
+// Floor on the stretched span. Guards both ends: a near-constant clip can't be
+// blown up so tiny noise fills the scale, and — paired with robust percentiles
+// below — a model that already spans a wide range maps ~identity instead of
+// being over-stretched.
+export const MIN_DISPLAY_SPAN = 0.08;
+
+function clamp01(x: number): number {
+  return x < 0 ? 0 : x > 1 ? 1 : x;
+}
+
+// Robust per-clip display range: the [lowPct, highPct] percentile band of the
+// clip's values (default 2nd–98th — resistant to a few outlier vertices),
+// clamped into [0, 1] and widened to MIN_DISPLAY_SPAN. Returns IDENTITY_RANGE
+// for empty input.
+export function computeDisplayRange(
+  values: ArrayLike<number>,
+  lowPct = 0.02,
+  highPct = 0.98,
+): DisplayRange {
+  const n = values.length;
+  if (n === 0) return { ...IDENTITY_RANGE };
+
+  const sorted = Float64Array.from(values as ArrayLike<number>);
+  sorted.sort();
+  const at = (p: number): number => {
+    let idx = Math.round(p * (n - 1));
+    if (idx < 0) idx = 0;
+    else if (idx > n - 1) idx = n - 1;
+    return sorted[idx];
+  };
+
+  let lo = clamp01(at(lowPct));
+  let hi = clamp01(at(highPct));
+  if (hi < lo) {
+    const t = lo;
+    lo = hi;
+    hi = t;
+  }
+
+  if (hi - lo < MIN_DISPLAY_SPAN) {
+    // Widen symmetrically around the midpoint, then shift back inside [0, 1]
+    // if the widening overran an edge. A truly flat clip collapses to
+    // identity (uniform mid-tone) rather than amplifying floating-point noise.
+    const mid = (lo + hi) / 2;
+    lo = mid - MIN_DISPLAY_SPAN / 2;
+    hi = mid + MIN_DISPLAY_SPAN / 2;
+    if (lo < 0) {
+      hi -= lo;
+      lo = 0;
+    }
+    if (hi > 1) {
+      lo -= hi - 1;
+      hi = 1;
+    }
+    lo = clamp01(lo);
+    hi = clamp01(hi);
+    if (hi - lo < 1e-6) return { ...IDENTITY_RANGE };
+  }
+
+  return { lo, hi };
+}
+
+// Map a raw value into [0, 1] across the display range. Monotonic; clamped.
+export function stretch(value: number, range: DisplayRange): number {
+  const span = range.hi - range.lo;
+  if (span <= 1e-6) return clamp01(value);
+  return clamp01((value - range.lo) / span);
+}
+
+// cividis after a display stretch — used for the per-region legend swatches so
+// they match the mesh.
+export function cividisStretched(
+  value: number,
+  range: DisplayRange,
+): [number, number, number] {
+  return cividis(stretch(value, range));
+}
+
+// Like cividisFill, but contrast-stretches each value across `range` before
+// the LUT. With IDENTITY_RANGE this is byte-for-byte identical to cividisFill.
+// Allocation-free for the per-frame hot path.
+export function cividisFillStretched(
+  values: ArrayLike<number>,
+  out: Float32Array,
+  range: DisplayRange,
+): void {
+  const lo = range.lo;
+  const span = range.hi - range.lo;
+  const inv = span > 1e-6 ? 1 / span : 0;
+  const n = values.length;
+  for (let i = 0; i < n; i++) {
+    const t = inv === 0 ? values[i] : (values[i] - lo) * inv;
+    const [r, g, b] = cividis(t); // cividis clamps to [0,1] + applies gamma
+    const j = i * 3;
+    out[j] = r;
+    out[j + 1] = g;
+    out[j + 2] = b;
+  }
+}

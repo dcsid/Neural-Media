@@ -8,7 +8,7 @@ app_port: 7860
 hardware: a10g-small
 license: cc-by-nc-4.0
 pinned: false
-short_description: TRIBE v2 inference for single-video brain-prediction requests
+short_description: TRIBE v2 inference for single-video brain prediction
 ---
 
 # neural-media · HuggingFace Space (TRIBE inference)

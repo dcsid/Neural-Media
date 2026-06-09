@@ -1,7 +1,12 @@
 "use client";
 
 import { REGION_DESCRIPTIONS, REGION_IDS, type RegionId } from "@shared/types";
-import { cividis } from "./lut";
+import {
+  cividis,
+  cividisStretched,
+  IDENTITY_RANGE,
+  type DisplayRange,
+} from "./lut";
 
 // Corner overlay legend for the brain mesh. Cividis is a sequential LUT —
 // regions don't have intrinsic colors, they share one ramp keyed by
@@ -22,10 +27,14 @@ interface RegionLegendProps {
   // informative; pass a zero-filled map for the dashboard hero where there
   // is no per-region resolution.
   byRegion: Record<RegionId, number>;
+  // Clip-wide display range the mesh colours are stretched across. Swatches use
+  // it so they match the surface, and the ramp is relabelled with it. The
+  // per-region NUMBERS shown stay raw. Defaults to identity (no stretch).
+  range?: DisplayRange;
 }
 
-function swatchStyle(value: number): React.CSSProperties {
-  const [r, g, b] = cividis(value);
+function swatchStyle(value: number, range: DisplayRange): React.CSSProperties {
+  const [r, g, b] = cividisStretched(value, range);
   return {
     backgroundColor: `rgb(${Math.round(r * 255)}, ${Math.round(g * 255)}, ${Math.round(b * 255)})`,
   };
@@ -45,7 +54,13 @@ function rampStops(n: number): string {
 // Computed once. 9 stops is more than enough for an 8-bit CSS gradient.
 const RAMP_GRADIENT = rampStops(9);
 
-export function RegionLegend({ byRegion }: RegionLegendProps) {
+export function RegionLegend({
+  byRegion,
+  range = IDENTITY_RANGE,
+}: RegionLegendProps) {
+  // Colours are contrast-stretched whenever the clip's display range is
+  // narrower than the full [0,1] — relabel the ramp to say so.
+  const stretched = range.lo > 0 || range.hi < 1;
   return (
     <div
       role="figure"
@@ -62,7 +77,12 @@ export function RegionLegend({ byRegion }: RegionLegendProps) {
       </div>
       <ul className="space-y-1.5">
         {REGION_IDS.map((r) => (
-          <RegionRow key={r} region={r} value={byRegion[r] ?? 0} />
+          <RegionRow
+            key={r}
+            region={r}
+            value={byRegion[r] ?? 0}
+            range={range}
+          />
         ))}
       </ul>
 
@@ -73,9 +93,11 @@ export function RegionLegend({ byRegion }: RegionLegendProps) {
           style={{ backgroundImage: RAMP_GRADIENT }}
         />
         <div className="mt-1 flex justify-between font-mono text-[9px] tabular-nums text-ink-400">
-          <span>0.0</span>
-          <span>activation</span>
-          <span>1.0</span>
+          <span>{range.lo.toFixed(2)}</span>
+          <span className="tracking-normal">
+            {stretched ? "normalized" : "activation"}
+          </span>
+          <span>{range.hi.toFixed(2)}</span>
         </div>
       </div>
     </div>
@@ -85,15 +107,16 @@ export function RegionLegend({ byRegion }: RegionLegendProps) {
 interface RegionRowProps {
   region: RegionId;
   value: number;
+  range: DisplayRange;
 }
 
-function RegionRow({ region, value }: RegionRowProps) {
+function RegionRow({ region, value, range }: RegionRowProps) {
   return (
     <li className="flex items-center gap-2">
       <span
         aria-hidden
         className="h-2.5 w-2.5 shrink-0 border border-line/60"
-        style={swatchStyle(value)}
+        style={swatchStyle(value, range)}
       />
       <span className="min-w-[44px] font-mono text-[10px] uppercase tracking-[0.06em] text-ink-200">
         {region}

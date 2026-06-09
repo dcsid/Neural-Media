@@ -4,12 +4,19 @@ import { useFrame, useThree } from "@react-three/fiber";
 import { useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
 import type { RegionId } from "@shared/types";
-import { cividisFill } from "./lut";
+import {
+  cividisFillStretched,
+  IDENTITY_RANGE,
+  type DisplayRange,
+} from "./lut";
 import { placeholderRegionForDir } from "./regions";
 import { useReducedMotion } from "./hooks/useReducedMotion";
 
 interface PlaceholderMeshProps {
   byRegion: Record<RegionId, number>;
+  // Clip-wide display range for the colour contrast stretch (pure rendering).
+  // Defaults to identity; the single-scalar hero passes identity.
+  range?: DisplayRange;
   onReady?: () => void;
   // When true, render the surface as a wireframe outline rather than a
   // solid fill. Used during the cortical-surface load step so the user
@@ -52,6 +59,7 @@ function buildBrainGeometry(): THREE.BufferGeometry {
 
 export function PlaceholderMesh({
   byRegion,
+  range = IDENTITY_RANGE,
   onReady,
   wireframe = false,
 }: PlaceholderMeshProps) {
@@ -119,7 +127,7 @@ export function PlaceholderMesh({
       for (let i = 0; i < regionPerVertex.length; i++) {
         scratch[i] = displayed.current[regionPerVertex[i]] ?? 0;
       }
-      cividisFill(scratch, colorAttr.array as Float32Array);
+      cividisFillStretched(scratch, colorAttr.array as Float32Array, range);
       colorAttr.needsUpdate = true;
       if (reduceMotion) invalidate();
     }
@@ -136,10 +144,10 @@ export function PlaceholderMesh({
     for (let i = 0; i < regionPerVertex.length; i++) {
       scratch[i] = displayed.current[regionPerVertex[i]] ?? 0;
     }
-    cividisFill(scratch, colorAttr.array as Float32Array);
+    cividisFillStretched(scratch, colorAttr.array as Float32Array, range);
     colorAttr.needsUpdate = true;
     invalidate();
-  }, [regionPerVertex, colorAttr, scratch, invalidate]);
+  }, [regionPerVertex, colorAttr, scratch, invalidate, range]);
 
   return (
     <mesh ref={meshRef} geometry={geometry} castShadow={false} receiveShadow={false}>

@@ -5,7 +5,11 @@ import { GLTFLoader, type GLTF } from "three/examples/jsm/loaders/GLTFLoader.js"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { NUM_VERTICES, type RegionId } from "@shared/types";
-import { cividisFill } from "./lut";
+import {
+  cividisFillStretched,
+  IDENTITY_RANGE,
+  type DisplayRange,
+} from "./lut";
 import { useReducedMotion } from "./hooks/useReducedMotion";
 
 // Loaded cortical surface (fsaverage5, 20,484 vertices, both hemispheres
@@ -33,6 +37,10 @@ interface CorticalSurfaceProps {
   // Optional per-vertex activation override. If provided, takes precedence
   // over `byRegion` (Detail mode with full vertex resolution).
   perVertex?: Float32Array;
+  // Clip-wide display range for the colour contrast stretch. Pure rendering;
+  // defaults to identity (no stretch). Mesh colours stretch across this while
+  // hover / region-reading numbers stay raw.
+  range?: DisplayRange;
   // Per-vertex region assignment for fsaverage5. Length === NUM_VERTICES.
   vertexRegions?: Uint8Array;
   // REGION_IDS order — the byte value in vertexRegions indexes into this.
@@ -63,6 +71,7 @@ export function CorticalSurface({
   url,
   byRegion,
   perVertex,
+  range = IDENTITY_RANGE,
   vertexRegions,
   regionOrder,
   highlightRegion = null,
@@ -279,7 +288,7 @@ export function CorticalSurface({
     if (!scratch || !colorAttr) return;
     const count = scratch.length;
     if (perVertex && perVertex.length === count) {
-      cividisFill(perVertex, colorAttr.array as Float32Array);
+      cividisFillStretched(perVertex, colorAttr.array as Float32Array, range);
     } else if (vertexRegions && regionOrder && vertexRegions.length === count) {
       for (let i = 0; i < count; i++) {
         const idx = vertexRegions[i];
@@ -290,7 +299,7 @@ export function CorticalSurface({
         const r = regionOrder[idx];
         scratch[i] = displayed.current[r] ?? 0;
       }
-      cividisFill(scratch, colorAttr.array as Float32Array);
+      cividisFillStretched(scratch, colorAttr.array as Float32Array, range);
     } else {
       let sum = 0;
       let n = 0;
@@ -300,7 +309,7 @@ export function CorticalSurface({
       }
       const g = n > 0 ? sum / n : 0;
       for (let i = 0; i < count; i++) scratch[i] = g;
-      cividisFill(scratch, colorAttr.array as Float32Array);
+      cividisFillStretched(scratch, colorAttr.array as Float32Array, range);
     }
     colorAttr.needsUpdate = true;
     invalidate();
@@ -366,7 +375,7 @@ export function CorticalSurface({
     // Render the base colours into colorAttr.array.
     let didRepaint = false;
     if (perVertex && perVertex.length === count) {
-      cividisFill(perVertex, colorAttr.array as Float32Array);
+      cividisFillStretched(perVertex, colorAttr.array as Float32Array, range);
       didRepaint = true;
     } else if (vertexRegions && regionOrder && vertexRegions.length === count) {
       let dirty = false;
@@ -390,7 +399,7 @@ export function CorticalSurface({
           const r = regionOrder[idx];
           scratch[i] = displayed.current[r] ?? 0;
         }
-        cividisFill(scratch, colorAttr.array as Float32Array);
+        cividisFillStretched(scratch, colorAttr.array as Float32Array, range);
         didRepaint = true;
       }
     } else {
@@ -402,7 +411,7 @@ export function CorticalSurface({
       }
       const g = n > 0 ? sum / n : 0;
       for (let i = 0; i < count; i++) scratch[i] = g;
-      cividisFill(scratch, colorAttr.array as Float32Array);
+      cividisFillStretched(scratch, colorAttr.array as Float32Array, range);
       didRepaint = true;
     }
 

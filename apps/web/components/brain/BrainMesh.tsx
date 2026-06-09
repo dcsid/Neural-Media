@@ -300,7 +300,11 @@ export function BrainMesh({
 
         <SurfaceErrorBoundary
           fallback={
-            <PlaceholderMesh byRegion={frame.byRegion} onReady={handleReady} />
+            <PlaceholderMesh
+              byRegion={frame.byRegion}
+              range={frame.range}
+              onReady={handleReady}
+            />
           }
         >
           <Suspense
@@ -312,6 +316,7 @@ export function BrainMesh({
             fallback={
               <PlaceholderMesh
                 byRegion={frame.byRegion}
+                range={frame.range}
                 onReady={handleReady}
                 wireframe
               />
@@ -324,6 +329,7 @@ export function BrainMesh({
               // while region readings (driven by byRegion) keep working.
               <PlaceholderMesh
                 byRegion={frame.byRegion}
+                range={frame.range}
                 onReady={handleReady}
               />
             ) : surfaceAvailable ? (
@@ -331,6 +337,7 @@ export function BrainMesh({
                 url={SURFACE_URL}
                 byRegion={frame.byRegion}
                 perVertex={frame.perVertex ?? undefined}
+                range={frame.range}
                 vertexRegions={regionMask ?? undefined}
                 regionOrder={REGION_IDS}
                 highlightRegion={tour.active ? tour.frame.highlightedRegion : null}
@@ -349,6 +356,7 @@ export function BrainMesh({
             ) : (
               <PlaceholderMesh
                 byRegion={frame.byRegion}
+                range={frame.range}
                 onReady={handleReady}
               />
             )}
@@ -394,7 +402,7 @@ export function BrainMesh({
           painted with the same uniform scalar and a per-region readout
           would be misleading. Callers can force it off with hideLegend. */}
       {!hideLegend && keyframeVertices !== undefined && (
-        <RegionLegend byRegion={frame.byRegion} />
+        <RegionLegend byRegion={frame.byRegion} range={frame.range} />
       )}
 
       {/* Tour button — same chrome aesthetic as the other overlays. Gated

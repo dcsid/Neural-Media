@@ -22,7 +22,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     # write under /root/.cache (which is ephemeral and per-cold-boot).
     HF_HOME=/data/hf-cache \
     HUGGINGFACE_HUB_CACHE=/data/hf-cache \
-    LOG_LEVEL=INFO
+    LOG_LEVEL=INFO \
+    # TRIBE transcribes by shelling out to `uvx whisperx`, whose isolated env
+    # lacks the hf_transfer package; HF infra defaults this flag to 1, which
+    # crashes that model download. Force it off process-wide so the subprocess
+    # inherits it (proven necessary on the RunPod GPU run).
+    HF_HUB_ENABLE_HF_TRANSFER=0
 
 # System deps.
 #   ffmpeg / ffprobe — duration check, trim, preprocess.
@@ -54,6 +59,12 @@ COPY services/hf-space/requirements.txt /app/requirements.txt
 
 RUN pip install --upgrade pip \
  && pip install -r /app/requirements.txt
+
+# TRIBE's audio transcription shells out to `uvx whisperx` at inference time,
+# so `uvx` must exist in the image — install uv (provides both `uv` and `uvx`).
+# Proven necessary on the RunPod GPU run. WhisperX itself + the large-v3 weights
+# are fetched lazily on the first prediction, so warm the Space once after deploy.
+RUN pip install uv
 
 # Now bring in the Space code.
 COPY services/hf-space/app.py /app/app.py

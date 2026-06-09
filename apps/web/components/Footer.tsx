@@ -29,7 +29,7 @@ export function Footer() {
           <p className="eyebrow mb-2">More</p>
           <Link
             href="/about"
-            className="text-ink-100 underline-offset-2 hover:text-accent hover:underline"
+            className="text-accent underline underline-offset-2 transition-opacity hover:opacity-80"
           >
             About &amp; framing
           </Link>

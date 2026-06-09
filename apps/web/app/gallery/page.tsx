@@ -4,12 +4,19 @@ import dynamic from "next/dynamic";
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ActivationPayload } from "@/lib/api-v2";
-import type { RegionId } from "@shared/types";
+import { REGION_IDS, REGION_DESCRIPTIONS, type RegionId } from "@shared/types";
 import { DemoModeBanner } from "@/components/DemoModeBanner";
 import { BrainCanvasSkeleton } from "@/components/brain/BrainCanvasStates";
 import { TimelineScrubber } from "@/components/brain/TimelineScrubber";
 import { useReducedMotion } from "@/components/brain/hooks/useReducedMotion";
 import { GalleryVideo } from "@/components/gallery/GalleryVideo";
+import {
+  cividisStretched,
+  computeDisplayRange,
+  stretch,
+  IDENTITY_RANGE,
+  type DisplayRange,
+} from "@/components/brain/lut";
 
 // Demo clip asset convention (no manifest change): mp4 + poster keyed by slug.
 const clipSrc = (slug: string) => `/demo-clips/${slug}.mp4`;
@@ -136,11 +143,11 @@ export default function DemoGalleryPage() {
   }, []);
 
   return (
-    <main className="mx-auto max-w-[1280px] px-5 pb-16 pt-12 sm:px-8">
+    <main className="mx-auto max-w-[1440px] px-5 pb-16 pt-12 sm:px-8">
       <DemoModeBanner cta={{ href: "/", label: "Predict your own clip →" }}>
-        These predictions are precomputed and ship with the build — curated
-        short clips run through the pipeline in mock mode. Nothing is fetched
-        or inferred live.
+        These predictions are precomputed and ship with the build — each
+        curated clip was run through the real TRIBE model ahead of time, so it
+        loads instantly with no live inference.
       </DemoModeBanner>
 
       <header className="motion-fade-in flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2">
@@ -166,7 +173,7 @@ export default function DemoGalleryPage() {
       {listError ? (
         <ErrorBanner message={listError} />
       ) : (
-        <div className="mt-10 grid items-start gap-8 lg:grid-cols-[minmax(0,1fr)_minmax(0,468px)]">
+        <div className="mt-10 grid items-start gap-8 lg:grid-cols-[340px_minmax(0,1fr)]">
           <ExamplesGrid
             entries={entries}
             selectedSlug={selected?.slug ?? null}
@@ -210,7 +217,7 @@ function ExamplesGrid({
         <ul
           aria-busy
           aria-label="Loading examples"
-          className="grid gap-3 sm:grid-cols-2"
+          className="grid gap-3"
         >
           {[0, 1, 2, 3, 4, 5].map((i) => (
             <li
@@ -228,7 +235,7 @@ function ExamplesGrid({
           to populate it.
         </p>
       ) : (
-        <ul className="grid gap-3 sm:grid-cols-2">
+        <ul className="grid gap-3">
           {entries.map((entry) => (
             <li key={entry.slug}>
               <GalleryCard
@@ -362,6 +369,26 @@ function Viewer({
     [timestamps, durationSec, tsMax],
   );
 
+  // Per-region values at the current playhead + the clip's contrast range —
+  // drives the live region bars below, and matches the brain's stretched
+  // colours (same lut + range the mesh uses).
+  const byRegionSeries = activation?.byRegion ?? null;
+  const displayRange = useMemo<DisplayRange>(() => {
+    if (!byRegionSeries) return IDENTITY_RANGE;
+    const all: number[] = [];
+    for (const s of Object.values(byRegionSeries)) for (const v of s) all.push(v);
+    return computeDisplayRange(all);
+  }, [byRegionSeries]);
+  const currentByRegion = useMemo(() => {
+    const out = {} as Record<RegionId, number>;
+    for (const r of REGION_IDS) {
+      out[r] = byRegionSeries
+        ? valueAt(byRegionSeries[r] ?? [], timestamps, brainPlayheadSec)
+        : 0;
+    }
+    return out;
+  }, [byRegionSeries, timestamps, brainPlayheadSec]);
+
   // Reset the playhead and probe for the clip whenever the selection changes.
   useEffect(() => {
     setVideoSec(0);
@@ -473,6 +500,7 @@ function Viewer({
               keyframeVertices={activation.byRegion as Record<RegionId, number[]>}
               timestamps={activation.timestamps}
               playheadSec={brainPlayheadSec}
+              hideLegend
             />
           )}
 
@@ -526,6 +554,10 @@ function Viewer({
             />
           </div>
         </div>
+      )}
+
+      {activation && (
+        <RegionBars byRegion={currentByRegion} range={displayRange} />
       )}
 
       <ViewerMeta selected={selected} detail={detail} status={status} />
@@ -681,4 +713,96 @@ function meanFromActivation(a: ActivationPayload): number {
   }
   if (count === 0) return 0;
   return Math.max(0, Math.min(1, sum / count));
+}
+
+// ---------------------------------------------------------------------------
+// Region activation bars (live readout, off the canvas)
+// ---------------------------------------------------------------------------
+
+// Linear interpolation of a per-region series at `t` (brain-seconds) against
+// the dense `timestamps`. Mirrors useActivationFrame's interpolateSeries so the
+// bars track exactly what the mesh shows.
+function valueAt(series: number[], timestamps: number[], t: number): number {
+  if (series.length === 0) return 0;
+  if (timestamps.length === 0) return series[0];
+  if (t <= timestamps[0]) return series[0];
+  const last = timestamps.length - 1;
+  if (t >= timestamps[last]) return series[Math.min(last, series.length - 1)];
+  let lo = 0;
+  let hi = last;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (timestamps[mid] <= t) lo = mid;
+    else hi = mid;
+  }
+  const t0 = timestamps[lo];
+  const t1 = timestamps[hi];
+  const f = t1 === t0 ? 0 : (t - t0) / (t1 - t0);
+  const a = series[lo] ?? 0;
+  const b = series[Math.min(hi, series.length - 1)] ?? a;
+  return a + (b - a) * f;
+}
+
+function RegionBars({
+  byRegion,
+  range,
+}: {
+  byRegion: Record<RegionId, number>;
+  range: DisplayRange;
+}) {
+  const stretched = range.lo > 0 || range.hi < 1;
+  return (
+    <div className="border border-line bg-surface/40 p-4 sm:p-5">
+      <div className="mb-3 flex items-baseline justify-between">
+        <span className="eyebrow">Region activation</span>
+        <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-ink-400">
+          {stretched ? "normalized" : "live"}
+        </span>
+      </div>
+      <ul className="grid gap-x-8 gap-y-3 md:grid-cols-2">
+        {REGION_IDS.map((r) => (
+          <RegionBar key={r} region={r} value={byRegion[r] ?? 0} range={range} />
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function RegionBar({
+  region,
+  value,
+  range,
+}: {
+  region: RegionId;
+  value: number;
+  range: DisplayRange;
+}) {
+  const fill = stretch(value, range); // 0..1 across the clip's range (dynamic)
+  const [r, g, b] = cividisStretched(value, range);
+  const color = `rgb(${Math.round(r * 255)}, ${Math.round(g * 255)}, ${Math.round(b * 255)})`;
+  return (
+    <li className="flex items-center gap-3">
+      <div className="w-[124px] shrink-0">
+        <div className="font-mono text-[10px] uppercase tracking-[0.06em] text-ink-200">
+          {region}
+        </div>
+        <div
+          className="truncate text-[10px] leading-tight text-ink-500"
+          title={REGION_DESCRIPTIONS[region]}
+        >
+          {REGION_DESCRIPTIONS[region]}
+        </div>
+      </div>
+      <div className="relative h-2.5 min-w-0 flex-1 overflow-hidden rounded-sm bg-ink-900/60">
+        <div
+          aria-hidden
+          className="absolute inset-y-0 left-0 rounded-sm transition-[width] duration-100 ease-out"
+          style={{ width: `${(fill * 100).toFixed(1)}%`, backgroundColor: color }}
+        />
+      </div>
+      <span className="w-[34px] shrink-0 text-right font-mono tabular-nums text-[11px] text-ink-100">
+        {value.toFixed(2)}
+      </span>
+    </li>
+  );
 }

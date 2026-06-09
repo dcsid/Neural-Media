@@ -97,7 +97,7 @@ export default function AboutPage() {
               href="https://creativecommons.org/licenses/by-nc/4.0/"
               rel="noreferrer noopener"
               target="_blank"
-              className="text-ink-100 underline-offset-2 hover:text-accent hover:underline focus:text-accent focus:underline"
+              className="text-accent underline underline-offset-2 transition-opacity hover:opacity-80"
             >
               creativecommons.org/licenses/by-nc/4.0
             </a>{" "}

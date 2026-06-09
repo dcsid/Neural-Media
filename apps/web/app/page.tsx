@@ -634,7 +634,7 @@ function IdlePanel({
             <button
               type="button"
               onClick={switchToUpload}
-              className="underline-offset-2 hover:text-accent hover:underline focus-visible:text-accent focus-visible:underline"
+              className="text-accent underline underline-offset-2 transition-opacity hover:opacity-80"
             >
               upload an MP4 directly
             </button>{" "}
@@ -644,7 +644,7 @@ function IdlePanel({
             No clip handy?{" "}
             <Link
               href="/gallery"
-              className="underline-offset-2 hover:text-accent hover:underline focus-visible:text-accent focus-visible:underline"
+              className="text-accent underline underline-offset-2 transition-opacity hover:opacity-80"
             >
               Try a demo
             </Link>{" "}

@@ -23,7 +23,7 @@ export function DemoModeBanner({ children, cta }: DemoModeBannerProps) {
       </div>
       <Link
         href={cta.href}
-        className="text-ink-200 underline underline-offset-2 hover:text-accent"
+        className="text-accent underline underline-offset-2 transition-opacity hover:opacity-80"
       >
         {cta.label}
       </Link>

@@ -42,8 +42,8 @@ Two ways in:
 
 ## What it measures (plainly)
 
-**Does:** predict the BOLD fMRI response — averaged across TRIBE v2's ~1,000
-training subject‑hours — at **20,484 points on the cortical surface**
+**Does:** predict the BOLD fMRI response — averaged across TRIBE v2's training
+population — at **20,484 points on the cortical surface**
 (`fsaverage5`), for the chosen window of a video. Those vertices are aggregated
 into **eight well‑localised regions**: early visual **V1–V4**, **auditory**
 cortex, the **language** network, the **FFA** (faces), and the **VWFA**

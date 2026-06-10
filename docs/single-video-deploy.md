@@ -1,24 +1,26 @@
 # Single-Video Pipeline — Deployment Runbook
 
-From-scratch deploy of the **v2 single-video architecture**: a user pastes a
-**YouTube URL** and picks a **≤90-second segment**; an AWS API Gateway routes
-the request through a Lambda chain to a HuggingFace Space that runs TRIBE on
-just that window; results land in S3 + DynamoDB and surface back in the browser.
+From-scratch deploy of the **single-video architecture**: a user **uploads an
+MP4** and picks a **≤90-second window**; an AWS API Gateway routes the request
+through a Lambda chain to a HuggingFace Space that runs TRIBE on just that
+window; results land in S3 + DynamoDB and surface back in the browser.
+(The live path is **upload-only** — see the [README](../README.md), "Why
+upload-only", for why the YouTube-URL path is retired.)
 
 **You do not need to know AWS to follow this.** Every step is a copy-pasteable
 command. Do them **in order** — later steps consume values produced by earlier
 ones. If a step fails, its troubleshooting block usually has the fix.
 
 ```
-[Browser /single page]
-     │  POST /v2/jobs { url, startSec, endSec }
+[Browser  /  (live upload page)]
+     │  POST /v2/jobs/upload → presigned PUT → POST .../{id}/confirm {startSec,endSec}
      ▼
-[API Gateway HTTP API] ─► [Lambda jobs_create] ─► [DynamoDB jobs table]
+[API Gateway HTTP API] ─► [Lambda jobs_upload] ─► [DynamoDB jobs table]
                                    │ async invoke
                                    ▼
                            [Lambda jobs_worker] ─► [HF Space POST /predict]
-                                                        │  yt-dlp --download-sections
-                                                        │  ffmpeg + TRIBE (segment only)
+                                                        │  HTTPS-GET upload from S3
+                                                        │  ffmpeg trim + TRIBE (window only)
 [Browser polls GET /v2/jobs/{id}]                       │  POST /v2/internal/hf-callback
                                                         ▼      (header X-NM-Token: <secret>)
                                                   [Lambda hf_callback]

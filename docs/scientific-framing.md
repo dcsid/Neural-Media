@@ -47,9 +47,9 @@ TRIBE needs a GPU, so two backends sit behind the same contract:
 - **`mock`** — `MockBackend`
   (`services/inference/neural_media_inference/backend.py`), **a sine wave per
   cortical vertex seeded by `SHA-256(video_id, seed)`.** No GPU, no network, no
-  model weights. It powers the tests, local dev
-  (`services/hf-space/mock_local.py`), and the gallery-bake fallback when a
-  real run isn't available.
+  model weights. It powers the tests and local dev
+  (`services/hf-space/mock_local.py`). **The shipped gallery is real** (baked on
+  a GPU), so mock is no longer its fallback — it's a dev/test tool only.
 
 In mock mode:
 
@@ -63,9 +63,9 @@ In mock mode:
   regardless of whether the underlying video ever existed.
 
 This is intentional: mock mode exercises the full plumbing — fetch → infer →
-aggregate → callback → 3D render — without a GPU, and makes the example gallery
-bulletproof. It is the right tool for tests, system demos, and any case where
-the integrity of the *prediction* does not matter.
+aggregate → callback → 3D render — without a GPU. (The shipped gallery is real,
+baked on a GPU; mock remains the right tool for tests, local system demos, and
+any case where the integrity of the *prediction* does not matter.)
 
 It is **not** a prediction about the video's actual content. Specifically:
 

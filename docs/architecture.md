@@ -13,39 +13,65 @@ shapes, [`shared/CONTRACTS.md`](../shared/CONTRACTS.md) is authoritative.
 
 ## End‑to‑end flow (the live upload path)
 
-```
-[Browser:  /  and  /gallery]
-   │  ① POST /v2/jobs/upload {filename, contentType}     → 201 {jobId, uploadUrl}
-   │  ② PUT <bytes> → uploadUrl (S3, Content-Type video/mp4)
-   │  ③ POST /v2/jobs/upload/{id}/confirm {startSec, endSec}
-   │  ④ GET  /v2/jobs/{id}   (poll every 2s until terminal)
-   ▼
-[AWS API Gateway — HTTP API v2]
-   │
-   ├─► [Lambda jobs_upload]  mint presigned PUT (①); on confirm (③) store the
-   │        │                 segment + async-invoke the worker
-   │        │ async invoke (InvocationType=Event)
-   │        ▼
-   │   [Lambda jobs_worker]  poll Space /healthz until awake (cold-boot tolerant),
-   │        │                 then POST /predict with a presigned GET of the upload
-   │        ▼
-   │   [HF Space  POST /predict]  → 202, runs in a background task:
-   │        │   HTTPS-GET the upload  →  ffmpeg trim to [start,end)
-   │        │   →  TRIBE v2  →  per-vertex BOLD  →  8-region aggregate
-   │        │   POST /v2/internal/hf-callback   (header X-NM-Token)
-   │        ▼
-   │   [Lambda hf_callback]  → S3 results/{id}.json.gz  +  DynamoDB status=done
-   │
-   └─► [Lambda jobs_status]  serves ④ from DynamoDB (+ a presigned resultUrl when done)
-                                                          │
-[Browser] ◄──── GET resultUrl (gzipped ActivationPayload) ┘
-   ▼
-[3D cortical mesh + a video/brain/slider synced viewer]
+```mermaid
+sequenceDiagram
+    autonumber
+    actor B as Browser
+    participant UP as λ jobs_upload
+    participant S3 as S3
+    participant WK as λ jobs_worker
+    participant HF as HF Space GPU
+    participant CB as λ hf_callback
+    participant DB as DynamoDB
+    participant ST as λ jobs_status
+
+    Note over B,ST: all Browser API calls route through API Gateway (HTTP API)
+    B->>UP: POST /v2/jobs/upload {filename}
+    UP->>DB: create job (pending)
+    UP-->>B: jobId + presigned PUT url
+    B->>S3: PUT file bytes
+    B->>UP: POST .../{id}/confirm {startSec, endSec}
+    UP->>DB: store segment
+    UP-)WK: async invoke
+    WK->>HF: poll /healthz until awake
+    WK->>HF: POST /predict (+ presigned GET of upload)
+    HF-->>WK: 202 accepted
+    Note over HF: background task — GET upload,<br/>ffmpeg trim, TRIBE v2, aggregate 8 regions
+    loop poll every 2s
+        B->>ST: GET /v2/jobs/{id}
+        ST->>DB: read status
+        ST-->>B: pending → running → done
+    end
+    HF->>CB: POST callback (gzip result, X-NM-Token)
+    CB->>S3: write results/{id}.json.gz
+    CB->>DB: status = done
+    B->>S3: GET resultUrl
+    S3-->>B: ActivationPayload (8-region timeseries)
+    Note over B: render 3D brain + synced video / slider
 ```
 
 A job row exists in DynamoDB from step ① (status `pending`), so the browser
 always has an id to poll even if the upload itself fails. Abandoned uploads
 evaporate via a 1‑day S3 lifecycle rule; results live 30 days.
+
+## Job status lifecycle
+
+The browser's poll (`GET /v2/jobs/{id}`) walks this state machine:
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: confirm upload
+    pending --> downloading: worker wakes + kicks the Space
+    downloading --> inferring: clip fetched + ffmpeg-trimmed
+    inferring --> done: callback writes the result
+    pending --> rejected_duration: window over 90s
+    downloading --> failed_download: Space unreachable / bad source
+    inferring --> failed_inference: model error
+    done --> [*]
+    rejected_duration --> [*]
+    failed_download --> [*]
+    failed_inference --> [*]
+```
 
 ---
 

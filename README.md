@@ -64,36 +64,41 @@ window, and only that window is ever analyzed. (An earlier version pasted a
 YouTube URL — see [Why upload‑only](#1-why-upload-only-not-a-youtube-link)
 below for why that path is retired.)
 
+```mermaid
+flowchart TB
+    subgraph BR["Browser — Next.js + R3F"]
+        U["Upload MP4 +<br/>pick a ≤90s window"]
+        V["3D brain +<br/>synced video / slider"]
+    end
+    subgraph AWS["AWS — orchestration only"]
+        GW["API Gateway"]
+        JU["λ jobs_upload"]
+        JW["λ jobs_worker"]
+        JS["λ jobs_status"]
+        CB["λ hf_callback"]
+        S3[("S3 — uploads + results")]
+        DB[("DynamoDB — job status")]
+    end
+    subgraph HF["HF Space — A10G GPU"]
+        P["/predict — ffmpeg trim,<br/>TRIBE v2, aggregate 8 regions"]
+    end
+
+    U -->|"1. create + confirm"| GW
+    GW --> JU
+    U -->|"2. PUT bytes"| S3
+    JU -. async invoke .-> JW
+    JW -->|"wake + POST"| P
+    P -->|"GET upload"| S3
+    P -->|"4. callback"| CB
+    CB --> S3
+    CB --> DB
+    U -. poll .-> JS
+    JS -.-> DB
+    S3 -->|"5. result JSON"| V
 ```
- BROWSER (Next.js + React-Three-Fiber)
-   │
-   │ 1. POST /v2/jobs/upload {filename}        ── mint a one-time S3 PUT url + jobId
-   │ 2. PUT <file>  ─────────────────────────► S3 (uploads/)
-   │ 3. POST /v2/jobs/upload/{id}/confirm {startSec, endSec}
-   │ 4. poll  GET /v2/jobs/{id}  every 2s
-   ▼
- AWS API GATEWAY (HTTP API)  ──►  Lambda (Python)
-   │                                jobs_upload   – presigned PUT + confirm
-   │                                jobs_worker   – wake + kick the GPU (async)
-   │                                jobs_status   – the poll endpoint
-   │                                hf_callback   – receive the result
-   │                                (+ jobs_create – dormant YouTube-URL path)
-   │  async invoke
-   ▼
- jobs_worker  ──►  poll Space /healthz until awake  ──►  POST /predict
-                                                            │
-                                                            ▼
- HUGGING FACE SPACE (Docker, A10G GPU, FastAPI)
-   │  HTTPS-GET the upload from S3  →  ffmpeg trim to [start, end)
-   │  →  TRIBE v2  (LLaMA-3.2-3B · V-JEPA2 · Wav2Vec-BERT)
-   │  →  per-vertex BOLD  →  aggregate to 8 regions
-   │  POST the gzipped result back to  /v2/internal/hf-callback  (X-NM-Token)
-   ▼
- hf_callback  ──►  S3 (results/{id}.json.gz)  +  DynamoDB (status → done)
-   │
-   ▼
- BROWSER  ──►  GET resultUrl  ──►  render the 3D mesh + a synced video/brain/slider
-```
+
+> _GitHub renders the Mermaid blocks above and below; click a diagram to
+> zoom/pan. The model runs on the HF Space GPU — AWS is orchestration only._
 
 **The model runs on the HF Space GPU, never on AWS.** AWS does only the
 lightweight orchestration — mint the upload, track status, store and serve the

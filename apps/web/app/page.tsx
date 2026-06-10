@@ -32,6 +32,7 @@ import {
   type IdleState,
   type TrackingState,
 } from "@/lib/session";
+import { readVideoDuration } from "@/lib/video";
 
 // Re-uses the existing BrainMesh component. Dynamic with ssr:false
 // matches BrainMeshSlot/AutoPlayingBrain — R3F's runtime touches browser-
@@ -97,31 +98,6 @@ function errorCodeFromBody(body: unknown): string | undefined {
     if (typeof code === "string") return code;
   }
   return undefined;
-}
-
-// Probe a local video File's duration without keeping the element around. Used
-// to bound the segment picker at the real file length. Rejects on a file we
-// can't decode (so the UI can ask for a standard MP4).
-function readVideoDuration(file: File): Promise<number> {
-  return new Promise((resolve, reject) => {
-    if (typeof document === "undefined") {
-      reject(new Error("no document"));
-      return;
-    }
-    const url = URL.createObjectURL(file);
-    const v = document.createElement("video");
-    v.preload = "metadata";
-    const done = (fn: () => void) => {
-      URL.revokeObjectURL(url);
-      fn();
-    };
-    v.onloadedmetadata = () => {
-      const d = Number.isFinite(v.duration) ? v.duration : 0;
-      done(() => (d > 0 ? resolve(d) : reject(new Error("zero duration"))));
-    };
-    v.onerror = () => done(() => reject(new Error("decode error")));
-    v.src = url;
-  });
 }
 
 // ---------------------------------------------------------------------------

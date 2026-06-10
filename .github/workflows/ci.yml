@@ -35,6 +35,10 @@ env:
   PNPM_VERSION: "11.0.8"
   PYTHON_VERSION: "3.11"
   SAM_CLI_TELEMETRY: "0"
+  # Opt the JS actions (checkout, setup-python, …) into Node 24 ahead of
+  # GitHub's 2026-06-16 forced cutover, silencing the Node 20 deprecation
+  # warning.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   # ---------------------------------------------------------------------------

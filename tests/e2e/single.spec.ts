@@ -1,13 +1,12 @@
-// E2E for the single-clip → brain journey at `/` (YouTube URL + segment).
+// E2E for the single-clip → brain journey at `/` (upload → segment → result).
 //
-// All network calls hit the mock server on :3001. The segment picker defaults
-// to a valid 0–30s window, so the happy path is just: fill a YouTube URL →
-// Predict. Selectors rely on visible copy + roles (not test-ids) so the suite
-// survives reasonable markup changes.
+// All network calls hit the mock server on :3001. Upload a tiny MP4, the
+// browser reads its duration and the segment picker defaults to a valid window,
+// then Predict. Selectors rely on visible copy + roles (not test-ids) so the
+// suite survives reasonable markup changes.
 //
 // Status timing in the mock (must stay in sync with mock-server.ts):
-//   pending → downloading (1s) → inferring (3s) → done (6s)
-//   BLOCK_ME → failed_download / download_blocked at 2s
+//   confirm → pending → downloading (1s) → inferring (3s) → done (6s)
 
 import { test, expect, type Page, type Request } from "@playwright/test";
 import { fileURLToPath } from "node:url";
@@ -16,61 +15,40 @@ import { dirname, resolve } from "node:path";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TINY_MP4 = resolve(__dirname, "fixtures/tiny.mp4");
 
-const SAMPLE_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
-// A valid YouTube URL whose id carries the mock's BLOCK_ME marker, so it
-// passes the client's YouTube validator but the mock fails the download.
-const BLOCKED_URL = "https://www.youtube.com/watch?v=BLOCK_ME_9999";
-
-async function fillUrl(page: Page, url: string) {
-  await page.getByLabel(/youtube url/i).fill(url);
+async function uploadClip(page: Page) {
+  // The dropzone wraps a hidden <input type="file"> — setInputFiles works on
+  // hidden inputs without a prior click. The browser then reads the clip's
+  // duration and the segment picker appears with Predict enabled on the default
+  // window.
+  await page.locator('input[type="file"]').first().setInputFiles(TINY_MP4);
+  await expect(
+    page.getByRole("button", { name: /^predict$/i }),
+  ).toBeEnabled({ timeout: 10_000 });
 }
 
 async function clickPredict(page: Page) {
   await page.getByRole("button", { name: /^predict$/i }).click();
 }
 
-test.describe("/ — YouTube URL + segment → brain", () => {
-  test("happy path: URL → result", async ({ page }) => {
+test.describe("/ — upload + segment → brain", () => {
+  test("happy path: upload → result", async ({ page }) => {
     await page.goto("/");
-    await fillUrl(page, SAMPLE_URL);
-    // The default 0–30s segment is valid, so Predict is enabled.
+    await uploadClip(page);
     await clickPredict(page);
 
-    // Done at +6s in the mock — the Result panel's "Try another" CTA is our
-    // canonical "we reached done" signal.
+    // Done at +6s in the mock — the result header + "Try another" CTA are our
+    // canonical "we reached done" signals; the brain renders into a <canvas>.
     await expect(
-      page.getByRole("button", { name: /try another/i }),
-    ).toBeVisible({ timeout: 12_000 });
-    await expect(page.getByText(/of brain activity/i)).toBeVisible();
-    await expect(page.locator("canvas")).toBeVisible();
-
-    // Reset path.
-    await page.getByRole("button", { name: /try another/i }).click();
-    await expect(
-      page.getByRole("button", { name: /^predict$/i }),
-    ).toBeVisible();
-  });
-
-  test("download blocked → upload fallback", async ({ page }) => {
-    await page.goto("/");
-    await fillUrl(page, BLOCKED_URL);
-    await clickPredict(page);
-
-    // failed_download (download_blocked) arrives ~2s; the error panel surfaces
-    // an upload drop zone.
-    await expect(
-      page.getByText(/youtube blocked our download/i),
-    ).toBeVisible({ timeout: 8_000 });
-
-    // The dropzone has a hidden <input type="file"> — setInputFiles works on
-    // hidden inputs without a prior click.
-    await page.locator('input[type="file"]').first().setInputFiles(TINY_MP4);
-
-    // After confirm, happy-path timing resumes → result panel at +6s.
-    await expect(
-      page.getByRole("button", { name: /try another/i }),
+      page.getByRole("heading", { name: /your brain on that video/i }),
     ).toBeVisible({ timeout: 14_000 });
+    await expect(
+      page.getByRole("button", { name: /try another/i }),
+    ).toBeVisible();
     await expect(page.locator("canvas")).toBeVisible();
+
+    // Reset path → back to the upload dropzone.
+    await page.getByRole("button", { name: /try another/i }).click();
+    await expect(page.getByText(/drop mp4 here/i)).toBeVisible();
   });
 
   test("polling stops on unmount", async ({ page }) => {
@@ -80,18 +58,19 @@ test.describe("/ — YouTube URL + segment → brain", () => {
     });
 
     await page.goto("/");
-    await fillUrl(page, SAMPLE_URL);
+    await uploadClip(page);
     await clickPredict(page);
 
-    // Wait until at least one poll has fired so we know polling is live.
+    // Wait until requests are flowing (upload + confirm + the status poll), so
+    // we know the tracking loop is live.
     await expect
-      .poll(() => apiRequests.length, { timeout: 5_000 })
+      .poll(() => apiRequests.length, { timeout: 8_000 })
       .toBeGreaterThan(0);
 
     // Navigate away mid-flight (about:blank avoids re-triggering app fetches).
     await page.goto("about:blank");
 
-    // Snapshot the count, then verify it doesn't grow for 5s.
+    // Snapshot the count, then verify polls don't keep growing for 5s.
     const baseline = apiRequests.length;
     await page.waitForTimeout(5_000);
     expect(apiRequests.length).toBe(baseline);

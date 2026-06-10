@@ -152,7 +152,7 @@ subset (deps, GPU, disk, tools only).
 
 ## 7. Smoke one clip → dry-run the list → bake
 
-The product is a YouTube URL + a `[startSec, endSec)` segment
+The product is an uploaded MP4 + a `[startSec, endSec)` window
 (`shared/CONTRACTS.md` §13), so there's no TikTok export to ingest. Walk
 the gates in order — each is cheaper than the next:
 

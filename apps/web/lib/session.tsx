@@ -10,6 +10,7 @@ import {
 } from "react";
 import type {
   ActivationPayload,
+  JobStage,
   JobStatus,
   TerminalFailureStatus,
 } from "@/lib/api-v2";
@@ -43,6 +44,10 @@ export interface TrackingState {
   jobId: string;
   status: JobStatus;
   elapsedSec: number;
+  // Fine-grained sub-stage + coarse fraction the Space reports while working
+  // (CONTRACTS §13.6). Both optional — undefined until the first progress ping.
+  stage?: JobStage;
+  progress?: number;
   // Wall-clock ms at which polling started (enforces the overall cap).
   startedAtMs: number;
   // Carried from the upload so the result can play the LOCAL file, trimmed to

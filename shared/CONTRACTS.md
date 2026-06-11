@@ -227,3 +227,28 @@ Keep it working; do not extend it with segment selection.
   is taken verbatim from `[startSec, endSec)`; `endSec − startSec > 90` is
   rejected (`segment_too_long`) rather than silently trimmed. `MAX_DURATION_SEC`
   stays 90 as the hard ceiling; the `TRIM_THRESHOLD/TRIM_TARGET` logic goes away.
+
+### 13.6 In-flight progress (advisory)
+
+The TRIBE phase runs for minutes (transcription + multi-modal encoding +
+forward pass), so the Space reports **intermediate progress** instead of staying
+opaque until the terminal callback. This is a UX layer on top of `status` — the
+status state machine is **unchanged**.
+
+- **The Space POSTs one or more intermediate callbacks** to the same callback URL
+  as it works, each shaped `{ jobId, status: "inferring", stage, progress }`. It
+  then POSTs exactly one terminal callback (`done` / a failure) as before.
+- **`stage`** ∈ `downloading | preprocessing | transcribing | encoding |
+  predicting | aggregating` — the current sub-step, ordered by execution. Advisory
+  and best-effort: a Space that can't observe a sub-step simply doesn't report it,
+  and consumers must tolerate `stage` being absent or skipping values.
+- **`progress`** ∈ `[0, 1]` — a coarse fraction **anchored to real stage
+  transitions**, not a fabricated smooth ramp (consistent with the "no fake
+  percentages" rule). The continuous "not stuck" signal remains the elapsed clock.
+- **Persistence + polling.** `hf_callback` whitelists `stage` against the
+  vocabulary above and clamps `progress` to `[0, 1]`, storing both on the job row;
+  `GET /v2/jobs/{id}` echoes them as optional `stage` / `progress` fields. Older
+  Spaces that never send them, and pre-callback statuses, simply omit the fields.
+
+Three surfaces stay in sync: `JOB_STAGES` in `infra/aws/lambdas/shared/__init__.py`
+(Python) and `apps/web/lib/api-v2.ts` (TypeScript), and this section.

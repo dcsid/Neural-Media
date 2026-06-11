@@ -381,7 +381,7 @@ describe("/ timeout + poll resilience (fake timers)", () => {
     });
   }
 
-  it("flips to the timeout error after the 10-minute budget", async () => {
+  it("flips to the timeout error after the 20-minute budget", async () => {
     api.getJob.mockResolvedValue({
       jobId: "job-1",
       status: "inferring",
@@ -392,11 +392,29 @@ describe("/ timeout + poll resilience (fake timers)", () => {
     expect(screen.getByText(/running on the gpu/i)).toBeInTheDocument();
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(601_000); // past the 600s cap
+      await vi.advanceTimersByTimeAsync(1_201_000); // past the 1200s (20-min) cap
     });
     expect(
       screen.getByText(/taking longer than expected/i),
     ).toBeInTheDocument();
+  });
+
+  it("shows the Space-reported sub-stage + a determinate bar (CONTRACTS §13.6)", async () => {
+    api.getJob.mockResolvedValue({
+      jobId: "job-1",
+      status: "inferring",
+      createdAt: 0,
+      elapsedSec: 5,
+      stage: "encoding",
+      progress: 0.55,
+    });
+    await reachTracking();
+
+    // The friendly label for the reported stage replaces the static copy...
+    expect(screen.getByText(/encoding the video/i)).toBeInTheDocument();
+    // ...and the bar is determinate (aria-valuenow reflects the fraction).
+    const bar = screen.getByRole("progressbar", { name: /encoding the video/i });
+    expect(bar).toHaveAttribute("aria-valuenow", "55");
   });
 
   it("recovers from a transient poll failure, then resolves", async () => {

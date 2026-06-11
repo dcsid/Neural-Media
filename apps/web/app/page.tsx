@@ -21,6 +21,7 @@ import {
   MAX_SEGMENT_SEC,
   putUpload,
   validateSegment,
+  type JobStage,
   type JobStatus,
   type JobStatusResponse,
 } from "@/lib/api-v2";
@@ -67,11 +68,14 @@ const BrainMeshLazy = dynamic(
 // ---------------------------------------------------------------------------
 
 const POLL_INTERVAL_MS = 2000;
-// Real TRIBE forward pass is ~12s/segment on the A10G, but the FIRST request
-// after the Space has been idle pays a cold-start weight warm-up (~17GB lazy
-// weights). 10 minutes covers a cold start + a long 90s clip without
-// false-timing-out a job that's actually still running.
-const POLL_TIMEOUT_MS = 600_000;
+// The real pipeline on the A10G is minutes, not seconds: whisper transcription
+// (~90s, fixed per job) + multi-modal encoding + the forward pass, and video
+// encoding scales with clip length (~5s per 0.5s window). A 30s window measured
+// ~9 min; a near-90s window can approach ~15 min. The old 10-min cap timed out
+// real, still-running jobs (the exact failure users hit). 20 minutes is the hard
+// backstop; the stage progress (below) keeps the long wait legible. To bound the
+// worst case, lower HF_MAX_DURATION_SEC on the Space (see services/hf-space).
+const POLL_TIMEOUT_MS = 1_200_000;
 
 // Live inference is wired up (Stage 2: HF Space + Lambda). Set false to fall
 // back to the coming-soon panel pointing at the precomputed gallery.
@@ -301,6 +305,8 @@ export default function SingleVideoPage() {
 
       // Still in flight — update status + elapsed. Prefer the server's
       // elapsedSec if it's monotonically newer; else compute from wall clock.
+      // Carry the Space-reported sub-stage + progress when present, but never
+      // let progress go backwards (out-of-order pings shouldn't rewind the bar).
       const wallSec = Math.floor((Date.now() - startedAtMs) / 1000);
       setPhase((p) =>
         p.kind === "tracking" && p.jobId === jobId
@@ -308,6 +314,11 @@ export default function SingleVideoPage() {
               ...p,
               status: res.status,
               elapsedSec: Math.max(res.elapsedSec ?? 0, wallSec),
+              stage: res.stage ?? p.stage,
+              progress:
+                res.progress != null
+                  ? Math.max(res.progress, p.progress ?? 0)
+                  : p.progress,
             }
           : p,
       );
@@ -612,13 +623,15 @@ function ComingSoonPanel() {
 // ---------------------------------------------------------------------------
 // Tracking panel — honest stage stepper (L1)
 //
-// The raw job status barely moves (it sits on "downloading" for the whole
-// multi-minute GPU run), so instead of a fake percentage we show: the real
-// coarse phase as a stepper, a per-second elapsed clock (the clearest
-// "not stuck" signal — and it ticks even under reduced motion), and an
-// indeterminate bar for constant motion. We deliberately DON'T claim a
-// sub-stage (transcribe / encode / predict) we can't observe from the browser
-// — that's the future L3 work, fed by real progress pings from the Space.
+// The raw job status barely moves (it sits on "downloading"/"inferring" for the
+// whole multi-minute GPU run), so the coarse stepper alone reads as stuck. The
+// Space now reports real sub-stages + a coarse fraction (CONTRACTS §13.6), so we
+// show: the coarse phase as a stepper, the live sub-stage label under the active
+// step ("Transcribing the audio", "Encoding the video", …), a progress bar that
+// is determinate when the Space has reported a fraction (anchored to real stage
+// transitions — not a fabricated ramp) and indeterminate before the first ping,
+// and a per-second elapsed clock (the clearest "not stuck" signal, ticking even
+// under reduced motion).
 // ---------------------------------------------------------------------------
 
 const TRACK_STEPS: { key: string; label: string }[] = [
@@ -627,6 +640,17 @@ const TRACK_STEPS: { key: string; label: string }[] = [
   { key: "running", label: "Running on the GPU" },
   { key: "result", label: "Result ready" },
 ];
+
+// Friendly, present-tense label for each Space-reported sub-stage. Used to fill
+// the active "Running on the GPU" step with what's actually happening right now.
+const STAGE_LABEL: Record<JobStage, string> = {
+  downloading: "Fetching your clip",
+  preprocessing: "Preparing the video",
+  transcribing: "Transcribing the audio",
+  encoding: "Encoding the video",
+  predicting: "Predicting the brain response",
+  aggregating: "Aggregating cortical regions",
+};
 
 // Map the raw job status onto a stepper index. downloading + inferring both
 // just mean "the Space has it and is working" → the single "Running on the GPU"
@@ -661,6 +685,16 @@ function TrackingPanel({ state }: { state: TrackingState }) {
 
   const cur = trackStepIndex(state.status);
   const segLen = Math.max(0, state.endSec - state.startSec);
+
+  // Space-reported sub-stage + coarse fraction (CONTRACTS §13.6). Both are
+  // optional: stageLabel is null and pct is null until the first progress ping,
+  // in which case the active step falls back to the static copy + indeterminate
+  // bar. pct is clamped defensively even though the server already clamps.
+  const stageLabel = state.stage ? STAGE_LABEL[state.stage] : null;
+  const pct =
+    state.progress != null
+      ? Math.round(Math.max(0, Math.min(1, state.progress)) * 100)
+      : null;
 
   return (
     <div className="motion-fade-in flex h-full flex-col gap-5 border border-line bg-surface/40 p-6">
@@ -706,17 +740,47 @@ function TrackingPanel({ state }: { state: TrackingState }) {
               </div>
               {isRunning && (
                 <div className="ml-[27px] flex flex-col gap-2">
-                  <div
-                    role="progressbar"
-                    aria-label="Working"
-                    className="relative h-[3px] w-full overflow-hidden bg-line"
-                  >
-                    <div className="nm-indeterminate absolute inset-y-0 w-1/3 bg-accent" />
-                  </div>
+                  {/* Determinate once the Space reports a fraction; indeterminate
+                      before the first ping. The fraction jumps at real stage
+                      boundaries, so it's an honest signal, not a fake ramp. */}
+                  {pct != null ? (
+                    <div
+                      role="progressbar"
+                      aria-label={stageLabel ?? "Working"}
+                      aria-valuenow={pct}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      className="relative h-[3px] w-full overflow-hidden bg-line"
+                    >
+                      <div
+                        className="absolute inset-y-0 left-0 bg-accent transition-[width] duration-500 ease-out"
+                        style={{ width: `${pct}%` }}
+                      />
+                    </div>
+                  ) : (
+                    <div
+                      role="progressbar"
+                      aria-label={stageLabel ?? "Working"}
+                      className="relative h-[3px] w-full overflow-hidden bg-line"
+                    >
+                      <div className="nm-indeterminate absolute inset-y-0 w-1/3 bg-accent" />
+                    </div>
+                  )}
                   <p className="max-w-[40ch] text-[12px] leading-relaxed text-ink-400">
-                    Transcribing the audio, encoding the video, and running TRIBE
-                    on a real GPU. Usually a few minutes — the first run after the
-                    model&rsquo;s been idle is the slowest.
+                    {stageLabel ? (
+                      <>
+                        <span className="text-ink-200">{stageLabel}…</span>{" "}
+                        Running TRIBE on a real GPU — usually a few minutes, and
+                        the first run after the model&rsquo;s been idle is the
+                        slowest.
+                      </>
+                    ) : (
+                      <>
+                        Transcribing the audio, encoding the video, and running
+                        TRIBE on a real GPU. Usually a few minutes — the first run
+                        after the model&rsquo;s been idle is the slowest.
+                      </>
+                    )}
                   </p>
                 </div>
               )}

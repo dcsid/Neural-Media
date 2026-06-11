@@ -28,6 +28,21 @@ export const JOB_STATUSES = [
 
 export type JobStatus = (typeof JOB_STATUSES)[number];
 
+// Fine-grained sub-stages the HF Space reports during the multi-minute in-flight
+// phase (CONTRACTS §13.6). Advisory UX hints layered on top of `status` — ordered
+// by execution order so the UI can render a monotonic stepper. Mirror of
+// JOB_STAGES in infra/aws/lambdas/shared/__init__.py.
+export const JOB_STAGES = [
+  "downloading",
+  "preprocessing",
+  "transcribing",
+  "encoding",
+  "predicting",
+  "aggregating",
+] as const;
+
+export type JobStage = (typeof JOB_STAGES)[number];
+
 export type TerminalSuccessStatus = "done";
 export type TerminalFailureStatus =
   | "failed_download"
@@ -79,6 +94,13 @@ export interface JobStatusResponse {
   // Reported through the hf-callback once inference completes; absent on
   // pre-callback statuses.
   durationSec?: number;
+  // Current sub-stage within the in-flight phase, reported by the Space as it
+  // works (CONTRACTS §13.6). Advisory — absent on older Spaces and pre-callback
+  // statuses; consumers must tolerate it being missing or skipping values.
+  stage?: JobStage;
+  // Coarse 0..1 completion fraction, anchored to real stage transitions on the
+  // Space (NOT a fabricated smooth ramp). Absent until the Space reports it.
+  progress?: number;
 }
 
 export interface CreateUrlJobResponse {

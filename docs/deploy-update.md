@@ -91,6 +91,13 @@ Then, as the script prints:
 - **Warm it once**: run a throwaway upload through the site and let it finish, so
   the first real visitor doesn't pay the one-time weight download.
 
+> **Secrets persist across a redeploy** — a force-push only replaces the code,
+> not the Space's Settings → Variables/Secrets. So `CALLBACK_SHARED_SECRET` and
+> `HF_TOKEN` (the latter is needed for the gated `meta-llama/Llama-3.2-3B` TRIBE
+> pulls) stay set; you don't re-enter them. If a *rebuild* ever fails on the
+> Llama model, that's the one to check (token expired, or the license was
+> un-accepted on huggingface.co).
+>
 > If you ever change the Space's `HFSpaceUrl`, re-run Step 1 with the new value.
 > Optional: in the Space **Settings → Variables**, set `HF_MAX_DURATION_SEC=45`
 > to bound worst-case job time until a GPU upgrade.

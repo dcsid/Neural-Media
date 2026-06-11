@@ -60,6 +60,37 @@ TERMINAL_STATUSES = frozenset(
     }
 )
 
+# Fine-grained progress sub-stages the HF Space reports during the (otherwise
+# opaque) multi-minute in-flight phase. These are an advisory UX layer on top of
+# `status` — the status state machine itself is unchanged; an intermediate
+# callback rides in as status="inferring" plus one of these `stage` values and a
+# coarse `progress` fraction. Ordered by typical execution order so the frontend
+# can render a monotonic stepper. See CONTRACTS.md §13.6.
+JOB_STAGES = (
+    "downloading",     # acquiring the clip (S3 GET / yt-dlp)
+    "preprocessing",   # ffmpeg → 224x224@8fps / 16kHz mono
+    "transcribing",    # whisper transcript (TRIBE's LLaMA head consumes it)
+    "encoding",        # V-JEPA2 / Wav2Vec-BERT / text feature extraction
+    "predicting",      # TRIBE fusion forward pass
+    "aggregating",     # region means + packing the result
+)
+
+
+def clamp_progress(value: Any) -> Optional[float]:
+    """Coerce a reported progress fraction into [0, 1], or None if unusable.
+
+    Defensive because the value crosses the HF Space → Lambda trust boundary:
+    non-numeric, NaN, or out-of-range inputs collapse to None / the bounds
+    rather than corrupting the job row.
+    """
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f != f:  # NaN — the only value not equal to itself
+        return None
+    return max(0.0, min(1.0, f))
+
 # How long a job row sticks around before DynamoDB's TTL deletes it.
 JOB_TTL_DAYS = 30
 

@@ -4,8 +4,11 @@ Invoked by AWS Lambda over HTTP.  Returns 202 immediately and runs the
 pipeline (download → preprocess → TRIBE → aggregate) in a background
 task, posting the result to a caller-supplied callback URL.
 
-Free tier only (ZeroGPU).  Per-call wall clock budget is ~120 s; we
-target <90 s end-to-end.
+Runs on a dedicated A10G Space (HF `hardware: a10g-small`) that sleeps when
+idle, so the worker Lambda wakes it via /healthz before POSTing /predict. The
+TRIBE phase (whisper transcription + multi-modal encoding + forward pass) takes
+minutes, not seconds; the Space POSTs intermediate `inferring` progress
+callbacks (CONTRACTS §13.6) so the long phase is observable while it runs.
 
 Pipeline (CONTRACTS.md §13):
 
@@ -53,6 +56,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -483,11 +487,21 @@ def _build_timestamps(num_timepoints: int, duration_sec: float) -> list[float]:
 
 
 @_gpu_decorator
-def _run_tribe(video_path: Path, *, seed: int) -> tuple[np.ndarray, str]:
+def _run_tribe(
+    video_path: Path, *, seed: int,
+    callback_url: str | None = None,
+    callback_token: str | None = None,
+    job_id: str | None = None,
+) -> tuple[np.ndarray, str]:
     """Wrap TribeBackend.infer.  Returns (activations, model_version).
 
     Decorated with `@spaces.GPU` so ZeroGPU only allocates the A10G for the
     duration of this call — outside this scope the Space holds no GPU.
+
+    When callback args are supplied, a `_ProgressLogBridge` is attached for the
+    duration of infer() so TRIBE's own progress logs surface as Space→AWS
+    progress pings (CONTRACTS §13.6). It's removed in a finally so the handler
+    never leaks across jobs.
     """
     from neural_media_inference.backend_tribe import TribeBackend  # noqa: PLC0415
 
@@ -505,13 +519,26 @@ def _run_tribe(video_path: Path, *, seed: int) -> tuple[np.ndarray, str]:
     else:
         _BACKEND._videos_dir = video_path.parent  # noqa: SLF001
 
-    # The backend resolves `{videos_dir}/{video_id}.mp4` — pass the stem.
-    activations = _BACKEND.infer(
-        video_id=video_path.stem,
-        duration_s=0.0,  # informational only in the wrapper; the model uses the file
-        seed=seed,
-        sample_rate_hz=1.5,
-    )
+    # Attach the progress bridge to the root logger so it sees TRIBE/neuralset
+    # records (which propagate up). Marker-filtered, so unrelated logs are ignored.
+    bridge: _ProgressLogBridge | None = None
+    root_logger = logging.getLogger()
+    if callback_url and callback_token and job_id:
+        bridge = _ProgressLogBridge(callback_url, callback_token, job_id)
+        bridge.setLevel(logging.INFO)
+        root_logger.addHandler(bridge)
+
+    try:
+        # The backend resolves `{videos_dir}/{video_id}.mp4` — pass the stem.
+        activations = _BACKEND.infer(
+            video_id=video_path.stem,
+            duration_s=0.0,  # informational only in the wrapper; the model uses the file
+            seed=seed,
+            sample_rate_hz=1.5,
+        )
+    finally:
+        if bridge is not None:
+            root_logger.removeHandler(bridge)
     return activations, _BACKEND.model_version
 
 
@@ -552,6 +579,105 @@ async def _post_callback(url: str, token: str, payload: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# In-flight progress (CONTRACTS.md §13.6)
+#
+# The TRIBE phase runs for minutes; instead of staying opaque until the terminal
+# callback we POST lightweight intermediate callbacks as the pipeline advances.
+# These are best-effort and fire-and-forget: a dropped ping just means the
+# frontend shows the previous stage a little longer. They must NEVER slow down or
+# fail the job, so each posts on its own daemon thread and swallows every error.
+# ---------------------------------------------------------------------------
+
+# Coarse fraction anchored to each real stage transition (not a fake smooth
+# ramp). The continuous "not stuck" signal stays the frontend's elapsed clock.
+_PROGRESS_STAGE_TO_FRACTION = {
+    "downloading": 0.10,
+    "preprocessing": 0.22,
+    "transcribing": 0.35,
+    "encoding": 0.55,
+    "predicting": 0.82,
+    "aggregating": 0.92,
+}
+
+
+def _fire_progress(
+    callback_url: str, token: str, job_id: str, stage: str,
+    progress: float | None = None,
+) -> None:
+    """Fire-and-forget progress ping → {status:"inferring", stage, progress}.
+
+    Runs the POST on a daemon thread so it never blocks the pipeline, and
+    swallows all errors — progress is advisory (CONTRACTS.md §13.6), so a failed
+    ping must not affect the job. The Lambda's terminal-status guard makes a
+    late ping that races the final callback a harmless no-op.
+    """
+    if progress is None:
+        progress = _PROGRESS_STAGE_TO_FRACTION.get(stage)
+    body: dict[str, Any] = {"jobId": job_id, "status": "inferring", "stage": stage}
+    if progress is not None:
+        body["progress"] = progress
+
+    def _send() -> None:
+        try:
+            with httpx.Client(timeout=httpx.Timeout(5.0, connect=3.0)) as client:
+                client.post(
+                    callback_url,
+                    json=body,
+                    headers={"X-NM-Token": token, "content-type": "application/json"},
+                )
+        except Exception:  # noqa: BLE001 - progress is strictly best-effort
+            pass
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
+class _ProgressLogBridge(logging.Handler):
+    """Translate TRIBE/neuralset progress logs into Space→AWS progress pings.
+
+    TRIBE's preprocessing emits recognizable INFO logs as it moves through the
+    forward pass ("Running whisperx via uvx...", "Preparing extractor: video",
+    ...). We listen for those *during* the otherwise-opaque infer() call and
+    forward a coarse `stage` so the long GPU phase becomes observable. Best-
+    effort and defensive: an unrecognized or changed upstream log line just
+    leaves the stage where it was. Throttled to stage *transitions* so we POST a
+    handful of times total, not once per log record.
+    """
+
+    # (substring, stage) — matched case-insensitively against each log message,
+    # in order. Markers are deliberately conservative: each maps to a stage we're
+    # confident about from observed TRIBE logs. The forward pass ("predict") has
+    # no reliable log marker, so it's left to the coarse pings in _run_job.
+    _MARKERS = (
+        ("running whisperx", "transcribing"),
+        ("extracting words from audio", "transcribing"),
+        ("preparing extractor: text", "encoding"),
+        ("computing word embeddings", "encoding"),
+        ("preparing extractor: audio", "encoding"),
+        ("preparing extractor: video", "encoding"),
+        ("encoding video", "encoding"),
+    )
+
+    def __init__(self, callback_url: str, token: str, job_id: str) -> None:
+        super().__init__()
+        self._url = callback_url
+        self._token = token
+        self._job_id = job_id
+        self._last_stage: str | None = None
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = record.getMessage().lower()
+        except Exception:  # noqa: BLE001 - logging handlers must never raise
+            return
+        for needle, stage in self._MARKERS:
+            if needle in msg:
+                if stage != self._last_stage:
+                    self._last_stage = stage
+                    _fire_progress(self._url, self._token, self._job_id, stage)
+                return
+
+
+# ---------------------------------------------------------------------------
 # Job runner
 # ---------------------------------------------------------------------------
 async def _run_job(req: PredictRequest) -> None:
@@ -560,10 +686,17 @@ async def _run_job(req: PredictRequest) -> None:
     would silently log and drop)."""
     started = time.monotonic()
     workdir = Path(tempfile.mkdtemp(prefix=f"job-{req.jobId}-"))
+
+    # Best-effort progress pings for the coarse stages we control here; the finer
+    # transcribe/encode sub-stages come from the log bridge inside _run_tribe.
+    def emit(stage: str) -> None:
+        _fire_progress(req.callbackUrl, req.callbackToken, req.jobId, stage)
+
     try:
         # 1. Acquire + 2. determine the analyzed duration.
         raw_dir = workdir / "raw"
         raw_dir.mkdir()
+        emit("downloading")
         if req.source.kind == "url":
             # YouTube segment path (CONTRACTS.md §13). The cheap segment checks
             # already passed synchronously at /predict; the remaining one needs
@@ -640,14 +773,23 @@ async def _run_job(req: PredictRequest) -> None:
         proc_dir = workdir / "proc"
         proc_dir.mkdir()
         proc_path = proc_dir / f"{req.jobId}.mp4"
+        emit("preprocessing")
         await asyncio.to_thread(_preprocess, raw_path, proc_path, start=seg_start, end=seg_end)
 
         # Seed derived from the jobId so identical inputs produce identical
         # outputs (TRIBE wrapper z-seeds torch + numpy + cuda from this).
         seed = int.from_bytes(req.jobId.encode("utf-8")[:4].ljust(4, b"\0"), "big") & 0x7FFFFFFF
-        activations, model_version = await asyncio.to_thread(_run_tribe, proc_path, seed=seed)
+        # `transcribing` is the first sub-stage inside infer(); the log bridge
+        # advances it to `encoding`/etc as TRIBE progresses (CONTRACTS §13.6).
+        emit("transcribing")
+        activations, model_version = await asyncio.to_thread(
+            _run_tribe, proc_path, seed=seed,
+            callback_url=req.callbackUrl, callback_token=req.callbackToken,
+            job_id=req.jobId,
+        )
 
         # 5. Region aggregation.
+        emit("aggregating")
         by_region = _region_means_per_timepoint(activations, req.jobId)
         T = activations.shape[0]
         timestamps = _build_timestamps(T, float(duration))

@@ -32,6 +32,14 @@ def lambda_handler(event: dict, _context) -> dict:
         body["error"] = job["error"]
     if job.get("modelVersion"):
         body["modelVersion"] = job["modelVersion"]
+    # Advisory progress hints written by hf_callback from the Space's
+    # intermediate callbacks (CONTRACTS §13.6). `stage` is a plain string;
+    # `progress` is stored as a DynamoDB Decimal — cast back to float so
+    # json_response can serialize it.
+    if job.get("stage"):
+        body["stage"] = job["stage"]
+    if job.get("progress") is not None:
+        body["progress"] = float(job["progress"])
     # hf_callback writes durationSec as a DynamoDB Decimal; cast back to
     # float so json.dumps() in json_response handles it natively (Decimal
     # is not JSON-serializable by default).

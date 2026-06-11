@@ -23,6 +23,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HOME=/data/hf-cache \
     HUGGINGFACE_HUB_CACHE=/data/hf-cache \
     LOG_LEVEL=INFO \
+    # `uvx whisperx` resolves+installs whisperx into the uv cache on first use.
+    # The default cache (~/.cache/uv) is ephemeral, so a sleeping Space re-pays
+    # that resolution on every cold boot. Point it at persistent /data so the
+    # first job warms it once and every later cold boot reuses it. (The whisper
+    # large-v3 weights land in HF_HOME=/data/hf-cache and persist the same way.)
+    UV_CACHE_DIR=/data/uv-cache \
     # TRIBE transcribes by shelling out to `uvx whisperx`, whose isolated env
     # lacks the hf_transfer package; HF infra defaults this flag to 1, which
     # crashes that model download. Force it off process-wide so the subprocess
@@ -60,10 +66,19 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip \
  && pip install -r /app/requirements.txt
 
+# Bake the spaCy model TRIBE's text extractor needs (en_core_web_lg, ~400 MB).
+# Without this it is pip-installed into ephemeral site-packages on the FIRST
+# transcription of every cold boot — a recurring 400 MB download mid-job. Baking
+# it into the image layer makes `spacy.load("en_core_web_lg")` a local hit. The
+# version is auto-selected to match the spaCy pulled in by the install above.
+RUN python -m spacy download en_core_web_lg
+
 # TRIBE's audio transcription shells out to `uvx whisperx` at inference time,
 # so `uvx` must exist in the image — install uv (provides both `uv` and `uvx`).
-# Proven necessary on the RunPod GPU run. WhisperX itself + the large-v3 weights
-# are fetched lazily on the first prediction, so warm the Space once after deploy.
+# Proven necessary on the RunPod GPU run. WhisperX + the large-v3 weights are
+# fetched lazily on the first prediction; they then persist in the UV_CACHE_DIR /
+# HF_HOME on /data set above, so warm the Space ONCE after deploy and later cold
+# boots skip the resolution + download.
 RUN pip install uv
 
 # Now bring in the Space code.

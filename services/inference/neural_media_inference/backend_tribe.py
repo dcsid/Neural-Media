@@ -162,6 +162,25 @@ class TribeBackend:
         if hasattr(self._model, "eval"):
             self._model.eval()
 
+        # Confirm where compute will actually land. TribeModel may not expose
+        # `.to()` (handled above), and on a slow run we want to KNOW whether the
+        # heavy V-JEPA2 video encoder is on the GPU or silently on CPU rather than
+        # infer it from timings. Logged once at load; cheap and never raises.
+        cuda_ok = bool(getattr(torch, "cuda", None)) and torch.cuda.is_available()
+        gpu_name = torch.cuda.get_device_name(0) if cuda_ok else None
+        param_device = None
+        try:  # TribeModel is a high-level wrapper — parameters() may be absent.
+            param_device = str(next(self._model.parameters()).device)
+        except (StopIteration, AttributeError, TypeError):
+            pass
+        _log.info(
+            "event=device-check requested=%s cuda_available=%s gpu=%s "
+            "model_param_device=%s. If a forward pass is slow and "
+            "model_param_device is 'cpu' (or None with cuda_available=True), the "
+            "encoder is not on the GPU — investigate TRIBE device placement.",
+            self._device, cuda_ok, gpu_name, param_device,
+        )
+
     # ------------------------------------------------------------------
     # Reproducibility envelope contributions
     # ------------------------------------------------------------------

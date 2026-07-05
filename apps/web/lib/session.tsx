@@ -16,9 +16,9 @@ import type {
 } from "@/lib/api-v2";
 
 // ---------------------------------------------------------------------------
-// Home-page state machine — lifted out of app/page.tsx into a layout-level
-// store so the current upload + result survive client navigation
-// (/ ↔ /gallery) without re-uploading or re-running inference. The product is
+// Predict-page state machine — lifted out of app/predict/page.tsx into a
+// layout-level store so the current upload + result survive client navigation
+// (/predict ↔ /) without re-uploading or re-running inference. The product is
 // upload-only: drop an MP4, pick a ≤90s window, watch the synced video+brain.
 // ---------------------------------------------------------------------------
 
@@ -93,10 +93,10 @@ export function freshIdle(): IdleState {
 //
 // The provider lives in the root layout, which does NOT unmount on client
 // navigation — so `phase` (including the uploaded File and the fetched
-// activation, both already in browser memory) rides across / ↔ /gallery. A full
+// activation, both already in browser memory) rides across /predict ↔ /. A full
 // reload remounts the layout and resets to a fresh idle, and a new upload
-// replaces it: exactly the "keep until reload or new upload" lifetime. Nothing
-// is persisted to disk; returning to / skips the re-upload AND the re-inference.
+// replaces it: exactly the "keep until reload or new upload" lifetime. Nothing is
+// persisted to disk; returning to /predict skips the re-upload AND re-inference.
 // ---------------------------------------------------------------------------
 
 interface SessionPhase {

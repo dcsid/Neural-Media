@@ -36,7 +36,7 @@ vi.mock("@/lib/api-v2", async (importOriginal) => {
   };
 });
 
-import SingleVideoPage from "@/app/page";
+import SingleVideoPage from "@/app/predict/page";
 import { SessionProvider } from "@/lib/session";
 import * as apiV2 from "@/lib/api-v2";
 import { readVideoDuration } from "@/lib/video";

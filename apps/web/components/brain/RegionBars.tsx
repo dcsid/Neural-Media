@@ -14,8 +14,8 @@ import {
 // ---------------------------------------------------------------------------
 // Region activation bars (live readout, off the canvas)
 //
-// Shared by the precomputed gallery (`app/gallery`) and the live single-video
-// result (`app/page` → LiveResultViewer): both render the same per-region bars
+// Shared by the precomputed gallery (`app/page`) and the live single-video
+// result (`app/predict` → LiveResultViewer): both render the same per-region bars
 // under the synced video+brain, driven by the value at the current playhead.
 // ---------------------------------------------------------------------------
 

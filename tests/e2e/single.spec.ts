@@ -1,4 +1,4 @@
-// E2E for the single-clip → brain journey at `/` (upload → segment → result).
+// E2E for the single-clip → brain journey at `/predict` (upload → segment → result).
 //
 // All network calls hit the mock server on :3001. Upload a tiny MP4, the
 // browser reads its duration and the segment picker defaults to a valid window,
@@ -30,9 +30,9 @@ async function clickPredict(page: Page) {
   await page.getByRole("button", { name: /^predict$/i }).click();
 }
 
-test.describe("/ — upload + segment → brain", () => {
+test.describe("/predict — upload + segment → brain", () => {
   test("happy path: upload → result", async ({ page }) => {
-    await page.goto("/");
+    await page.goto("/predict");
     await uploadClip(page);
     await clickPredict(page);
 
@@ -57,7 +57,7 @@ test.describe("/ — upload + segment → brain", () => {
       if (/\/v2\/jobs/.test(r.url())) apiRequests.push(r);
     });
 
-    await page.goto("/");
+    await page.goto("/predict");
     await uploadClip(page);
     await clickPredict(page);
 

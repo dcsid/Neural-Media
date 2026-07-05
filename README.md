@@ -10,11 +10,12 @@ auditory, language, and face‑processing parts of the brain. Built on Meta FAIR
 
 Two ways in:
 
-- **The gallery** — a set of precomputed example clips. Click one and the brain
-  animates instantly beside the source video. No waiting, no setup, can't fail.
-- **Your own clip** — drop an MP4, pick a ≤90 s window, and it runs **live on a
-  real GPU**, then plays your trimmed clip next to its predicted brain on one
-  shared timeline.
+- **The gallery (the landing page)** — a set of precomputed example clips. Click
+  one and the brain animates instantly beside the source video. No waiting, no
+  setup, can't fail.
+- **Your own clip (`/predict`)** — drop an MP4, pick a ≤90 s window, and it runs
+  **live on a real GPU**, then plays your trimmed clip next to its predicted
+  brain on one shared timeline.
 
 > _The whole thing is non‑commercial. TRIBE v2 is licensed CC BY‑NC and uses
 > Llama 3.2 internally — built with Llama._
@@ -130,7 +131,7 @@ re‑add behind a server‑side fetch.
 
 ### 2. Two surfaces: an instant gallery + a real live path
 
-| | Gallery (`/gallery`) | Live upload (`/`) |
+| | Gallery (`/`, the landing page) | Live upload (`/predict`) |
 |---|---|---|
 | Input | a precomputed example, clicked | your MP4 + a ≤90 s window |
 | Compute | baked once, offline | live, on the GPU, on demand |
@@ -214,7 +215,7 @@ the Space all validate against them, so a drift in the job shape or the
 
 ```
 apps/web/             Next.js + R3F frontend
-  app/                /  (live upload),  /gallery,  /about
+  app/                /  (gallery, landing),  /predict  (live upload),  /about
   components/brain/   the 3D cortical mesh, scrubber, region bars, synced viewer
   lib/                api client (api-v2.ts) + the in-memory session store
 services/inference/   TRIBE v2 wrapper (mock + real backends) + 8-region aggregation

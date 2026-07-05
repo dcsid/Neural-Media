@@ -1,6 +1,6 @@
 // Pure-DOM states for the brain canvas box — no R3F, no WebGL. Shared so the
 // loading + unsupported experiences look identical wherever a brain renders
-// (the /gallery + / dynamic-import fallbacks and BrainMesh's own first-paint
+// (the / + /predict dynamic-import fallbacks and BrainMesh's own first-paint
 // overlay). Keeping these dependency-free is the point: the gallery's lazy
 // loader must not pull in three.js, and the unsupported fallback has to draw
 // without the very context it's reporting missing.

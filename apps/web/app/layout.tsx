@@ -25,7 +25,7 @@ export default function RootLayout({
           <Header />
           <div id="main" className="flex-1">
             {/* In-memory store (lib/session): keeps the current upload + result
-                across / ↔ /gallery navigation; resets on full reload. */}
+                across /predict ↔ / navigation; resets on full reload. */}
             <SessionProvider>{children}</SessionProvider>
           </div>
           <Footer />

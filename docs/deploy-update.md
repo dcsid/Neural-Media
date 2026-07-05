@@ -109,23 +109,25 @@ Then, as the script prints:
 Ships the progress bar, the live sub-stage labels, and the 20-minute timeout.
 
 ```bash
-# Build the static export with the live API base inlined (NEXT_PUBLIC_* is
-# baked at build time):
-NEXT_PUBLIC_API_BASE_V2="$API_BASE" STATIC_EXPORT=1 \
-  pnpm --filter @neural-media/web build      # writes apps/web/out/
+# Build (NEXT_PUBLIC_* is baked at build time), sync with correct cache
+# headers, and invalidate — one command:
+NEXT_PUBLIC_API_BASE_V2="$API_BASE" scripts/deploy_web.sh
+```
 
-# Find the live web bucket + CloudFront distribution behind the demo domain:
+The script stamps `Cache-Control` per file class (HTML/txt always revalidate,
+hashed `_next/static` immutable, media 1 day). Don't fall back to a bare
+`aws s3 sync` — it uploads with **no** Cache-Control, so returning visitors'
+browsers heuristically cache the HTML and show a stale page after the next
+deploy (CloudFront invalidation clears the CDN, not anyone's browser).
+
+Bucket/distribution default to the live demo (`neural-media-demo-817866065510`
+/ `E3MT7NNX14Y7KO`); override with `WEB_BUCKET` / `CF_DIST_ID` if they ever
+change. To rediscover them:
+
+```bash
 aws cloudfront list-distributions \
   --query "DistributionList.Items[?contains(DomainName,'ddbk4djj9nrdg')].[Id,Origins.Items[0].DomainName]" \
   --output table
-# Expected (per the last gallery deploy): dist E3MT7NNX14Y7KO,
-# bucket neural-media-demo-817866065510. Use what the command prints.
-
-export WEB_BUCKET=neural-media-demo-817866065510
-export WEB_DIST=E3MT7NNX14Y7KO
-
-aws s3 sync apps/web/out "s3://$WEB_BUCKET" --delete
-aws cloudfront create-invalidation --distribution-id "$WEB_DIST" --paths '/*'
 ```
 
 ---

@@ -257,11 +257,10 @@ exercise the entire browser → API → result flow with **no GPU**.
 Two independent deploys, both documented in
 [`docs/single-video-deploy.md`](docs/single-video-deploy.md):
 
-1. **Frontend** → S3 + CloudFront:
+1. **Frontend** → S3 + CloudFront (build, sync with correct cache headers,
+   invalidate — one command):
    ```bash
-   NEXT_PUBLIC_API_BASE_V2=<api-url> STATIC_EXPORT=1 pnpm --filter @neural-media/web build
-   aws s3 sync apps/web/out s3://<bucket> --delete
-   aws cloudfront create-invalidation --distribution-id <id> --paths '/*'
+   NEXT_PUBLIC_API_BASE_V2=<api-url> scripts/deploy_web.sh
    ```
 2. **Backend** → AWS + HF Space:
    ```bash

@@ -10,6 +10,12 @@
 #   _next/static/**    public, max-age=31536000, immutable  (content-hashed)
 #   everything else    public, max-age=86400                (media/data)
 #
+# NB: never "fix" headers with an in-place `aws s3 cp --metadata-directive
+# REPLACE` — on S3→S3 copies the CLI does not re-derive Content-Type, so every
+# object degrades to binary/octet-stream and browsers DOWNLOAD pages instead of
+# rendering them (bit us 2026-07-05). Always re-upload from local out/ instead;
+# local uploads re-guess the MIME type from each file's extension.
+#
 # Usage:
 #   NEXT_PUBLIC_API_BASE_V2=https://<api-id>.execute-api.us-east-1.amazonaws.com/dev \
 #     scripts/deploy_web.sh
